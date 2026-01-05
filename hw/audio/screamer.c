@@ -9,11 +9,14 @@
  */
 
 #include "qemu/osdep.h"
-#include "audio/audio.h"
-#include "hw/irq.h"
-#include "hw/audio/screamer.h"
-#include "hw/qdev-properties.h"
 #include "qemu/timer.h"
+#include "qapi/error.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "qemu/audio.h"
+#include "hw/audio/screamer.h"
+#include "hw/core/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "qemu/cutils.h"
 #include "qemu/log.h"
@@ -184,10 +187,10 @@ static void screamer_update_settings(ScreamerState *s)
         .endianness = s->regs[BYTE_SWAP_REG] ? 0 : 1
     };
 
-    s->voice = AUD_open_out(&s->card, s->voice, s_spk, s,
+    s->voice = AUD_open_out(s->audio_be, s->voice, s_spk, s,
                             screamerspk_callback, &as);
     if (!s->voice) {
-        AUD_log(s_spk, "Could not open voice\n");
+        qemu_log_mask(LOG_GUEST_ERROR, "screamer: Could not open voice\n");
         return;
     }
 
@@ -203,8 +206,8 @@ static void screamer_update_volume(ScreamerState *s)
     SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
                      muted, att_left, att_right);
 
-    AUD_set_volume_out(s->voice, muted, (0xf - att_left) << 4,
-                       (0xf - att_right) << 4);
+    AUD_set_volume_out_lr(s->voice, muted, (0xf - att_left) << 4,
+                          (0xf - att_right) << 4);
 }
 
 static void screamer_reset_hold(Object *obj, ResetType type)
@@ -225,7 +228,9 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
 {
     ScreamerState *s = SCREAMER(dev);
 
-    AUD_register_card(s_spk, &s->card);
+    if (!AUD_backend_check(&s->audio_be, errp)) {
+        return;
+    }
 }
 
 static void screamer_control_write(ScreamerState *s, uint32_t val)
@@ -389,7 +394,7 @@ static void screamer_initfn(Object *obj)
 }
 
 static const Property screamer_properties[] = {
-    DEFINE_AUDIO_PROPERTIES(ScreamerState, card),
+    DEFINE_AUDIO_PROPERTIES(ScreamerState, audio_be),
 };
 
 static void screamer_class_init(ObjectClass *oc, const void *data)
