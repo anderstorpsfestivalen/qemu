@@ -62,6 +62,9 @@ static void pmac_screamer_tx_transfer(DBDMA_io *io)
 
     s->bpos += io->len;
 
+    /* Reactivate audio voice when we have data */
+    AUD_set_active_out(s->voice, true);
+
     /* Indicate success */
     io->len = 0;
 
@@ -175,6 +178,9 @@ static void screamerspk_callback(void *opaque, int avail)
 
         SCREAMER_DPRINTF("Processing deferred buffer\n");
         pmac_screamer_tx_transfer(&s->io);
+    } else {
+        /* No data available - deactivate voice to prevent rate control drift */
+        AUD_set_active_out(s->voice, false);
     }
 }
 
@@ -194,7 +200,7 @@ static void screamer_update_settings(ScreamerState *s)
         return;
     }
 
-    AUD_set_active_out(s->voice, true);
+    /* Voice starts inactive - will be activated when DMA provides data */
 }
 
 static void screamer_update_volume(ScreamerState *s)
