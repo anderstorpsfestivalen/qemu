@@ -200,7 +200,7 @@ static void screamer_update_settings(ScreamerState *s)
         return;
     }
 
-    /* Voice starts inactive - will be activated when DMA provides data */
+    AUD_set_active_out(s->voice, true);
 }
 
 static void screamer_update_volume(ScreamerState *s)
