@@ -131,6 +131,7 @@ config MAC_OLDWORLD
     select GRACKLE_PCI
     select HEATHROW_PIC
     select MACIO
+    select SCREAMER
     select FW_CFG_PPC
 
 config MAC_NEWWORLD
@@ -145,6 +146,7 @@ config MAC_NEWWORLD
     select MACIO
     select MACIO_GPIO
     select MAC_PMU
+    select SCREAMER
     select UNIN_PCI
     select FW_CFG_PPC
 
