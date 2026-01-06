@@ -145,6 +145,8 @@ static void pmac_screamer_rx_flush(DBDMA_io *io)
 void macio_screamer_register_dma(ScreamerState *s, void *dbdma,
                                   int txchannel, int rxchannel)
 {
+    SCREAMER_DPRINTF("Registering DMA: tx_channel=0x%x rx_channel=0x%x\n",
+                     txchannel, rxchannel);
     s->dbdma = dbdma;
     DBDMA_register_channel(dbdma, txchannel, s->dma_tx_irq,
                            pmac_screamer_tx, pmac_screamer_tx_flush, s);
@@ -187,6 +189,10 @@ static void screamer_update_settings(ScreamerState *s)
         .endianness = s->regs[BYTE_SWAP_REG] ? 0 : 1
     };
 
+    SCREAMER_DPRINTF("screamer_update_settings: rate=%d, endian=%d\n",
+                     s->rate, as.endianness);
+
+    /* Re-open voice with new settings */
     s->voice = AUD_open_out(s->audio_be, s->voice, s_spk, s,
                             screamerspk_callback, &as);
     if (!s->voice) {
@@ -194,6 +200,7 @@ static void screamer_update_settings(ScreamerState *s)
         return;
     }
 
+    /* Always keep voice active to receive callbacks */
     AUD_set_active_out(s->voice, true);
 }
 
@@ -214,6 +221,8 @@ static void screamer_reset_hold(Object *obj, ResetType type)
 {
     ScreamerState *s = SCREAMER(obj);
 
+    SCREAMER_DPRINTF("screamer_reset_hold called\n");
+
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->codec_ctrl_regs, 0, sizeof(s->codec_ctrl_regs));
 
@@ -221,16 +230,42 @@ static void screamer_reset_hold(Object *obj, ResetType type)
     s->bpos = 0;
     s->ppos = 0;
 
-    screamer_update_settings(s);
+    /* Keep voice active after reset - we need callbacks to poll for data */
+    if (s->voice) {
+        AUD_set_active_out(s->voice, true);
+    }
 }
 
 static void screamer_realizefn(DeviceState *dev, Error **errp)
 {
     ScreamerState *s = SCREAMER(dev);
+    struct audsettings as;
+
+    SCREAMER_DPRINTF("screamer_realizefn called\n");
 
     if (!AUD_backend_check(&s->audio_be, errp)) {
+        error_setg(errp, "screamer: audio backend not available");
         return;
     }
+
+    /* Initialize with default settings */
+    s->rate = 44100;
+    as.freq = s->rate;
+    as.nchannels = 2;
+    as.fmt = AUDIO_FORMAT_S16;
+    as.endianness = 1; /* big endian by default for PPC */
+
+    s->voice = AUD_open_out(s->audio_be, NULL, s_spk, s,
+                            screamerspk_callback, &as);
+    if (!s->voice) {
+        error_setg(errp, "screamer: failed to open audio output");
+        return;
+    }
+
+    SCREAMER_DPRINTF("Audio voice opened successfully\n");
+
+    /* Start with voice active so callback is called */
+    AUD_set_active_out(s->voice, true);
 }
 
 static void screamer_control_write(ScreamerState *s, uint32_t val)
