@@ -1365,6 +1365,18 @@
   'data'    : { '*rendernode' : 'str' } }
 
 ##
+# @DisplayJukeShmem:
+#
+# Juke shared memory display options.
+#
+# @socket: Unix socket path for passing shared memory fd to Juke.
+#
+# Since: 9.2
+##
+{ 'struct'  : 'DisplayJukeShmem',
+  'data'    : { '*socket' : 'str' } }
+
+##
 # @DisplayDBus:
 #
 # DBus display options.
@@ -1513,6 +1525,9 @@
 #
 # @dbus: Start a D-Bus service for the display.  (Since 7.0)
 #
+# @juke-shmem: Juke shared memory display for zero-copy framebuffer
+#     sharing.  (Since 9.2)
+#
 # Since: 2.12
 ##
 { 'enum'    : 'DisplayType',
@@ -1525,7 +1540,8 @@
     { 'name': 'curses', 'if': 'CONFIG_CURSES' },
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
-    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' }
+    { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
+    { 'name': 'juke-shmem' }
   ]
 }
 
@@ -1563,7 +1579,8 @@
       'egl-headless': { 'type': 'DisplayEGLHeadless',
                         'if': 'CONFIG_OPENGL' },
       'dbus': { 'type': 'DisplayDBus', 'if': 'CONFIG_DBUS_DISPLAY' },
-      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' }
+      'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' },
+      'juke-shmem': 'DisplayJukeShmem'
   }
 }
 
