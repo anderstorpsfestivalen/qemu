@@ -110,6 +110,10 @@ typedef struct JukeShmemState {
     char *socket_path;
     int client_fd;       /* Connection to Juke */
     bool fd_sent;
+    /* Mouse position tracking for rel<->abs conversion */
+    int32_t mouse_x;
+    int32_t mouse_y;
+    bool mouse_initialized;
 } JukeShmemState;
 
 static void juke_shmem_send_fd(JukeShmemState *s);
@@ -141,21 +145,76 @@ static void juke_shmem_process_input(JukeShmemState *s)
     uint32_t write_idx = __atomic_load_n(&ring->write_idx, __ATOMIC_ACQUIRE);
     uint32_t read_idx = ring->read_idx;
 
+    /* Check what the guest expects - this is what cocoa backend does */
+    bool guest_wants_abs = qemu_input_is_absolute(s->dcl.con);
+
     while (read_idx != write_idx) {
         JukeInputEvent *ev = &ring->events[read_idx % JUKE_INPUT_RING_SIZE];
 
         switch (ev->type) {
         case JUKE_INPUT_MOUSE_REL:
-            qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, ev->x);
-            qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, ev->y);
+            /* Mark mouse as initialized on first movement - this prevents
+             * gfx_switch from resetting position to center */
+            s->mouse_initialized = true;
+
+            if (guest_wants_abs) {
+                /* Convert relative to absolute */
+                s->mouse_x += ev->x;
+                s->mouse_y += ev->y;
+                if (s->mouse_x < 0) s->mouse_x = 0;
+                if (s->mouse_y < 0) s->mouse_y = 0;
+                if (s->mouse_x >= (int32_t)s->shmem->width)
+                    s->mouse_x = s->shmem->width - 1;
+                if (s->mouse_y >= (int32_t)s->shmem->height)
+                    s->mouse_y = s->shmem->height - 1;
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X,
+                    s->mouse_x, 0, s->shmem->width);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y,
+                    s->mouse_y, 0, s->shmem->height);
+            } else {
+                qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, ev->x);
+                qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, ev->y);
+            }
             break;
+
         case JUKE_INPUT_MOUSE_ABS:
-            qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X, ev->x, 0, s->shmem->width);
-            qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y, ev->y, 0, s->shmem->height);
+            if (guest_wants_abs) {
+                /* Clamp to framebuffer bounds before sending to guest */
+                int32_t abs_x = ev->x;
+                int32_t abs_y = ev->y;
+                if (abs_x < 0) abs_x = 0;
+                if (abs_y < 0) abs_y = 0;
+                if (abs_x >= (int32_t)s->shmem->width)
+                    abs_x = s->shmem->width - 1;
+                if (abs_y >= (int32_t)s->shmem->height)
+                    abs_y = s->shmem->height - 1;
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X,
+                    abs_x, 0, s->shmem->width);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y,
+                    abs_y, 0, s->shmem->height);
+                s->mouse_x = abs_x;
+                s->mouse_y = abs_y;
+            } else {
+                /* Convert absolute to relative */
+                if (s->mouse_initialized) {
+                    int32_t dx = ev->x - s->mouse_x;
+                    int32_t dy = ev->y - s->mouse_y;
+                    if (dx != 0 || dy != 0) {
+                        qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, dx);
+                        qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, dy);
+                    }
+                }
+                s->mouse_x = ev->x;
+                s->mouse_y = ev->y;
+                s->mouse_initialized = true;
+            }
             break;
+
         case JUKE_INPUT_MOUSE_BTN:
-            qemu_input_queue_btn(s->dcl.con, ev->button, ev->pressed);
+            /* Use NULL source like input-linux.c for PS/2 compatibility */
+            qemu_input_queue_btn(NULL, ev->button, ev->pressed);
             break;
+
         case JUKE_INPUT_KEY:
             /* ev->x contains the scancode */
             qemu_input_event_send_key_number(s->dcl.con, ev->x, ev->pressed);
@@ -219,8 +278,14 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
     size_t needed = sizeof(JukeShmemHeader) + JUKE_CURSOR_DATA_SIZE + sizeof(JukeInputRing) + pixels_size;
 
     /* Reallocate shared memory if size changed */
+    bool new_allocation = false;
     if (needed > s->shmem_size) {
         if (s->shmem) {
+            /* Invalidate magic BEFORE freeing so Rust side detects stale mmap.
+             * The Rust side may still have the old mmap until it receives the
+             * new fd. By zeroing magic, reads from old mmap will be rejected. */
+            s->shmem->magic = 0;
+            __atomic_thread_fence(__ATOMIC_RELEASE);
             qemu_memfd_free(s->shmem, s->shmem_size, s->shmem_fd);
             s->shmem = NULL;
             s->shmem_fd = -1;
@@ -234,35 +299,56 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
             error_report("juke-shmem: failed to allocate shared memory");
             return;
         }
+        new_allocation = true;
     }
 
-    /* Initialize header */
+    /* Update header - always update dimensions, but preserve cursor state on resize */
     s->shmem->magic = JUKE_SHMEM_MAGIC;
     s->shmem->version = JUKE_SHMEM_VERSION;
     s->shmem->width = w;
     s->shmem->height = h;
     s->shmem->stride = stride;
     s->shmem->format = surface_format(new_surface);
-    s->shmem->frame_counter = 0;
+    /* Don't reset frame_counter on resize - let it continue incrementing */
+    if (new_allocation) {
+        s->shmem->frame_counter = 0;
+    }
     s->shmem->dirty_x = 0;
     s->shmem->dirty_y = 0;
     s->shmem->dirty_w = w;
     s->shmem->dirty_h = h;
 
-    /* Initialize cursor state */
-    s->shmem->cursor_version = 0;
-    s->shmem->cursor_x = 0;
-    s->shmem->cursor_y = 0;
-    s->shmem->cursor_visible = 0;
-    s->shmem->cursor_width = 0;
-    s->shmem->cursor_height = 0;
-    s->shmem->cursor_hot_x = 0;
-    s->shmem->cursor_hot_y = 0;
+    /* Only initialize cursor and input state on new allocation.
+     * On resize within same buffer, preserve cursor state so it doesn't jump. */
+    if (new_allocation) {
+        s->shmem->cursor_version = 0;
+        s->shmem->cursor_x = 0;
+        s->shmem->cursor_y = 0;
+        s->shmem->cursor_visible = 0;
+        s->shmem->cursor_width = 0;
+        s->shmem->cursor_height = 0;
+        s->shmem->cursor_hot_x = 0;
+        s->shmem->cursor_hot_y = 0;
 
-    /* Initialize input ring buffer */
-    JukeInputRing *ring = juke_shmem_input_ring(s);
-    ring->write_idx = 0;
-    ring->read_idx = 0;
+        /* Initialize input ring buffer */
+        JukeInputRing *ring = juke_shmem_input_ring(s);
+        ring->write_idx = 0;
+        ring->read_idx = 0;
+    }
+
+    /* Preserve mouse position across resolution changes, just clamp to new bounds.
+     * Only reset to center on first initialization (mouse_initialized = false).
+     * This prevents the mouse jumping to center when guest changes resolution. */
+    if (!s->mouse_initialized) {
+        s->mouse_x = w / 2;
+        s->mouse_y = h / 2;
+    } else {
+        /* Clamp existing position to new resolution bounds */
+        if (s->mouse_x >= w) s->mouse_x = w - 1;
+        if (s->mouse_y >= h) s->mouse_y = h - 1;
+        if (s->mouse_x < 0) s->mouse_x = 0;
+        if (s->mouse_y < 0) s->mouse_y = 0;
+    }
 
     /* Copy initial surface content */
     uint8_t *src = surface_data(new_surface);
