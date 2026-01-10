@@ -2022,6 +2022,7 @@ void audio_create_pdos(Audiodev *dev)
         CASE(SPICE, spice, );
 #endif
         CASE(WAV, wav, );
+        CASE(JUKE, juke, );
 
     case AUDIODEV_DRIVER__MAX:
         abort();

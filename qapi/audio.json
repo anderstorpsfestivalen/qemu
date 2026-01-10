@@ -439,6 +439,25 @@
     '*path': 'str' } }
 
 ##
+# @AudiodevJukeOptions:
+#
+# Options of the Juke shared memory audio backend.
+#
+# @in: options of the capture stream
+#
+# @out: options of the playback stream
+#
+# @path: Unix socket path for fd passing to Juke
+#
+# Since: 9.0
+##
+{ 'struct': 'AudiodevJukeOptions',
+  'data': {
+    '*in':  'AudiodevPerDirectionOptions',
+    '*out': 'AudiodevPerDirectionOptions',
+    'path': 'str' } }
+
+##
 # @AudioFormat:
 #
 # An enumeration of possible audio formats.
@@ -478,6 +497,7 @@
             { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
             { 'name': 'dsound', 'if': 'CONFIG_AUDIO_DSOUND' },
             { 'name': 'jack', 'if': 'CONFIG_AUDIO_JACK' },
+            'juke',
             { 'name': 'oss', 'if': 'CONFIG_AUDIO_OSS' },
             { 'name': 'pa', 'if': 'CONFIG_AUDIO_PA' },
             { 'name': 'pipewire', 'if': 'CONFIG_AUDIO_PIPEWIRE' },
@@ -518,6 +538,7 @@
                    'if': 'CONFIG_AUDIO_DSOUND' },
     'jack':      { 'type': 'AudiodevJackOptions',
                    'if': 'CONFIG_AUDIO_JACK' },
+    'juke':      'AudiodevJukeOptions',
     'oss':       { 'type': 'AudiodevOssOptions',
                    'if': 'CONFIG_AUDIO_OSS' },
     'pa':        { 'type': 'AudiodevPaOptions',

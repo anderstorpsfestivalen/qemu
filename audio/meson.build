@@ -3,6 +3,7 @@ system_ss.add(files(
   'mixeng.c',
   'noaudio.c',
   'wavaudio.c',
+  'jukeaudio.c',
 ))
 
 # deprecated since v10.2, to be removed
