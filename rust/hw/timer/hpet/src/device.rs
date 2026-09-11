@@ -32,7 +32,7 @@ const HPET_REG_SPACE_LEN: u64 = 0x400; // 1024 bytes
 /// Minimum recommended hardware implementation.
 const HPET_MIN_TIMERS: usize = 3;
 /// Maximum timers in each timer block.
-const HPET_MAX_TIMERS: usize = 32;
+const HPET_MAX_TIMERS: usize = 24;
 
 /// Flags that HPETState.flags supports.
 const HPET_FLAG_MSI_SUPPORT_SHIFT: usize = 0;
@@ -627,8 +627,6 @@ pub struct HPETState {
     flags: u32,
 
     hpet_offset_migration: BqlCell<u64>,
-    #[property(rename = "hpet-offset-saved", default = true)]
-    hpet_offset_saved: bool,
 
     irqs: [InterruptSource; HPET_NUM_IRQ_ROUTES],
     rtc_irq_level: BqlCell<u32>,
@@ -725,7 +723,6 @@ impl HPETState {
             self.irqs[0].lower();
             self.irqs[RTC_ISA_IRQ].lower();
         } else if deactivating_bit(old_val, new_val, HPET_CFG_LEG_RT_SHIFT) {
-            // TODO: Add irq binding: qemu_irq_lower(s->irqs[0])
             self.irqs[0].lower();
             self.pit_enabled.set(true);
             self.irqs[RTC_ISA_IRQ].set(self.rtc_irq_level.get() != 0);
@@ -948,11 +945,6 @@ impl HPETState {
             tn_regs.last = CLOCK_VIRTUAL.get_ns() - NANOSECONDS_PER_SECOND;
         }
 
-        // Recalculate the offset between the main counter and guest time
-        if !self.hpet_offset_saved {
-            self.hpet_offset_migration
-                .set(ticks_to_ns(regs.counter) - CLOCK_VIRTUAL.get_ns());
-        }
         regs.hpet_offset = self.hpet_offset_migration.get();
 
         Ok(())
@@ -963,7 +955,7 @@ impl HPETState {
     }
 
     fn is_offset_needed(&self) -> bool {
-        self.regs.borrow().is_hpet_enabled() && self.hpet_offset_saved
+        self.regs.borrow().is_hpet_enabled()
     }
 
     fn validate_num_timers(&self, _version_id: u8) -> bool {

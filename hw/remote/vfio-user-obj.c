@@ -161,7 +161,9 @@ static void vfu_object_set_socket(Object *obj, Visitor *v, const char *name,
 
     o->socket = NULL;
 
-    visit_type_SocketAddress(v, name, &o->socket, errp);
+    if (!visit_type_SocketAddress(v, name, &o->socket, errp)) {
+        return;
+    }
 
     if (o->socket->type != SOCKET_ADDRESS_TYPE_UNIX) {
         error_setg(errp, "vfu: Unsupported socket type - %s",
@@ -751,7 +753,7 @@ static void vfu_object_init_ctx(VfuObject *o, Error **errp)
                                 LIBVFIO_USER_FLAG_ATTACH_NB,
                                 o, VFU_DEV_TYPE_PCI);
     if (o->vfu_ctx == NULL) {
-        error_setg(errp, "vfu: Failed to create context - %s", strerror(errno));
+        error_setg_errno(errp, errno, "vfu: Failed to create context");
         return;
     }
 
@@ -776,9 +778,9 @@ static void vfu_object_init_ctx(VfuObject *o, Error **errp)
 
     ret = vfu_pci_init(o->vfu_ctx, pci_type, PCI_HEADER_TYPE_NORMAL, 0);
     if (ret < 0) {
-        error_setg(errp,
-                   "vfu: Failed to attach PCI device %s to context - %s",
-                   o->device, strerror(errno));
+        error_setg_errno(errp, errno,
+                         "vfu: Failed to attach PCI device %s to context",
+                         o->device);
         goto fail;
     }
 
@@ -792,13 +794,14 @@ static void vfu_object_init_ctx(VfuObject *o, Error **errp)
                            VFU_REGION_FLAG_RW | VFU_REGION_FLAG_ALWAYS_CB,
                            NULL, 0, -1, 0);
     if (ret < 0) {
-        error_setg(errp,
-                   "vfu: Failed to setup config space handlers for %s- %s",
-                   o->device, strerror(errno));
+        error_setg_errno(errp, errno,
+                         "vfu: Failed to setup config space handlers for %s",
+                         o->device);
         goto fail;
     }
 
-    ret = vfu_setup_device_dma(o->vfu_ctx, &dma_register, &dma_unregister);
+    ret = vfu_setup_device_dma(o->vfu_ctx, LIBVFIO_USER_MAX_DMA_REGIONS,
+                               &dma_register, &dma_unregister);
     if (ret < 0) {
         error_setg(errp, "vfu: Failed to setup DMA handlers for %s",
                    o->device);
@@ -822,8 +825,8 @@ static void vfu_object_init_ctx(VfuObject *o, Error **errp)
 
     ret = vfu_realize_ctx(o->vfu_ctx);
     if (ret < 0) {
-        error_setg(errp, "vfu: Failed to realize device %s- %s",
-                   o->device, strerror(errno));
+        error_setg_errno(errp, errno, "vfu: Failed to realize device %s",
+                         o->device);
         goto fail;
     }
 

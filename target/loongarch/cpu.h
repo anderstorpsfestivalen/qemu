@@ -10,7 +10,6 @@
 
 #include "qemu/int128.h"
 #include "exec/cpu-common.h"
-#include "exec/cpu-defs.h"
 #include "exec/cpu-interrupt.h"
 #include "fpu/softfloat-types.h"
 #include "hw/core/registerfields.h"
@@ -97,7 +96,15 @@ FIELD(FCSR0, CAUSE, 24, 5)
 #define  EXCCODE_DBP                 EXCODE(26, 0) /* Reserved subcode used for debug */
 
 /* cpucfg[0] bits */
-FIELD(CPUCFG0, PRID, 0, 32)
+FIELD(CPUCFG0, PRID, 0, 12)
+FIELD(CPUCFG0, SERID, 12, 4)
+FIELD(CPUCFG0, VENID, 16, 8)
+#define PRID_SERIES_LA132            0x8  /* Loongson 32bit */
+#define PRID_SERIES_LA264            0xa  /* Loongson 64bit, 2-issue */
+#define PRID_SERIES_LA364            0xb  /* Loongson 64bit, 3-issue */
+#define PRID_SERIES_LA464            0xc  /* Loongson 64bit, 4-issue */
+#define PRID_SERIES_LA664            0xd  /* Loongson 64bit, 6-issue */
+#define PRID_VENDOR_LOONGSON         0x14
 
 /* cpucfg[1] bits */
 FIELD(CPUCFG1, ARCH, 0, 2)
@@ -138,6 +145,12 @@ FIELD(CPUCFG2, LBT_ALL, 18, 3)
 FIELD(CPUCFG2, LSPW, 21, 1)
 FIELD(CPUCFG2, LAM, 22, 1)
 FIELD(CPUCFG2, HPTW, 24, 1)
+FIELD(CPUCFG2, FRECIPE, 25, 1)
+FIELD(CPUCFG2, DIV32, 26, 1)
+FIELD(CPUCFG2, LAM_BH, 27, 1)
+FIELD(CPUCFG2, LAMCAS, 28, 1)
+FIELD(CPUCFG2, LLACQ_SCREL, 29, 1)
+FIELD(CPUCFG2, SCQ, 30, 1)
 
 /* cpucfg[3] bits */
 FIELD(CPUCFG3, CCDMA, 0, 1)
@@ -152,6 +165,13 @@ FIELD(CPUCFG3, SPW_LVL, 8, 3)
 FIELD(CPUCFG3, SPW_HP_HF, 11, 1)
 FIELD(CPUCFG3, RVA, 12, 1)
 FIELD(CPUCFG3, RVAMAX, 13, 4)
+FIELD(CPUCFG3, DBAR_HINTS, 17, 1)
+FIELD(CPUCFG3, ALDORDER_CAP, 18, 1)
+FIELD(CPUCFG3, ASTORDER_CAP, 19, 1)
+FIELD(CPUCFG3, ALDORDER_STA, 20, 1)
+FIELD(CPUCFG3, ASTORDER_STA, 21, 1)
+FIELD(CPUCFG3, SLDORDER_CAP, 22, 1)
+FIELD(CPUCFG3, SLDORDER_STA, 23, 1)
 
 /* cpucfg[4] bits */
 FIELD(CPUCFG4, CC_FREQ, 0, 32)
@@ -223,6 +243,7 @@ extern const char * const fregnames[32];
 #define IRQ_IPI     12
 #define INT_DMSI    14
 
+#define MAX_PERF_EVENTS        16
 #define LOONGARCH_STLB         2048 /* 2048 STLB */
 #define LOONGARCH_MTLB         64   /* 64 MTLB */
 #define LOONGARCH_TLB_MAX      (LOONGARCH_STLB + LOONGARCH_MTLB)
@@ -293,18 +314,10 @@ typedef struct  LoongArchBT {
     uint32_t ftop;
 } lbt_t;
 
-typedef struct CPUArchState {
-    uint64_t gpr[32];
-    uint64_t pc;
-
-    fpr_t fpr[32];
-    bool cf[8];
-    uint32_t fcsr0;
-    lbt_t  lbt;
-
-    uint32_t cpucfg[21];
-    uint32_t pv_features;
-
+#define CPU_VENDOR_LOONGSON   "Loongson"
+#define CPU_MODEL_3A5000      "3A5000"
+#define CPU_MODEL_1C101       "1C101"
+typedef struct CPUSysState {
     /* LoongArch CSRs */
     uint64_t CSR_CRMD;
     uint64_t CSR_PRMD;
@@ -357,6 +370,8 @@ typedef struct CPUArchState {
     uint64_t CSR_MERRSAVE;
     uint64_t CSR_CTAG;
     uint64_t CSR_DMW[4];
+    uint64_t CSR_PERFCTRL[MAX_PERF_EVENTS];
+    uint64_t CSR_PERFCNTR[MAX_PERF_EVENTS];
     uint64_t CSR_DBG;
     uint64_t CSR_DERA;
     uint64_t CSR_DSAVE;
@@ -364,15 +379,36 @@ typedef struct CPUArchState {
     uint64_t CSR_MSGIS[N_MSGIS];
     uint64_t CSR_MSGIR;
     uint64_t CSR_MSGIE;
+} CPUSysState;
+
+typedef struct CPUArchState {
+    uint64_t gpr[32];
+    uint64_t pc;
+
+    fpr_t fpr[32];
+    bool cf[8];
+    uint32_t fcsr0;
+    lbt_t  lbt;
+
+    uint32_t cpucfg[21];
+    uint32_t pv_features;
+    uint64_t vendor_id;
+    uint64_t cpu_id;
+    CPUSysState sys_states[1];
+
     struct {
         uint64_t guest_addr;
     } stealtime;
+    uint32_t perf_event_num;
 
 #ifdef CONFIG_TCG
     float_status fp_status;
     uint32_t fcsr0_mask;
     uint64_t lladdr; /* LL virtual address compared against SC */
     uint64_t llval;
+    uint64_t llval_high; /* For 128-bit atomic SC.Q */
+    uint64_t llbit_scq; /* Potential LL.D+LD.D+SC.Q sequence in effect */
+    uint64_t hw_pte_mask; /* Mask of architecturally-defined (hardware) PTE bits. */
 #endif
 #ifndef CONFIG_USER_ONLY
 #ifdef CONFIG_TCG
@@ -382,6 +418,7 @@ typedef struct CPUArchState {
     AddressSpace *address_space_iocsr;
     uint32_t mp_state;
 #endif
+    CPUSysState *sys_state;
 } CPULoongArchState;
 
 typedef struct LoongArchCPUTopo {
@@ -448,6 +485,16 @@ struct LoongArchCPUClass {
 #define MMU_USER_IDX     MMU_PLV_USER
 #define MMU_DA_IDX       4
 
+static inline CPUSysState *env_sys(CPULoongArchState *env)
+{
+    return env->sys_state;
+}
+
+static inline void set_sys_state(CPULoongArchState *env, CPUSysState *sys)
+{
+    env->sys_state = sys;
+}
+
 static inline bool is_la64(CPULoongArchState *env)
 {
     return FIELD_EX32(env->cpucfg[1], CPUCFG1, ARCH) == CPUCFG1_ARCH_LA64;
@@ -457,8 +504,9 @@ static inline bool is_va32(CPULoongArchState *env)
 {
     /* VA32 if !LA64 or VA32L[1-3] */
     bool va32 = !is_la64(env);
-    uint64_t plv = FIELD_EX64(env->CSR_CRMD, CSR_CRMD, PLV);
-    if (plv >= 1 && (FIELD_EX64(env->CSR_MISC, CSR_MISC, VA32) & (1 << plv))) {
+    CPUSysState *sys = env_sys(env);
+    uint64_t plv = FIELD_EX64(sys->CSR_CRMD, CSR_CRMD, PLV);
+    if (plv >= 1 && (FIELD_EX64(sys->CSR_MISC, CSR_MISC, VA32) & (1 << plv))) {
         va32 = true;
     }
     return va32;

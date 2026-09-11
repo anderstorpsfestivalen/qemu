@@ -300,6 +300,7 @@
 #define __NR_landlock_create_ruleset 444
 #define __NR_landlock_add_rule 445
 #define __NR_landlock_restrict_self 446
+#define __NR_memfd_secret 447
 #define __NR_process_mrelease 448
 #define __NR_futex_waitv 449
 #define __NR_set_mempolicy_home_node 450
@@ -322,6 +323,8 @@
 #define __NR_open_tree_attr 467
 #define __NR_file_getattr 468
 #define __NR_file_setattr 469
+#define __NR_listns 470
+#define __NR_rseq_slice_yield 471
 
 
 #endif /* _ASM_UNISTD_64_H */

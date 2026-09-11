@@ -1,5 +1,8 @@
-system_ss.add(files(
+audio_ss = ss.source_set()
+audio_ss.add(files(
   'audio.c',
+  'audio-be.c',
+  'audio-mixeng-be.c',
   'mixeng.c',
   'noaudio.c',
   'wavaudio.c',
@@ -9,12 +12,11 @@ system_ss.add(files(
 # deprecated since v10.2, to be removed
 system_ss.add(files('audio-hmp-cmds.c', 'wavcapture.c'))
 
-system_ss.add(when: coreaudio, if_true: files('coreaudio.m'))
-system_ss.add(when: dsound, if_true: files('dsoundaudio.c', 'audio_win_int.c'))
-
 audio_modules = {}
 foreach m : [
   ['alsa', alsa, files('alsaaudio.c')],
+  ['coreaudio', coreaudio, files('coreaudio.m')],
+  ['dsound', dsound, files('dsoundaudio.c', 'audio_win_int.c')],
   ['oss', oss, files('ossaudio.c')],
   ['pa', pulse, files('paaudio.c')],
   ['sdl', sdl, files('sdlaudio.c')],
@@ -33,7 +35,7 @@ endforeach
 if dbus_display
     module_ss = ss.source_set()
     module_ss.add(when: [gio, pixman],
-                  if_true: [dbus_display1, files('dbusaudio.c')])
+                  if_true: [dbus_display1_h, files('dbusaudio.c')])
     audio_modules += {'dbus': module_ss}
 endif
 

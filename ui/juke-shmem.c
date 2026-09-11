@@ -380,7 +380,7 @@ static void juke_shmem_refresh(DisplayChangeListener *dcl)
         juke_shmem_process_input(s);
     }
 
-    graphic_hw_update(dcl->con);
+    qemu_console_hw_update(dcl->con);
 }
 
 /*
@@ -603,11 +603,11 @@ static void juke_shmem_setup_refresh(JukeShmemState *s)
     if (interval_ms > 0 && interval_ms < 100) {
         error_report("juke-shmem: using monitor refresh rate: %dms (~%dHz)",
                     interval_ms, 1000 / interval_ms);
-        update_displaychangelistener(&s->dcl, interval_ms);
+        qemu_console_listener_set_refresh(&s->dcl, interval_ms);
     } else {
         /* Fallback: 8ms (~120Hz) - fast enough for any common display */
         error_report("juke-shmem: using fallback refresh rate: 8ms (~120Hz)");
-        update_displaychangelistener(&s->dcl, 8);
+        qemu_console_listener_set_refresh(&s->dcl, 8);
     }
 }
 
@@ -626,7 +626,7 @@ static void juke_shmem_init(DisplayState *ds, DisplayOptions *opts)
         juke_shmem_connect(s);
     }
 
-    register_displaychangelistener(&s->dcl);
+    qemu_console_register_listener(s->dcl.con, &s->dcl, &juke_shmem_ops);
 
     /* Set refresh rate to match monitor (critical for performance!) */
     juke_shmem_setup_refresh(s);

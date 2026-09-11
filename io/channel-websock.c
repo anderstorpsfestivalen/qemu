@@ -457,7 +457,7 @@ static void qio_channel_websock_handshake_process(QIOChannelWebsock *ioc,
     connectionv = g_strsplit(connection, ",", 0);
     for (i = 0; connectionv != NULL && connectionv[i] != NULL; i++) {
         g_strstrip(connectionv[i]);
-        if (strcasecmp(connectionv[i],
+        if (g_ascii_strcasecmp(connectionv[i],
                        QIO_CHANNEL_WEBSOCK_CONNECTION_UPGRADE) == 0) {
             upgraded = true;
         }
@@ -468,7 +468,7 @@ static void qio_channel_websock_handshake_process(QIOChannelWebsock *ioc,
         goto bad_request;
     }
 
-    if (strcasecmp(upgrade, QIO_CHANNEL_WEBSOCK_UPGRADE_WEBSOCKET) != 0) {
+    if (g_ascii_strcasecmp(upgrade, QIO_CHANNEL_WEBSOCK_UPGRADE_WEBSOCKET) != 0) {
         error_setg(errp, "Incorrect upgrade method '%s'", upgrade);
         goto bad_request;
     }
@@ -526,11 +526,32 @@ static int qio_channel_websock_handshake_read(QIOChannelWebsock *ioc,
     return 1;
 }
 
+typedef struct QIOChannelWebsockData {
+    QIOTask *task;
+} QIOChannelWebsockData;
+
+static void qio_channel_websock_data_free(gpointer user_data)
+{
+    QIOChannelWebsockData *data = user_data;
+    /*
+     * Usually 'task' will be NULL since the GSource
+     * callback will either complete the task or pass
+     * it on to a new GSource. We'll see a non-NULL
+     * task here only if the GSource was released before
+     * its callback triggers
+     */
+    if (data->task) {
+        qio_task_free(data->task);
+    }
+    g_free(data);
+}
+
 static gboolean qio_channel_websock_handshake_send(QIOChannel *ioc,
                                                    GIOCondition condition,
                                                    gpointer user_data)
 {
-    QIOTask *task = user_data;
+    QIOChannelWebsockData *data = user_data;
+    QIOTask *task = data->task;
     QIOChannelWebsock *wioc = QIO_CHANNEL_WEBSOCK(
         qio_task_get_source(task));
     Error *err = NULL;
@@ -572,7 +593,8 @@ static gboolean qio_channel_websock_handshake_io(QIOChannel *ioc,
                                                  GIOCondition condition,
                                                  gpointer user_data)
 {
-    QIOTask *task = user_data;
+    QIOChannelWebsockData *data = user_data, *newdata = NULL;
+    QIOTask *task = data->task;
     QIOChannelWebsock *wioc = QIO_CHANNEL_WEBSOCK(
         qio_task_get_source(task));
     Error *err = NULL;
@@ -600,12 +622,14 @@ static gboolean qio_channel_websock_handshake_io(QIOChannel *ioc,
     error_propagate(&wioc->io_err, err);
 
     trace_qio_channel_websock_handshake_reply(ioc);
+    newdata = g_new0(QIOChannelWebsockData, 1);
+    newdata->task = g_steal_pointer(&data->task);
     wioc->hs_io_tag = qio_channel_add_watch(
         wioc->master,
         G_IO_OUT,
         qio_channel_websock_handshake_send,
-        task,
-        NULL);
+        newdata,
+        qio_channel_websock_data_free);
     return FALSE;
 }
 
@@ -901,12 +925,12 @@ void qio_channel_websock_handshake(QIOChannelWebsock *ioc,
                                    gpointer opaque,
                                    GDestroyNotify destroy)
 {
-    QIOTask *task;
+    QIOChannelWebsockData *data = g_new0(QIOChannelWebsockData, 1);
 
-    task = qio_task_new(OBJECT(ioc),
-                        func,
-                        opaque,
-                        destroy);
+    data->task = qio_task_new(OBJECT(ioc),
+                              func,
+                              opaque,
+                              destroy);
 
     trace_qio_channel_websock_handshake_start(ioc);
     trace_qio_channel_websock_handshake_pending(ioc, G_IO_IN);
@@ -914,8 +938,8 @@ void qio_channel_websock_handshake(QIOChannelWebsock *ioc,
         ioc->master,
         G_IO_IN,
         qio_channel_websock_handshake_io,
-        task,
-        NULL);
+        data,
+        qio_channel_websock_data_free);
 }
 
 
@@ -926,15 +950,9 @@ static void qio_channel_websock_finalize(Object *obj)
     buffer_free(&ioc->encinput);
     buffer_free(&ioc->encoutput);
     buffer_free(&ioc->rawinput);
-    if (ioc->hs_io_tag) {
-        g_source_remove(ioc->hs_io_tag);
-    }
-    if (ioc->io_tag) {
-        g_source_remove(ioc->io_tag);
-    }
-    if (ioc->io_err) {
-        error_free(ioc->io_err);
-    }
+    g_clear_handle_id(&ioc->hs_io_tag, g_source_remove);
+    g_clear_handle_id(&ioc->io_tag, g_source_remove);
+    error_free(ioc->io_err);
     object_unref(OBJECT(ioc->master));
 }
 
@@ -1048,10 +1066,7 @@ static gboolean qio_channel_websock_flush(QIOChannel *ioc,
 
 static void qio_channel_websock_unset_watch(QIOChannelWebsock *ioc)
 {
-    if (ioc->io_tag) {
-        g_source_remove(ioc->io_tag);
-        ioc->io_tag = 0;
-    }
+    g_clear_handle_id(&ioc->io_tag, g_source_remove);
 }
 
 static void qio_channel_websock_set_watch(QIOChannelWebsock *ioc)
@@ -1228,12 +1243,8 @@ static int qio_channel_websock_close(QIOChannel *ioc,
     buffer_free(&wioc->encinput);
     buffer_free(&wioc->encoutput);
     buffer_free(&wioc->rawinput);
-    if (wioc->hs_io_tag) {
-        g_clear_handle_id(&wioc->hs_io_tag, g_source_remove);
-    }
-    if (wioc->io_tag) {
-        g_clear_handle_id(&wioc->io_tag, g_source_remove);
-    }
+    g_clear_handle_id(&wioc->hs_io_tag, g_source_remove);
+    g_clear_handle_id(&wioc->io_tag, g_source_remove);
     if (wioc->io_err) {
         g_clear_pointer(&wioc->io_err, error_free);
     }

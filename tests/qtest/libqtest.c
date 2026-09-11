@@ -31,6 +31,7 @@
 #include "libqtest.h"
 #include "libqmp.h"
 #include "qemu/accel.h"
+#include "qemu/bswap.h"
 #include "qemu/ctype.h"
 #include "qemu/cutils.h"
 #include "qemu/exit-with-parent.h"
@@ -453,28 +454,27 @@ gchar *qtest_qemu_args(const char *extra_args)
 {
     g_autofree gchar *socket_path = qtest_socket_path("sock");
     g_autofree gchar *qmp_socket_path = qtest_socket_path("qmp");
-    const char *trace = g_getenv("QTEST_TRACE");
-    g_autofree char *tracearg = trace ? g_strdup_printf("-trace %s ", trace) :
-                                        g_strdup("");
+    const char *args_from_env = g_getenv("QTEST_QEMU_ARGS");
+
     gchar *args = g_strdup_printf(
-                      "%s"
                       "-qtest unix:%s "
                       "-qtest-log %s "
                       "-chardev socket,path=%s,id=char0 "
-                      "-mon chardev=char0,mode=control "
+                      "-object monitor-qmp,id=qmp0,chardev=char0 "
                       "-display none "
                       "-audio none "
-                      "%s"
-                      "%s"
-                      " -accel qtest",
+                      "%s "
+                      "%s "
+                      "%s "
+                      "-accel qtest",
 
-                      tracearg,
                       socket_path,
-                      getenv("QTEST_LOG") ? DEV_STDERR : DEV_NULL,
+                      qtest_verbose("qtest") ? DEV_STDERR : DEV_NULL,
                       qmp_socket_path,
                       can_exit_with_parent() ?
-                      "-run-with exit-with-parent=on " : "",
-                      extra_args ?: "");
+                      "-run-with exit-with-parent=on" : "",
+                      extra_args ?: "",
+                      args_from_env ?: "");
 
     return args;
 }
@@ -1014,22 +1014,39 @@ char *qtest_hmp(QTestState *s, const char *fmt, ...)
 
 const char *qtest_get_arch(void)
 {
-    const char *qemu = qtest_qemu_binary(NULL);
-    const char *end = strrchr(qemu, '-');
+    /*
+     * We find and cache the architecture name once, because we need to
+     * allocate memory to hold it. This memory will stay around for
+     * the lifetime of this test process.
+     */
+    static const char *arch;
 
-    if (!end) {
-        fprintf(stderr, "Can't determine architecture from binary name.\n");
-        exit(1);
+    if (!arch) {
+        /*
+         * Find the rightmost occurrence of "-system-"; the architecture
+         * name runs from there to the next whitespace.
+         */
+        const char *qemu = qtest_qemu_binary(NULL);
+        const char *sysstr = g_strrstr(qemu, "-system-");
+
+        if (sysstr) {
+            g_auto(GStrv) tokens = g_strsplit_set(sysstr + strlen("-system-"),
+                                                  " \t", 2);
+            if (tokens && tokens[0]) {
+                arch = g_steal_pointer(&tokens[0]);
+            }
+        }
+
+        if (!arch) {
+            fprintf(stderr, "Can't determine architecture from binary name.\n"
+                    "QTEST_QEMU_BINARY must include *-system-<arch> where "
+                    "'arch' is the target architecture "
+                    "(x86_64, aarch64, etc).\n");
+            exit(1);
+        }
     }
 
-    if (!strstr(qemu, "-system-")) {
-        fprintf(stderr, "QTEST_QEMU_BINARY must end with *-system-<arch> "
-                "where 'arch' is the target\narchitecture (x86_64, aarch64, "
-                "etc).\n");
-        exit(1);
-    }
-
-    return end + 1;
+    return arch;
 }
 
 static bool qtest_qom_has_concrete_type(const char *parent_typename,
@@ -1041,7 +1058,6 @@ static bool qtest_qom_has_concrete_type(const char *parent_typename,
     QObject *qobj;
     QString *qstr;
     QDict *devinfo;
-    int idx;
 
     if (!list) {
         QDict *resp;
@@ -1066,7 +1082,7 @@ static bool qtest_qom_has_concrete_type(const char *parent_typename,
         }
     }
 
-    for (p = qlist_first(list), idx = 0; p; p = qlist_next(p), idx++) {
+    for (p = qlist_first(list); p; p = qlist_next(p)) {
         devinfo = qobject_to(QDict, qlist_entry_obj(p));
         g_assert(devinfo);
 
@@ -1118,6 +1134,12 @@ bool qtest_get_irq(QTestState *s, int num)
 void qtest_module_load(QTestState *s, const char *prefix, const char *libname)
 {
     qtest_sendf(s, "module_load %s %s\n", prefix, libname);
+    qtest_rsp(s);
+}
+
+void qtest_qom_tests(QTestState *s)
+{
+    qtest_sendf(s, "qom-tests\n");
     qtest_rsp(s);
 }
 
@@ -1190,12 +1212,12 @@ void qtest_outb(QTestState *s, uint16_t addr, uint8_t value)
 
 void qtest_outw(QTestState *s, uint16_t addr, uint16_t value)
 {
-    qtest_out(s, "outw", addr, value);
+    qtest_out(s, "outw", addr, qtest_big_endian(s) ? bswap16(value) : value);
 }
 
 void qtest_outl(QTestState *s, uint16_t addr, uint32_t value)
 {
-    qtest_out(s, "outl", addr, value);
+    qtest_out(s, "outl", addr, qtest_big_endian(s) ? bswap32(value) : value);
 }
 
 static uint32_t qtest_in(QTestState *s, const char *cmd, uint16_t addr)
@@ -1220,12 +1242,16 @@ uint8_t qtest_inb(QTestState *s, uint16_t addr)
 
 uint16_t qtest_inw(QTestState *s, uint16_t addr)
 {
-    return qtest_in(s, "inw", addr);
+    uint16_t v = qtest_in(s, "inw", addr);
+
+    return qtest_big_endian(s) ? bswap16(v) : v;
 }
 
 uint32_t qtest_inl(QTestState *s, uint16_t addr)
 {
-    return qtest_in(s, "inl", addr);
+    uint32_t v = qtest_in(s, "inl", addr);
+
+    return qtest_big_endian(s) ? bswap32(v) : v;
 }
 
 static void qtest_write(QTestState *s, const char *cmd, uint64_t addr,
@@ -1811,6 +1837,7 @@ void qtest_cb_for_every_machine(void (*cb)(const char *machine),
             g_str_equal("xenpv", machines[i].name) ||
             g_str_equal("xenpvh", machines[i].name) ||
             g_str_equal("vmapple", machines[i].name) ||
+            g_str_equal("nitro", machines[i].name) ||
             g_str_equal("nitro-enclave", machines[i].name)) {
             continue;
         }
@@ -2120,4 +2147,58 @@ bool mkimg(const char *file, const char *fmt, unsigned size_mb)
     free(qemu_img_abs_path);
 
     return ret && !err;
+}
+
+bool qtest_verbose(const char *domain)
+{
+    const char *log = getenv("QTEST_LOG");
+    const char *found;
+
+    assert(domain);
+
+    if (log) {
+        /*
+         * verbose=true for all domains if:
+         *  QTEST_LOG=
+         *  QTEST_LOG=1
+         *  other one-character variations
+         */
+        if (log[0] == '\0' || log[1] == '\0') {
+            return true;
+        }
+
+        /*
+         * verbose=true for specified domains if:
+         *  QTEST_LOG=<domain>
+         *  QTEST_LOG=<domain1>,<domain2>
+         *  allows other separators, except - and +
+         *
+         * verbose=false for specified domains if:
+         *  QTEST_LOG=-<domain>
+         *  QTEST_LOG=<domain1>,-<domain2> (only false for domain2)
+         *  allows other separators, except - and +
+         */
+        found = strstr(log, domain);
+
+        if (found) {
+            /* reject options given twice */
+            assert(!strstr(found + strlen(domain), domain));
+
+            if (found > log) {
+                ptrdiff_t i = found - log - 1;
+                if (log[i] == '-') {
+                    return false;
+                }
+            }
+            return true;
+        } else {
+            /*
+             * If filtering out a specific domain, all others are
+             * enabled.
+             */
+            return !!strstr(log, "-");
+        }
+    }
+
+    return false;
 }

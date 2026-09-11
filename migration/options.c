@@ -13,6 +13,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
+#include "qemu/units.h"
 #include "exec/target_page.h"
 #include "qapi/clone-visitor.h"
 #include "qapi/error.h"
@@ -90,6 +91,7 @@ const PropertyInfo qdev_prop_StrOrNull;
 
 #define DEFAULT_MIGRATE_VCPU_DIRTY_LIMIT_PERIOD     1000    /* milliseconds */
 #define DEFAULT_MIGRATE_VCPU_DIRTY_LIMIT            1       /* MB/s */
+#define DEFAULT_MIGRATE_X_RDMA_CHUNK_SIZE           MiB
 
 const Property migration_properties[] = {
     DEFINE_PROP_BOOL("store-global-state", MigrationState,
@@ -108,6 +110,8 @@ const Property migration_properties[] = {
                      preempt_pre_7_2, false),
     DEFINE_PROP_BOOL("multifd-clean-tls-termination", MigrationState,
                      multifd_clean_tls_termination, true),
+    DEFINE_PROP_BOOL("switchover-ack-legacy", MigrationState,
+                     switchover_ack_legacy, false),
 
     /* Migration parameters */
     DEFINE_PROP_UINT8("x-throttle-trigger-threshold", MigrationState,
@@ -183,12 +187,14 @@ const Property migration_properties[] = {
     DEFINE_PROP_ZERO_PAGE_DETECTION("zero-page-detection", MigrationState,
                        parameters.zero_page_detection,
                        ZERO_PAGE_DETECTION_MULTIFD),
+    DEFINE_PROP_UINT64("x-rdma-chunk-size", MigrationState,
+                      parameters.x_rdma_chunk_size,
+                      DEFAULT_MIGRATE_X_RDMA_CHUNK_SIZE),
 
     /* Migration capabilities */
     DEFINE_PROP_MIG_CAP("x-xbzrle", MIGRATION_CAPABILITY_XBZRLE),
     DEFINE_PROP_MIG_CAP("x-rdma-pin-all", MIGRATION_CAPABILITY_RDMA_PIN_ALL),
     DEFINE_PROP_MIG_CAP("x-auto-converge", MIGRATION_CAPABILITY_AUTO_CONVERGE),
-    DEFINE_PROP_MIG_CAP("x-zero-blocks", MIGRATION_CAPABILITY_ZERO_BLOCKS),
     DEFINE_PROP_MIG_CAP("x-events", MIGRATION_CAPABILITY_EVENTS),
     DEFINE_PROP_MIG_CAP("x-postcopy-ram", MIGRATION_CAPABILITY_POSTCOPY_RAM),
     DEFINE_PROP_MIG_CAP("x-postcopy-preempt",
@@ -221,14 +227,12 @@ static void get_StrOrNull(Object *obj, Visitor *v, const char *name,
     StrOrNull **ptr = object_field_prop_ptr(obj, prop);
     StrOrNull *str_or_null = *ptr;
 
-    if (!str_or_null) {
-        str_or_null = g_new0(StrOrNull, 1);
-        str_or_null->type = QTYPE_QSTRING;
-        str_or_null->u.s = g_strdup("");
-    } else {
-        /* the setter doesn't allow QNULL */
-        assert(str_or_null->type != QTYPE_QNULL);
-    }
+    /*
+     * The property should never be NULL because it's part of
+     * s->parameters and a default value is always set by qdev. It
+     * should also never be QNULL as the setter doesn't allow it.
+     */
+    assert(str_or_null && str_or_null->type != QTYPE_QNULL);
     visit_type_str(v, name, &str_or_null->u.s, errp);
 }
 
@@ -237,16 +241,25 @@ static void set_StrOrNull(Object *obj, Visitor *v, const char *name,
 {
     const Property *prop = opaque;
     StrOrNull **ptr = object_field_prop_ptr(obj, prop);
-    StrOrNull *str_or_null = g_new0(StrOrNull, 1);
+    StrOrNull *str_or_null;
+    char *str;
 
-    /*
-     * Only str to keep compatibility, QNULL was never used via
-     * command line.
-     */
-    str_or_null->type = QTYPE_QSTRING;
-    if (!visit_type_str(v, name, &str_or_null->u.s, errp)) {
+    if (!visit_type_str(v, name, &str, errp)) {
         return;
     }
+
+    /*
+     * This property only applies to the command line usage of
+     * migration's TLS options (-global migration.tls-*) where the
+     * NULL value cannot be provided as input (only strings are
+     * allowed). Therefore, this StrOrNull implementation never
+     * produces a QNULL value to avoid ever returning values outside
+     * the range of what was previously handled by consumers of the
+     * TLS options.
+     */
+    str_or_null = g_new0(StrOrNull, 1);
+    str_or_null->type = QTYPE_QSTRING;
+    str_or_null->u.s = str;
 
     qapi_free_StrOrNull(*ptr);
     *ptr = str_or_null;
@@ -456,6 +469,13 @@ bool migrate_rdma(void)
     return s->rdma_migration;
 }
 
+bool migrate_switchover_ack_legacy(void)
+{
+    MigrationState *s = migrate_get_current();
+
+    return s->switchover_ack_legacy;
+}
+
 typedef enum WriteTrackingSupport {
     WT_SUPPORT_UNKNOWN = 0,
     WT_SUPPORT_ABSENT,
@@ -576,11 +596,15 @@ bool migrate_caps_check(bool *old_caps, bool *new_caps, Error **errp)
     ERRP_GUARD();
     MigrationIncomingState *mis = migration_incoming_get_current();
 
-    if (new_caps[MIGRATION_CAPABILITY_ZERO_BLOCKS]) {
-        warn_report("zero-blocks capability is deprecated");
+#ifdef CONFIG_REPLICATION
+    if (new_caps[MIGRATION_CAPABILITY_X_COLO]) {
+        if (!new_caps[MIGRATION_CAPABILITY_RETURN_PATH]) {
+            error_setg(errp, "Capability 'x-colo' requires capability "
+                             "'return-path'");
+            return false;
+        }
     }
-
-#ifndef CONFIG_REPLICATION
+#else
     if (new_caps[MIGRATION_CAPABILITY_X_COLO]) {
         error_setg(errp, "QEMU compiled without replication module"
                    " can't enable COLO");
@@ -956,6 +980,11 @@ const char *migrate_tls_hostname(void)
         return s->parameters.tls_hostname->u.s;
     }
 
+    /* hostname saved from a previously connected channel */
+    if (s->hostname) {
+        return s->hostname;
+    }
+
     return NULL;
 }
 
@@ -983,6 +1012,15 @@ ZeroPageDetection migrate_zero_page_detection(void)
     MigrationState *s = migrate_get_current();
 
     return s->parameters.zero_page_detection;
+}
+
+uint64_t migrate_rdma_chunk_size(void)
+{
+    MigrationState *s = migrate_get_current();
+    uint64_t size = s->parameters.x_rdma_chunk_size;
+
+    assert(MiB <= size && size <= GiB && is_power_of_2(size));
+    return size;
 }
 
 /* parameters helpers */
@@ -1047,7 +1085,7 @@ static void migrate_mark_all_params_present(MigrationParameters *p)
         &p->has_announce_step, &p->has_block_bitmap_mapping,
         &p->has_x_vcpu_dirty_limit_period, &p->has_vcpu_dirty_limit,
         &p->has_mode, &p->has_zero_page_detection, &p->has_direct_io,
-        &p->has_cpr_exec_command,
+        &p->has_x_rdma_chunk_size, &p->has_cpr_exec_command,
     };
 
     len = ARRAY_SIZE(has_fields);
@@ -1118,103 +1156,103 @@ bool migrate_params_check(MigrationParameters *params, Error **errp)
 
     if (params->throttle_trigger_threshold < 1 ||
         params->throttle_trigger_threshold > 100) {
-        error_setg(errp, "Option throttle_trigger_threshold expects "
+        error_setg(errp, "Option throttle-trigger-threshold expects "
                    "an integer in the range of 1 to 100");
         return false;
     }
 
     if (params->cpu_throttle_initial < 1 ||
         params->cpu_throttle_initial > 99) {
-        error_setg(errp, "Option cpu_throttle_initial expects "
+        error_setg(errp, "Option cpu-throttle-initial expects "
                    "an integer in the range of 1 to 99");
         return false;
     }
 
     if (params->cpu_throttle_increment < 1 ||
         params->cpu_throttle_increment > 99) {
-        error_setg(errp, "Option cpu_throttle_increment expects "
+        error_setg(errp, "Option cpu-throttle-increment expects "
                    "an integer in the range of 1 to 99");
         return false;
     }
 
     if (params->max_bandwidth > SIZE_MAX) {
-        error_setg(errp, "Option max_bandwidth expects "
+        error_setg(errp, "Option max-bandwidth expects "
                    "an integer in the range of 0 to "stringify(SIZE_MAX)
                    " bytes/second");
         return false;
     }
 
     if (params->avail_switchover_bandwidth > SIZE_MAX) {
-        error_setg(errp, "Option avail_switchover_bandwidth expects "
+        error_setg(errp, "Option avail-switchover-bandwidth expects "
                    "an integer in the range of 0 to "stringify(SIZE_MAX)
                    " bytes/second");
         return false;
     }
 
     if (params->downtime_limit > MAX_MIGRATE_DOWNTIME) {
-        error_setg(errp, "Option downtime_limit expects "
+        error_setg(errp, "Option downtime-limit expects "
                    "an integer in the range of 0 to "
                     stringify(MAX_MIGRATE_DOWNTIME)" ms");
         return false;
     }
 
     if (params->multifd_channels < 1) {
-        error_setg(errp, "Option multifd_channels expects "
+        error_setg(errp, "Option multifd-channels expects "
                    "a value between 1 and 255");
         return false;
     }
 
     if (params->multifd_zlib_level > 9) {
-        error_setg(errp, "Option multifd_zlib_level expects "
+        error_setg(errp, "Option multifd-zlib-level expects "
                    "a value between 0 and 9");
         return false;
     }
 
     if (params->multifd_qatzip_level > 9 ||
         params->multifd_qatzip_level < 1) {
-        error_setg(errp, "Option multifd_qatzip_level expects "
+        error_setg(errp, "Option multifd-qatzip-level expects "
                    "a value between 1 and 9");
         return false;
     }
 
     if (params->multifd_zstd_level > 20) {
-        error_setg(errp, "Option multifd_zstd_level expects "
+        error_setg(errp, "Option multifd-zstd-level expects "
                    "a value between 0 and 20");
         return false;
     }
 
     if (params->xbzrle_cache_size < qemu_target_page_size() ||
         !is_power_of_2(params->xbzrle_cache_size)) {
-        error_setg(errp, "Option xbzrle_cache_size expects "
+        error_setg(errp, "Option xbzrle-cache-size expects "
                    "a power of two no less than the target page size");
         return false;
     }
 
     if (params->max_cpu_throttle < params->cpu_throttle_initial ||
         params->max_cpu_throttle > 99) {
-        error_setg(errp, "max_Option cpu_throttle expects "
-                   "an integer in the range of cpu_throttle_initial to 99");
+        error_setg(errp, "Option max-cpu-throttle expects "
+                   "an integer in the range of cpu-throttle-initial to 99");
         return false;
     }
 
     if (params->announce_initial > 100000) {
-        error_setg(errp, "Option announce_initial expects "
+        error_setg(errp, "Option announce-initial expects "
                    "a value between 0 and 100000");
         return false;
     }
     if (params->announce_max > 100000) {
-        error_setg(errp, "Option announce_max expects "
+        error_setg(errp, "Option announce-max expects "
                    "a value between 0 and 100000");
         return false;
     }
     if (params->announce_rounds > 1000) {
-        error_setg(errp, "Option announce_rounds expects "
+        error_setg(errp, "Option announce-rounds expects "
                    "a value between 0 and 1000");
         return false;
     }
     if (params->announce_step < 1 ||
         params->announce_step > 10000) {
-        error_setg(errp, "Option announce_step expects "
+        error_setg(errp, "Option announce-step expects "
                    "a value between 0 and 10000");
         return false;
     }
@@ -1249,12 +1287,21 @@ bool migrate_params_check(MigrationParameters *params, Error **errp)
 
     if (params->vcpu_dirty_limit < 1) {
         error_setg(errp,
-                   "Parameter 'vcpu_dirty_limit' must be greater than 1 MB/s");
+                   "Parameter 'vcpu-dirty-limit' must be greater than 1 MB/s");
         return false;
     }
 
     if (params->direct_io && !qemu_has_direct_io()) {
         error_setg(errp, "No build-time support for direct-io");
+        return false;
+    }
+
+    if (params->has_x_rdma_chunk_size &&
+        (params->x_rdma_chunk_size < MiB ||
+         params->x_rdma_chunk_size > GiB ||
+         !is_power_of_2(params->x_rdma_chunk_size))) {
+        error_setg(errp, "Option x_rdma_chunk_size expects "
+                   "a power of 2 in the range 1MiB to 1024MiB");
         return false;
     }
 
@@ -1264,9 +1311,9 @@ bool migrate_params_check(MigrationParameters *params, Error **errp)
 static void migrate_params_test_apply(MigrationParameters *params,
                                       MigrationParameters *dest)
 {
-    *dest = migrate_get_current()->parameters;
+    MigrationState *s = migrate_get_current();
 
-    /* TODO use QAPI_CLONE() instead of duplicating it inline */
+    QAPI_CLONE_MEMBERS(MigrationParameters, dest, &s->parameters);
 
     if (params->has_throttle_trigger_threshold) {
         dest->throttle_trigger_threshold = params->throttle_trigger_threshold;
@@ -1285,24 +1332,18 @@ static void migrate_params_test_apply(MigrationParameters *params,
     }
 
     if (params->tls_creds) {
+        qapi_free_StrOrNull(dest->tls_creds);
         dest->tls_creds = QAPI_CLONE(StrOrNull, params->tls_creds);
-    } else {
-        /* clear the reference, it's owned by s->parameters */
-        dest->tls_creds = NULL;
     }
 
     if (params->tls_hostname) {
+        qapi_free_StrOrNull(dest->tls_hostname);
         dest->tls_hostname = QAPI_CLONE(StrOrNull, params->tls_hostname);
-    } else {
-        /* clear the reference, it's owned by s->parameters */
-        dest->tls_hostname = NULL;
     }
 
     if (params->tls_authz) {
+        qapi_free_StrOrNull(dest->tls_authz);
         dest->tls_authz = QAPI_CLONE(StrOrNull, params->tls_authz);
-    } else {
-        /* clear the reference, it's owned by s->parameters */
-        dest->tls_authz = NULL;
     }
 
     if (params->has_max_bandwidth) {
@@ -1359,8 +1400,9 @@ static void migrate_params_test_apply(MigrationParameters *params,
     }
 
     if (params->has_block_bitmap_mapping) {
-        dest->has_block_bitmap_mapping = true;
-        dest->block_bitmap_mapping = params->block_bitmap_mapping;
+        qapi_free_BitmapMigrationNodeAliasList(dest->block_bitmap_mapping);
+        dest->block_bitmap_mapping = QAPI_CLONE(BitmapMigrationNodeAliasList,
+                                                params->block_bitmap_mapping);
     }
 
     if (params->has_x_vcpu_dirty_limit_period) {
@@ -1383,8 +1425,13 @@ static void migrate_params_test_apply(MigrationParameters *params,
         dest->direct_io = params->direct_io;
     }
 
+    if (params->has_x_rdma_chunk_size) {
+        dest->x_rdma_chunk_size = params->x_rdma_chunk_size;
+    }
+
     if (params->has_cpr_exec_command) {
-        dest->cpr_exec_command = params->cpr_exec_command;
+        qapi_free_strList(dest->cpr_exec_command);
+        dest->cpr_exec_command = QAPI_CLONE(strList, params->cpr_exec_command);
     }
 }
 
@@ -1509,6 +1556,10 @@ static void migrate_params_apply(MigrationParameters *params)
         s->parameters.direct_io = params->direct_io;
     }
 
+    if (params->has_x_rdma_chunk_size) {
+        s->parameters.x_rdma_chunk_size = params->x_rdma_chunk_size;
+    }
+
     if (params->has_cpr_exec_command) {
         qapi_free_strList(s->parameters.cpr_exec_command);
         s->parameters.cpr_exec_command =
@@ -1540,4 +1591,6 @@ void qmp_migrate_set_parameters(MigrationParameters *params, Error **errp)
     }
 
     migrate_tls_opts_free(&tmp);
+    qapi_free_BitmapMigrationNodeAliasList(tmp.block_bitmap_mapping);
+    qapi_free_strList(tmp.cpr_exec_command);
 }

@@ -48,7 +48,6 @@ struct PXBBus {
     char bus_path[8];
 };
 
-#define TYPE_PXB_PCIE_DEV "pxb-pcie"
 OBJECT_DECLARE_SIMPLE_TYPE(PXBPCIEDev, PXB_PCIE_DEV)
 
 static GList *pxb_dev_list;
@@ -86,8 +85,14 @@ static uint16_t pxb_bus_numa_node(PCIBus *bus)
 static void prop_pxb_uid_get(Object *obj, Visitor *v, const char *name,
                              void *opaque, Error **errp)
 {
-    uint32_t uid = pci_bus_num(PCI_BUS(obj));
+    PCIBus *bus = PCI_BUS(obj);
+    uint32_t uid;
 
+    if (!bus->parent_dev) {
+        error_setg(errp, "bus not attached to a device");
+        return;
+    }
+    uid = pci_bus_num(bus);
     visit_type_uint32(v, name, &uid, errp);
 }
 
@@ -301,7 +306,7 @@ static void pxb_cxl_dev_reset(DeviceState *dev)
     uint32_t *write_msk = cxl_cstate->crb.cache_mem_regs_write_mask;
     int dsp_count = 0;
 
-    cxl_component_register_init_common(reg_state, write_msk, CXL2_RC);
+    cxl_component_register_init_common(reg_state, write_msk, CXL2_RC, false);
     /*
      * The CXL specification allows for host bridges with no HDM decoders
      * if they only have a single root port.

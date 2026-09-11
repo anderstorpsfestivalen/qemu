@@ -99,13 +99,13 @@ Other commit tags
 While the ``Signed-off-by`` tag is mandatory, there are a number of other tags
 that are commonly used during QEMU development:
 
- * **``Reviewed-by``**: when a QEMU community member reviews a patch on the
+ * **Reviewed-by**: when a QEMU community member reviews a patch on the
    mailing list, if they consider the patch acceptable, they should send an
    email reply containing a ``Reviewed-by`` tag. Subsystem maintainers who
    review a patch should add this even if they are also adding their
    ``Signed-off-by`` to the same commit.
 
- * **``Acked-by``**: when a QEMU subsystem maintainer approves a patch that
+ * **Acked-by**: when a QEMU subsystem maintainer approves a patch that
    touches their subsystem, but intends to allow a different maintainer to
    queue it and send a pull request, they would send a mail containing a
    ``Acked-by`` tag. Where a patch touches multiple subsystems, ``Acked-by``
@@ -113,18 +113,18 @@ that are commonly used during QEMU development:
    maintainer wants to indicate they have done a full review they should use
    a ``Reviewed-by`` tag.
 
- * **``Tested-by``**: when a QEMU community member has functionally tested the
+ * **Tested-by**: when a QEMU community member has functionally tested the
    behaviour of the patch in some manner, they should send an email reply
    containing a ``Tested-by`` tag.
 
- * **``Reported-by``**: when a QEMU community member reports a problem via the
+ * **Reported-by**: when a QEMU community member reports a problem via the
    mailing list, or some other informal channel that is not the issue tracker,
    it is good practice to credit them by including a ``Reported-by`` tag on
    any patch fixing the issue. When the problem is reported via the GitLab
    issue tracker, however, it is sufficient to just include a link to the
    issue.
 
- * **``Suggested-by``**: when a reviewer or other 3rd party makes non-trivial
+ * **Suggested-by**: when a reviewer or other 3rd party makes non-trivial
    suggestions for how to change a patch, it is good practice to credit them
    by including a ``Suggested-by`` tag.
 
@@ -213,7 +213,7 @@ The general principles when picking up abandoned work are:
  * Indicate where the original patch was obtained from (mailing list, bug
    tracker, author's git repo, etc) when sending it for review
  * Acknowledge the extra work of the new contributor by including their
-   ``Signed-off-by`` in the patch in addition to the orignal author's
+   ``Signed-off-by`` in the patch in addition to the original author's
  * Indicate who is responsible for what parts of the patch. This is typically
    done via a note in the commit message, just prior to the new contributor's
    ``Signed-off-by``::
@@ -259,7 +259,7 @@ process. A non-exhaustive list of examples is:
    container images from a clean git checkout.
 
  * eBPF: QEMU includes some generated eBPF machine code, since the required
-   eBPF compilation tools are not broadly available on all targetted OS
+   eBPF compilation tools are not broadly available on all targeted OS
    distributions. The corresponding eBPF C code for the binary is also
    provided. This is a time-limited exception until the eBPF toolchain is
    sufficiently broadly available in distros.

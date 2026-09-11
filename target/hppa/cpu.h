@@ -22,8 +22,8 @@
 
 #include "cpu-qom.h"
 #include "exec/cpu-common.h"
-#include "exec/cpu-defs.h"
 #include "exec/cpu-interrupt.h"
+#include "exec/target_long.h"
 #include "system/memory.h"
 #include "qemu/cpu-float.h"
 #include "qemu/interval-tree.h"
@@ -270,8 +270,6 @@ typedef struct CPUArchState {
     /* Fields up to this point are cleared by a CPU reset */
     struct {} end_reset_fields;
 
-    bool is_pa20;
-
     target_ulong kernel_entry; /* Linux kernel was loaded here */
     target_ulong cmdline_or_bootorder;
     target_ulong initrd_base, initrd_end;
@@ -291,6 +289,18 @@ struct ArchCPU {
 };
 
 /**
+ * HPPACPUDef:
+ * @phys_addr_bits: Number of bits in the physical address space.
+ * @is_pa20: Whether the CPU model follows the PA-RISC 2.0 or 1.1 spec.
+ *
+ * Configuration options for a HPPA CPU model.
+ */
+typedef struct HPPACPUDef {
+    uint8_t phys_addr_bits;
+    bool is_pa20;
+} HPPACPUDef;
+
+/**
  * HPPACPUClass:
  * @parent_realize: The parent class' realize handler.
  * @parent_phases: The parent class' reset phase handlers.
@@ -302,11 +312,22 @@ struct HPPACPUClass {
 
     DeviceRealize parent_realize;
     ResettablePhases parent_phases;
+    const HPPACPUDef *def;
 };
 
-static inline bool hppa_is_pa20(const CPUHPPAState *env)
+static inline const HPPACPUDef *hppa_def(CPUHPPAState *env)
 {
-    return env->is_pa20;
+    return HPPA_CPU_GET_CLASS(env_cpu(env))->def;
+}
+
+static inline uint8_t hppa_phys_addr_bits(CPUHPPAState *env)
+{
+    return hppa_def(env)->phys_addr_bits;
+}
+
+static inline bool hppa_is_pa20(CPUHPPAState *env)
+{
+    return hppa_def(env)->is_pa20;
 }
 
 static inline int HPPA_BTLB_ENTRIES(CPUHPPAState *env)
@@ -336,8 +357,9 @@ static inline vaddr hppa_form_gva(CPUHPPAState *env, uint64_t spc,
     return hppa_form_gva_mask(env->gva_offset_mask, spc, off);
 }
 
-hwaddr hppa_abs_to_phys_pa2_w0(vaddr addr);
-hwaddr hppa_abs_to_phys_pa2_w1(vaddr addr);
+hwaddr hppa_abs_to_phys_pa1x(uint8_t phys_addr_bits, vaddr addr);
+hwaddr hppa_abs_to_phys_pa2_w0(uint8_t phys_addr_bits, vaddr addr);
+hwaddr hppa_abs_to_phys_pa2_w1(uint8_t phys_addr_bits, vaddr addr);
 
 /*
  * Since PSW_{I,CB} will never need to be in tb->flags, reuse them.
@@ -367,7 +389,7 @@ int hppa_cpu_gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
 void hppa_cpu_dump_state(CPUState *cs, FILE *f, int);
 #ifndef CONFIG_USER_ONLY
 void hppa_ptlbe(CPUHPPAState *env);
-hwaddr hppa_cpu_get_phys_page_debug(CPUState *cs, vaddr addr);
+hwaddr hppa_cpu_get_phys_addr_debug(CPUState *cs, vaddr addr);
 void hppa_set_ior_and_isr(CPUHPPAState *env, vaddr addr, bool mmu_disabled);
 bool hppa_cpu_tlb_fill_align(CPUState *cs, CPUTLBEntryFull *out, vaddr addr,
                              MMUAccessType access_type, int mmu_idx,

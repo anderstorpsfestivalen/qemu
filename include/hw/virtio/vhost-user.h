@@ -10,6 +10,7 @@
 
 #include "chardev/char-fe.h"
 #include "hw/virtio/virtio.h"
+#include "qapi/qapi-types-virtio.h"
 
 enum VhostUserProtocolFeature {
     VHOST_USER_PROTOCOL_F_MQ = 0,
@@ -32,6 +33,9 @@ enum VhostUserProtocolFeature {
     /* Feature 17 reserved for VHOST_USER_PROTOCOL_F_XEN_MMAP. */
     VHOST_USER_PROTOCOL_F_SHARED_OBJECT = 18,
     VHOST_USER_PROTOCOL_F_DEVICE_STATE = 19,
+    VHOST_USER_PROTOCOL_F_GET_VRING_BASE_INFLIGHT = 20,
+    VHOST_USER_PROTOCOL_F_GPA_ADDRESSES = 21,
+    VHOST_USER_PROTOCOL_F_SHMEM = 22,
     VHOST_USER_PROTOCOL_F_MAX
 };
 
@@ -68,6 +72,7 @@ typedef struct VhostUserState {
     GPtrArray *notifiers;
     int memory_slots;
     bool supports_config;
+    bool supports_inflight_migration;
 } VhostUserState;
 
 /**
@@ -110,5 +115,8 @@ typedef void (*vu_async_close_fn)(DeviceState *cb);
 void vhost_user_async_close(DeviceState *d,
                             CharFrontend *chardev, struct vhost_dev *vhost,
                             vu_async_close_fn cb);
+
+void vhost_user_qmp_status(struct vhost_dev *dev, VirtioStatus *status);
+bool vhost_user_has_protocol_feature(struct vhost_dev *dev, uint64_t feature);
 
 #endif

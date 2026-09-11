@@ -164,7 +164,7 @@ static void screamerspk_callback(void *opaque, int avail)
             n = MIN(s->bpos - s->ppos, (unsigned int)avail);
             SCREAMER_DPRINTF("########### AUDIO WRITE! %d / %d - %d\n",
                              s->ppos, s->bpos, n);
-            len = AUD_write(s->voice, &s->buf[s->ppos], n);
+            len = audio_be_write(s->audio_be, s->voice, &s->buf[s->ppos], n);
             s->ppos += len;
             return;
         }
@@ -186,14 +186,14 @@ static void screamer_update_settings(ScreamerState *s)
         .freq = s->rate,
         .nchannels = 2,
         .fmt = AUDIO_FORMAT_S16,
-        .endianness = s->regs[BYTE_SWAP_REG] ? 0 : 1
+        .big_endian = !s->regs[BYTE_SWAP_REG]
     };
 
     SCREAMER_DPRINTF("screamer_update_settings: rate=%d, endian=%d\n",
-                     s->rate, as.endianness);
+                     s->rate, as.big_endian);
 
     /* Re-open voice with new settings */
-    s->voice = AUD_open_out(s->audio_be, s->voice, s_spk, s,
+    s->voice = audio_be_open_out(s->audio_be, s->voice, s_spk, s,
                             screamerspk_callback, &as);
     if (!s->voice) {
         qemu_log_mask(LOG_GUEST_ERROR, "screamer: Could not open voice\n");
@@ -201,7 +201,7 @@ static void screamer_update_settings(ScreamerState *s)
     }
 
     /* Always keep voice active to receive callbacks */
-    AUD_set_active_out(s->voice, true);
+    audio_be_set_active_out(s->audio_be, s->voice, true);
 }
 
 static void screamer_update_volume(ScreamerState *s)
@@ -213,7 +213,7 @@ static void screamer_update_volume(ScreamerState *s)
     SCREAMER_DPRINTF("setting mute: %d, attenuation L: %d R: %d\n",
                      muted, att_left, att_right);
 
-    AUD_set_volume_out_lr(s->voice, muted, (0xf - att_left) << 4,
+    audio_be_set_volume_out_lr(s->audio_be, s->voice, muted, (0xf - att_left) << 4,
                           (0xf - att_right) << 4);
 }
 
@@ -232,7 +232,7 @@ static void screamer_reset_hold(Object *obj, ResetType type)
 
     /* Keep voice active after reset - we need callbacks to poll for data */
     if (s->voice) {
-        AUD_set_active_out(s->voice, true);
+        audio_be_set_active_out(s->audio_be, s->voice, true);
     }
 }
 
@@ -243,8 +243,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
 
     SCREAMER_DPRINTF("screamer_realizefn called\n");
 
-    if (!AUD_backend_check(&s->audio_be, errp)) {
-        error_setg(errp, "screamer: audio backend not available");
+    if (!audio_be_check(&s->audio_be, errp)) {
         return;
     }
 
@@ -253,9 +252,9 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     as.freq = s->rate;
     as.nchannels = 2;
     as.fmt = AUDIO_FORMAT_S16;
-    as.endianness = 1; /* big endian by default for PPC */
+    as.big_endian = true; /* big endian by default for PPC */
 
-    s->voice = AUD_open_out(s->audio_be, NULL, s_spk, s,
+    s->voice = audio_be_open_out(s->audio_be, NULL, s_spk, s,
                             screamerspk_callback, &as);
     if (!s->voice) {
         error_setg(errp, "screamer: failed to open audio output");
@@ -265,7 +264,7 @@ static void screamer_realizefn(DeviceState *dev, Error **errp)
     SCREAMER_DPRINTF("Audio voice opened successfully\n");
 
     /* Start with voice active so callback is called */
-    AUD_set_active_out(s->voice, true);
+    audio_be_set_active_out(s->audio_be, s->voice, true);
 }
 
 static void screamer_control_write(ScreamerState *s, uint32_t val)

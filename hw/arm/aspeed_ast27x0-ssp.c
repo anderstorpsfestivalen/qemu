@@ -20,18 +20,21 @@
 
 static const hwaddr aspeed_soc_ast27x0ssp_memmap[] = {
     [ASPEED_DEV_SDRAM]     =  0x00000000,
-    [ASPEED_DEV_SRAM]      =  0x70000000,
+    [ASPEED_DEV_SRAM0]     =  0x70000000,
     [ASPEED_DEV_INTC]      =  0x72100000,
+    [ASPEED_DEV_PRIC0]     =  0x72140000,
     [ASPEED_DEV_SCU]       =  0x72C02000,
+    [ASPEED_DEV_TIMER1]    =  0x72C10000,
+    [ASPEED_DEV_UART4]     =  0x72C1A000,
+    [ASPEED_DEV_IPC0]      =  0x72C1C000,
+    [ASPEED_DEV_PRIC1]     =  0x74100000,
     [ASPEED_DEV_SCUIO]     =  0x74C02000,
+    [ASPEED_DEV_OTP]       =  0x74C07000,
+    [ASPEED_DEV_INTCIO]    =  0x74C18000,
     [ASPEED_DEV_UART0]     =  0x74C33000,
     [ASPEED_DEV_UART1]     =  0x74C33100,
     [ASPEED_DEV_UART2]     =  0x74C33200,
     [ASPEED_DEV_UART3]     =  0x74C33300,
-    [ASPEED_DEV_UART4]     =  0x72C1A000,
-    [ASPEED_DEV_INTCIO]    =  0x74C18000,
-    [ASPEED_DEV_IPC0]      =  0x72C1C000,
-    [ASPEED_DEV_IPC1]      =  0x74C39000,
     [ASPEED_DEV_UART5]     =  0x74C33400,
     [ASPEED_DEV_UART6]     =  0x74C33500,
     [ASPEED_DEV_UART7]     =  0x74C33600,
@@ -40,16 +43,17 @@ static const hwaddr aspeed_soc_ast27x0ssp_memmap[] = {
     [ASPEED_DEV_UART10]    =  0x74C33900,
     [ASPEED_DEV_UART11]    =  0x74C33A00,
     [ASPEED_DEV_UART12]    =  0x74C33B00,
-    [ASPEED_DEV_TIMER1]    =  0x72C10000,
+    [ASPEED_DEV_IPC1]      =  0x74C39000,
 };
 
 static const int aspeed_soc_ast27x0ssp_irqmap[] = {
+    [ASPEED_DEV_UART4]     = 8,
     [ASPEED_DEV_SCU]       = 12,
+    [ASPEED_DEV_TIMER1]    = 16,
     [ASPEED_DEV_UART0]     = 164,
     [ASPEED_DEV_UART1]     = 164,
     [ASPEED_DEV_UART2]     = 164,
     [ASPEED_DEV_UART3]     = 164,
-    [ASPEED_DEV_UART4]     = 8,
     [ASPEED_DEV_UART5]     = 164,
     [ASPEED_DEV_UART6]     = 164,
     [ASPEED_DEV_UART7]     = 164,
@@ -58,11 +62,10 @@ static const int aspeed_soc_ast27x0ssp_irqmap[] = {
     [ASPEED_DEV_UART10]    = 164,
     [ASPEED_DEV_UART11]    = 164,
     [ASPEED_DEV_UART12]    = 164,
-    [ASPEED_DEV_TIMER1]    = 16,
 };
 
 /* SSPINT 164 */
-static const int ast2700_ssp132_ssp164_intcmap[] = {
+static const int ast2700_ssp164_intcmap[] = {
     [ASPEED_DEV_UART0]     = 7,
     [ASPEED_DEV_UART1]     = 8,
     [ASPEED_DEV_UART2]     = 9,
@@ -89,21 +92,12 @@ static struct nvic_intc_irq_info ast2700_ssp_intcmap[] = {
     {161, 1, 1, NULL},
     {162, 1, 2, NULL},
     {163, 1, 3, NULL},
-    {164, 1, 4, ast2700_ssp132_ssp164_intcmap},
+    {164, 1, 4, ast2700_ssp164_intcmap},
     {165, 1, 5, NULL},
     {166, 1, 6, NULL},
     {167, 1, 7, NULL},
     {168, 1, 8, NULL},
     {169, 1, 9, NULL},
-    {128, 0, 1, NULL},
-    {129, 0, 2, NULL},
-    {130, 0, 3, NULL},
-    {131, 0, 4, NULL},
-    {132, 0, 5, ast2700_ssp132_ssp164_intcmap},
-    {133, 0, 6, NULL},
-    {134, 0, 7, NULL},
-    {135, 0, 8, NULL},
-    {136, 0, 9, NULL},
 };
 
 static qemu_irq aspeed_soc_ast27x0ssp_get_irq(AspeedCoprocessorState *s,
@@ -150,6 +144,12 @@ static void aspeed_soc_ast27x0ssp_init(Object *obj)
                             TYPE_UNIMPLEMENTED_DEVICE);
     object_initialize_child(obj, "scuio", &a->scuio,
                             TYPE_UNIMPLEMENTED_DEVICE);
+    object_initialize_child(obj, "pric0", &a->pric[0],
+                            TYPE_UNIMPLEMENTED_DEVICE);
+    object_initialize_child(obj, "pric1", &a->pric[1],
+                            TYPE_UNIMPLEMENTED_DEVICE);
+    object_initialize_child(obj, "otp", &a->otp,
+                            TYPE_UNIMPLEMENTED_DEVICE);
 }
 
 static void aspeed_soc_ast27x0ssp_realize(DeviceState *dev_soc, Error **errp)
@@ -158,6 +158,7 @@ static void aspeed_soc_ast27x0ssp_realize(DeviceState *dev_soc, Error **errp)
     AspeedCoprocessorState *s = ASPEED_COPROCESSOR(dev_soc);
     AspeedCoprocessorClass *sc = ASPEED_COPROCESSOR_GET_CLASS(s);
     DeviceState *armv7m;
+    MemoryRegion *mr;
     g_autofree char *sdram_name = NULL;
     int i;
 
@@ -190,7 +191,7 @@ static void aspeed_soc_ast27x0ssp_realize(DeviceState *dev_soc, Error **errp)
     /* SRAM */
     memory_region_init_alias(&s->sram_alias, OBJECT(s), "sram.alias",
                              s->sram, 0, memory_region_size(s->sram));
-    memory_region_add_subregion(s->memory, sc->memmap[ASPEED_DEV_SRAM],
+    memory_region_add_subregion(s->memory, sc->memmap[ASPEED_DEV_SRAM0],
                                 &s->sram_alias);
 
     /* SCU */
@@ -239,9 +240,9 @@ static void aspeed_soc_ast27x0ssp_realize(DeviceState *dev_soc, Error **errp)
     }
 
     /* UART */
-    memory_region_init_alias(&s->uart_alias, OBJECT(s), "uart.alias",
-                             &s->uart->serial.io, 0,
-                             memory_region_size(&s->uart->serial.io));
+    mr = sysbus_mmio_get_region(SYS_BUS_DEVICE(s->uart), 0);
+    memory_region_init_alias(&s->uart_alias, OBJECT(s), "uart.alias", mr, 0,
+                             memory_region_size(mr));
     memory_region_add_subregion(s->memory, sc->memmap[s->uart_dev],
                                 &s->uart_alias);
     /*
@@ -263,6 +264,15 @@ static void aspeed_soc_ast27x0ssp_realize(DeviceState *dev_soc, Error **errp)
     aspeed_mmio_map_unimplemented(s->memory, SYS_BUS_DEVICE(&a->scuio),
                                   "aspeed.scuio",
                                   sc->memmap[ASPEED_DEV_SCUIO], 0x1000);
+    aspeed_mmio_map_unimplemented(s->memory, SYS_BUS_DEVICE(&a->pric[0]),
+                                  "aspeed.pric0",
+                                  sc->memmap[ASPEED_DEV_PRIC0], 0x1000);
+    aspeed_mmio_map_unimplemented(s->memory, SYS_BUS_DEVICE(&a->pric[1]),
+                                  "aspeed.pric1",
+                                  sc->memmap[ASPEED_DEV_PRIC1], 0x1000);
+    aspeed_mmio_map_unimplemented(s->memory, SYS_BUS_DEVICE(&a->otp),
+                                  "aspeed.otp",
+                                  sc->memmap[ASPEED_DEV_OTP], 0x800);
 }
 
 static void aspeed_soc_ast27x0ssp_class_init(ObjectClass *klass,

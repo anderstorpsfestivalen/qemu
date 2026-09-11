@@ -26,6 +26,7 @@
 #define BLOCK_QCOW2_H
 
 #include "crypto/block.h"
+#include "qemu/bswap.h"
 #include "qemu/coroutine.h"
 #include "qemu/units.h"
 #include "block/block_int.h"
@@ -964,6 +965,10 @@ qcow2_cluster_discard(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
 int coroutine_fn GRAPH_RDLOCK
 qcow2_subcluster_zeroize(BlockDriverState *bs, uint64_t offset, uint64_t bytes,
                          int flags);
+
+void coroutine_mixed_fn
+qcow2_wait_for_dependencies(BlockDriverState *bs, uint64_t guest_offset,
+                            uint64_t bytes);
 
 int GRAPH_RDLOCK
 qcow2_expand_zero_clusters(BlockDriverState *bs,

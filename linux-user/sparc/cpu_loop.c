@@ -22,6 +22,7 @@
 #include "user-internals.h"
 #include "user/cpu_loop.h"
 #include "signal-common.h"
+#include "sparc/cpu_loop.h"
 
 #define SPARC64_STACK_BIAS 2047
 
@@ -119,7 +120,7 @@ static void restore_window(CPUSPARCState *env)
 #endif
 }
 
-static void flush_windows(CPUSPARCState *env)
+void flush_windows(CPUSPARCState *env)
 {
     int offset, cwp1;
 
@@ -229,7 +230,9 @@ void cpu_loop (CPUSPARCState *env)
                               env->regwptr[2], env->regwptr[3],
                               env->regwptr[4], env->regwptr[5],
                               0, 0);
-            if (ret == -QEMU_ERESTARTSYS || ret == -QEMU_ESIGRETURN) {
+            if (ret == -QEMU_ERESTARTSYS ||
+                ret == -QEMU_ESIGRETURN ||
+                ret == -QEMU_ESETPC) {
                 break;
             }
             if ((abi_ulong)ret >= (abi_ulong)(-515)) {
@@ -279,6 +282,16 @@ void cpu_loop (CPUSPARCState *env)
             break;
         case TT_TRAP + 0x6f:
             flush_windows(env);
+            /*
+             * If we have a pending signal, sparc64_set_context() may
+             * return early without changing register state (like a
+             * syscall that returns -QEMU_ERESTARTSYS). We will then
+             * take the pending signal via process_pending_signals()
+             * below and eventually re-execute the trap. We don't need
+             * the function to return a different value for the
+             * "restart" case because this main loop code does the
+             * same thing in both cases.
+             */
             sparc64_set_context(env);
             break;
 #endif

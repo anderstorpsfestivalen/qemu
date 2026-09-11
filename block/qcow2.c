@@ -2870,7 +2870,11 @@ static int GRAPH_RDLOCK qcow2_inactivate(BlockDriverState *bs)
                      strerror(-ret));
     }
 
-    if (result == 0) {
+    /*
+     * A read-only node cannot resolve an inherited dirty bit here;
+     * leave it dirty, same as plain read access already does.
+     */
+    if (result == 0 && !bdrv_is_read_only(bs)) {
         qcow2_mark_clean(bs);
     }
 
@@ -3991,6 +3995,8 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
     BlockDriverState *bs = NULL;
     BlockDriverState *data_bs = NULL;
     const char *val;
+    bool keep_data_file = false;
+    BlockdevCreateOptionsQcow2 *qcow2_opts;
     int ret;
 
     /* Only the keyval visitor supports the dotted syntax needed for
@@ -4020,6 +4026,22 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         qdict_put_str(qdict, BLOCK_OPT_COMPAT_LEVEL, "v2");
     } else if (val && !strcmp(val, "1.1")) {
         qdict_put_str(qdict, BLOCK_OPT_COMPAT_LEVEL, "v3");
+    }
+
+    val = qdict_get_try_str(qdict, BLOCK_OPT_KEEP_DATA_FILE);
+    if (val) {
+        if (!strcmp(val, "on")) {
+            keep_data_file = true;
+        } else if (!strcmp(val, "off")) {
+            keep_data_file = false;
+        } else {
+            error_setg(errp,
+                       "Invalid value '%s' for '%s': Must be 'on' or 'off'",
+                       val, BLOCK_OPT_KEEP_DATA_FILE);
+            ret = -EINVAL;
+            goto finish;
+        }
+        qdict_del(qdict, BLOCK_OPT_KEEP_DATA_FILE);
     }
 
     /* Change legacy command line options into QMP ones */
@@ -4058,9 +4080,11 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
     /* Create and open an external data file (protocol layer) */
     val = qdict_get_try_str(qdict, BLOCK_OPT_DATA_FILE);
     if (val) {
-        ret = bdrv_co_create_file(val, opts, false, errp);
-        if (ret < 0) {
-            goto finish;
+        if (!keep_data_file) {
+            ret = bdrv_co_create_file(val, opts, false, errp);
+            if (ret < 0) {
+                goto finish;
+            }
         }
 
         data_bs = bdrv_co_open(val, NULL, NULL,
@@ -4073,6 +4097,11 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
 
         qdict_del(qdict, BLOCK_OPT_DATA_FILE);
         qdict_put_str(qdict, "data-file", data_bs->node_name);
+    } else if (keep_data_file) {
+        error_setg(errp, "Must not use '%s=on' without '%s'",
+                   BLOCK_OPT_KEEP_DATA_FILE, BLOCK_OPT_DATA_FILE);
+        ret = -EINVAL;
+        goto finish;
     }
 
     /* Set 'driver' and 'node' options */
@@ -4093,9 +4122,39 @@ qcow2_co_create_opts(BlockDriver *drv, const char *filename, QemuOpts *opts,
         goto finish;
     }
 
+    qcow2_opts = &create_options->u.qcow2;
+
+    if (!qcow2_opts->has_preallocation) {
+        qcow2_opts->preallocation = PREALLOC_MODE_OFF;
+    }
+
+    if (keep_data_file &&
+        qcow2_opts->preallocation != PREALLOC_MODE_OFF &&
+        qcow2_opts->preallocation != PREALLOC_MODE_METADATA)
+    {
+        error_setg(errp, "Preallocating more than only metadata would "
+                   "overwrite the external data file's content and is "
+                   "therefore incompatible with '%s=on'",
+                   BLOCK_OPT_KEEP_DATA_FILE);
+        ret = -EINVAL;
+        goto finish;
+    }
+
+    if (keep_data_file &&
+        qcow2_opts->preallocation == PREALLOC_MODE_OFF &&
+        !qcow2_opts->data_file_raw)
+    {
+        error_setg(errp, "'%s=on' requires '%s=metadata' or '%s=on', or the "
+                   "file contents will not be visible",
+                   BLOCK_OPT_KEEP_DATA_FILE,
+                   BLOCK_OPT_PREALLOC,
+                   BLOCK_OPT_DATA_FILE_RAW);
+        ret = -EINVAL;
+        goto finish;
+    }
+
     /* Silently round up size */
-    create_options->u.qcow2.size = ROUND_UP(create_options->u.qcow2.size,
-                                            BDRV_SECTOR_SIZE);
+    qcow2_opts->size = ROUND_UP(qcow2_opts->size, BDRV_SECTOR_SIZE);
 
     /* Create the qcow2 image (format layer) */
     ret = qcow2_co_create(create_options, errp);
@@ -4103,7 +4162,9 @@ finish:
     if (ret < 0) {
         bdrv_graph_co_rdlock();
         bdrv_co_delete_file_noerr(bs);
-        bdrv_co_delete_file_noerr(data_bs);
+        if (!keep_data_file) {
+            bdrv_co_delete_file_noerr(data_bs);
+        }
         bdrv_graph_co_rdunlock();
     } else {
         ret = 0;
@@ -4177,10 +4238,16 @@ qcow2_co_pwrite_zeroes(BlockDriverState *bs, int64_t offset, int64_t bytes,
         }
 
         qemu_co_mutex_lock(&s->lock);
-        /* We can have new write after previous check */
         offset -= head;
         bytes = s->subcluster_size;
         nr = s->subcluster_size;
+        /*
+         * Wait for in-flight allocating writes first: otherwise the type
+         * check below could pass on UNALLOCATED while a yet-to-link_l2 write
+         * completes during qcow2_subcluster_zeroize()'s own wait, letting the
+         * resumed MAY_UNMAP discard the just-written data.
+         */
+        qcow2_wait_for_dependencies(bs, offset, bytes);
         ret = qcow2_get_host_offset(bs, offset, &nr, &off, &type);
         if (ret < 0 ||
             (type != QCOW2_SUBCLUSTER_UNALLOCATED_PLAIN &&
@@ -6202,6 +6269,12 @@ static QemuOptsList qcow2_create_opts = {
             .help = "Compression method used for image cluster "        \
                     "compression",                                      \
             .def_value_str = "zlib"                                     \
+        },                                                              \
+        {                                                               \
+            .name = BLOCK_OPT_KEEP_DATA_FILE,                           \
+            .type = QEMU_OPT_BOOL,                                      \
+            .help = "Assume the external data file already exists and " \
+                    "do not overwrite it"                               \
         },
         QCOW_COMMON_OPTIONS,
         { /* end of list */ }

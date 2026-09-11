@@ -159,83 +159,9 @@ macro_rules! vmstate_of {
             )$(.with_varray_flag($crate::call_func_with_field!(
                     $crate::vmstate::vmstate_varray_flag,
                     $struct_name,
-                    $($num).+))
-               $(.with_varray_multiply($factor))?)?
+                    $($num).+)))?
         }
     };
-}
-
-pub trait VMStateFlagsExt {
-    const VMS_VARRAY_FLAGS: VMStateFlags;
-}
-
-impl VMStateFlagsExt for VMStateFlags {
-    const VMS_VARRAY_FLAGS: VMStateFlags = VMStateFlags(
-        VMStateFlags::VMS_VARRAY_INT32.0
-            | VMStateFlags::VMS_VARRAY_UINT8.0
-            | VMStateFlags::VMS_VARRAY_UINT16.0
-            | VMStateFlags::VMS_VARRAY_UINT32.0,
-    );
-}
-
-// Add a couple builder-style methods to VMStateField, allowing
-// easy derivation of VMStateField constants from other types.
-impl VMStateField {
-    #[must_use]
-    pub const fn with_version_id(mut self, version_id: i32) -> Self {
-        assert!(version_id >= 0);
-        self.version_id = version_id;
-        self
-    }
-
-    #[must_use]
-    pub const fn with_array_flag(mut self, num: usize) -> Self {
-        assert!(num <= 0x7FFF_FFFFusize);
-        assert!((self.flags.0 & VMStateFlags::VMS_ARRAY.0) == 0);
-        assert!((self.flags.0 & VMStateFlags::VMS_VARRAY_FLAGS.0) == 0);
-        if (self.flags.0 & VMStateFlags::VMS_POINTER.0) != 0 {
-            self.flags = VMStateFlags(self.flags.0 & !VMStateFlags::VMS_POINTER.0);
-            self.flags = VMStateFlags(self.flags.0 | VMStateFlags::VMS_ARRAY_OF_POINTER.0);
-            // VMS_ARRAY_OF_POINTER flag stores the size of pointer.
-            // FIXME: *const, *mut, NonNull and Box<> have the same size as usize.
-            //        Resize if more smart pointers are supported.
-            self.size = std::mem::size_of::<usize>();
-        }
-        self.flags = VMStateFlags(self.flags.0 & !VMStateFlags::VMS_SINGLE.0);
-        self.flags = VMStateFlags(self.flags.0 | VMStateFlags::VMS_ARRAY.0);
-        self.num = num as i32;
-        self
-    }
-
-    #[must_use]
-    pub const fn with_pointer_flag(mut self) -> Self {
-        assert!((self.flags.0 & VMStateFlags::VMS_POINTER.0) == 0);
-        self.flags = VMStateFlags(self.flags.0 | VMStateFlags::VMS_POINTER.0);
-        self
-    }
-
-    #[must_use]
-    pub const fn with_varray_flag_unchecked(mut self, flag: VMStateFlags) -> Self {
-        self.flags = VMStateFlags(self.flags.0 & !VMStateFlags::VMS_ARRAY.0);
-        self.flags = VMStateFlags(self.flags.0 | flag.0);
-        self.num = 0; // varray uses num_offset instead of num.
-        self
-    }
-
-    #[must_use]
-    #[allow(unused_mut)]
-    pub const fn with_varray_flag(mut self, flag: VMStateFlags) -> Self {
-        assert!((self.flags.0 & VMStateFlags::VMS_ARRAY.0) != 0);
-        self.with_varray_flag_unchecked(flag)
-    }
-
-    #[must_use]
-    pub const fn with_varray_multiply(mut self, num: u32) -> Self {
-        assert!(num <= 0x7FFF_FFFFu32);
-        self.flags = VMStateFlags(self.flags.0 | VMStateFlags::VMS_MULTIPLY_ELEMENTS.0);
-        self.num = num as i32;
-        self
-    }
 }
 
 /// This macro can be used (by just passing it a type) to forward the `VMState`
@@ -565,6 +491,11 @@ unsafe extern "C" fn vmstate_no_version_cb<
     into_neg_errno(result)
 }
 
+unsafe extern "C" fn vmstate_post_save_cb<T, F: for<'a> FnCall<(&'a T,), ()>>(opaque: *mut c_void) {
+    // SAFETY: the function is used in T's implementation of VMState.
+    F::call((unsafe { &*(opaque.cast::<T>()) },));
+}
+
 unsafe extern "C" fn vmstate_post_load_cb<
     T,
     F: for<'a> FnCall<(&'a T, u8), Result<(), impl Into<Errno>>>,
@@ -670,12 +601,9 @@ impl<T> VMStateDescriptionBuilder<T> {
     }
 
     #[must_use]
-    pub const fn post_save<F: for<'a> FnCall<(&'a T,), Result<(), impl Into<Errno>>>>(
-        mut self,
-        _f: &F,
-    ) -> Self {
+    pub const fn post_save<F: for<'a> FnCall<(&'a T,), ()>>(mut self, _f: &F) -> Self {
         self.0.post_save = if F::IS_SOME {
-            Some(vmstate_no_version_cb::<T, F>)
+            Some(vmstate_post_save_cb::<T, F>)
         } else {
             None
         };

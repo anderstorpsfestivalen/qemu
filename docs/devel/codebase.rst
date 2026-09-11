@@ -8,6 +8,11 @@ organized.
 Beyond giving succinct descriptions, the goal is to offer links to various
 parts of the documentation/codebase.
 
+Those two videos are an excellent introduction to QEMU codebase:
+
+- `QEMU Dev Starter guide - General overview <https://www.youtube.com/watch?v=OCBLTMKLGAk>`_
+- `QEMU Dev Starter guide - System mode <https://www.youtube.com/watch?v=jrZ56K3Sl_k>`_
+
 Subsystems
 ----------
 
@@ -88,8 +93,6 @@ yet, so sometimes the source code is all you have.
   `VirtFS <https://www.linux-kvm.org/page/VirtFS>`_ support.
 * `gdbstub <https://gitlab.com/qemu-project/qemu/-/tree/master/gdbstub>`_:
   `GDB <GDB usage>` support.
-* `gdb-xml <https://gitlab.com/qemu-project/qemu/-/tree/master/gdb-xml>`_:
-  Set of XML files describing architectures and used by `gdbstub <GDB usage>`.
 * `host <https://gitlab.com/qemu-project/qemu/-/tree/master/host>`_:
   Various architecture specific header files (crypto, atomic, memory
   operations).

@@ -45,7 +45,6 @@ struct Omap1GpioState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    int mpu_model;
     void *clk;
     struct omap_gpio_s omap1;
 };
@@ -76,7 +75,9 @@ static uint64_t omap_gpio_read(void *opaque, hwaddr addr,
     int offset = addr & OMAP_MPUI_REG_MASK;
 
     if (size != 2) {
-        return omap_badwidth_read16(opaque, addr);
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: read at offset 0x%" HWADDR_PRIx
+                      " with bad width %d\n", __func__, addr, size);
+        return 0;
     }
 
     switch (offset) {
@@ -116,7 +117,8 @@ static void omap_gpio_write(void *opaque, hwaddr addr,
     int ln;
 
     if (size != 2) {
-        omap_badwidth_write16(opaque, addr, value);
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: write at offset 0x%" HWADDR_PRIx
+                      " with bad width %d\n", __func__, addr, size);
         return;
     }
 
@@ -225,17 +227,12 @@ void omap_gpio_set_clk(Omap1GpioState *gpio, omap_clk clk)
     gpio->clk = clk;
 }
 
-static const Property omap_gpio_properties[] = {
-    DEFINE_PROP_INT32("mpu_model", Omap1GpioState, mpu_model, 0),
-};
-
 static void omap_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = omap_gpio_realize;
     device_class_set_legacy_reset(dc, omap_gpif_reset);
-    device_class_set_props(dc, omap_gpio_properties);
     /* Reason: pointer property "clk" */
     dc->user_creatable = false;
 }

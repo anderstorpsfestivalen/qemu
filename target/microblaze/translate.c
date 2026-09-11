@@ -20,8 +20,11 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
-#include "accel/tcg/cpu-ldst.h"
-#include "tcg/tcg-op.h"
+#include "accel/tcg/cpu-ldst-common.h"
+#include "accel/tcg/cpu-mmu-index.h"
+#define TCG_ADDRESS_BITS 32
+#include "tcg/tcg-op-common.h"
+#include "tcg/tcg-op-mem.h"
 #include "exec/helper-proto.h"
 #include "exec/helper-gen.h"
 #include "exec/translator.h"
@@ -689,7 +692,7 @@ static void gen_alignment_check_ea(DisasContext *dc, TCGv_i64 ea, int rb,
         record_unaligned_ess(dc, rd, size, store);
 
         tcg_gen_brcondi_i64(TCG_COND_TSTEQ, ea, (1 << size) - 1, over);
-        gen_helper_unaligned_access(tcg_env, ea);
+        gen_helper_microblaze_unaligned_access(tcg_env, ea);
         gen_set_label(over);
     }
 }
@@ -794,7 +797,7 @@ static bool trans_lhuea(DisasContext *dc, arg_typea *arg)
 #else
     TCGv_i64 addr = compute_ldst_addr_ea(dc, arg->ra, arg->rb);
     gen_alignment_check_ea(dc, addr, arg->rb, arg->rd, MO_16, false);
-    (mo_endian(dc) == MO_BE ? gen_helper_lhuea_be : gen_helper_lhuea_le)
+    (dc->cfg->endi ? gen_helper_lhuea_le : gen_helper_lhuea_be)
         (reg_for_write(dc, arg->rd), tcg_env, addr);
     return true;
 #endif
@@ -828,7 +831,7 @@ static bool trans_lwea(DisasContext *dc, arg_typea *arg)
 #else
     TCGv_i64 addr = compute_ldst_addr_ea(dc, arg->ra, arg->rb);
     gen_alignment_check_ea(dc, addr, arg->rb, arg->rd, MO_32, false);
-    (mo_endian(dc) == MO_BE ? gen_helper_lwea_be : gen_helper_lwea_le)
+    (dc->cfg->endi ? gen_helper_lwea_le : gen_helper_lwea_be)
         (reg_for_write(dc, arg->rd), tcg_env, addr);
     return true;
 #endif
@@ -954,7 +957,7 @@ static bool trans_shea(DisasContext *dc, arg_typea *arg)
 #else
     TCGv_i64 addr = compute_ldst_addr_ea(dc, arg->ra, arg->rb);
     gen_alignment_check_ea(dc, addr, arg->rb, arg->rd, MO_16, true);
-    (mo_endian(dc) == MO_BE ? gen_helper_shea_be : gen_helper_shea_le)
+    (dc->cfg->endi ? gen_helper_shea_le : gen_helper_shea_be)
         (tcg_env, reg_for_read(dc, arg->rd), addr);
     return true;
 #endif
@@ -988,7 +991,7 @@ static bool trans_swea(DisasContext *dc, arg_typea *arg)
 #else
     TCGv_i64 addr = compute_ldst_addr_ea(dc, arg->ra, arg->rb);
     gen_alignment_check_ea(dc, addr, arg->rb, arg->rd, MO_32, true);
-    (mo_endian(dc) == MO_BE ? gen_helper_swea_be : gen_helper_swea_le)
+    (dc->cfg->endi ? gen_helper_swea_le : gen_helper_swea_be)
         (tcg_env, reg_for_read(dc, arg->rd), addr);
     return true;
 #endif
@@ -1630,7 +1633,7 @@ static void mb_tr_insn_start(DisasContextBase *dcb, CPUState *cs)
 {
     DisasContext *dc = container_of(dcb, DisasContext, base);
 
-    tcg_gen_insn_start(dc->base.pc_next, dc->tb_flags & ~MSR_TB_MASK);
+    tcg_gen_insn_start(dc->base.pc_next, dc->tb_flags & ~MSR_TB_MASK, 0);
 }
 
 static void mb_tr_translate_insn(DisasContextBase *dcb, CPUState *cs)
@@ -1646,8 +1649,8 @@ static void mb_tr_translate_insn(DisasContextBase *dcb, CPUState *cs)
 
     dc->tb_flags_to_set = 0;
 
-    ir = translator_ldl_swap(cpu_env(cs), &dc->base, dc->base.pc_next,
-                             mb_cpu_is_big_endian(cs) != TARGET_BIG_ENDIAN);
+    ir = translator_ldl_end(cpu_env(cs), &dc->base, dc->base.pc_next,
+                            mo_endian(dc));
     if (!decode(dc, ir)) {
         trap_illegal(dc, true);
     }
@@ -1769,7 +1772,7 @@ static void mb_tr_tb_stop(DisasContextBase *dcb, CPUState *cs)
     }
 
     /* Finish DISAS_EXIT_* */
-    if (unlikely(cs->singlestep_enabled)) {
+    if (unlikely(cpu_single_stepping(cs))) {
         gen_raise_exception(dc, EXCP_DEBUG);
     } else {
         tcg_gen_exit_tb(NULL, 0);
@@ -1788,7 +1791,8 @@ void mb_translate_code(CPUState *cpu, TranslationBlock *tb,
                        int *max_insns, vaddr pc, void *host_pc)
 {
     DisasContext dc;
-    translator_loop(cpu, tb, max_insns, pc, host_pc, &mb_tr_ops, &dc.base);
+    translator_loop(cpu, tb, max_insns, pc, host_pc, &mb_tr_ops, &dc.base,
+                    TCG_TYPE_VA);
 }
 
 void mb_cpu_dump_state(CPUState *cs, FILE *f, int flags)

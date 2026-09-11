@@ -28,6 +28,7 @@
 #include "exec/cpu-common.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "system/physmem.h"
 #include "system/reset.h"
 #include "system/runstate.h"
 
@@ -250,8 +251,7 @@ S390PCIBusDevice *s390_pci_find_dev_by_target(S390pciState *s,
     return NULL;
 }
 
-static S390PCIBusDevice *s390_pci_find_dev_by_pci(S390pciState *s,
-                                                  PCIDevice *pci_dev)
+S390PCIBusDevice *s390_pci_find_dev_by_pci(S390pciState *s, PCIDevice *pci_dev)
 {
     S390PCIBusDevice *pbdev;
 
@@ -462,8 +462,8 @@ static uint64_t table_translate(S390IOTLBEntry *entry, uint64_t to, int8_t ett,
     uint16_t err = 0;
 
     tx = get_table_index(entry->iova, ett);
-    te = address_space_ldq(&address_space_memory, to + tx * sizeof(uint64_t),
-                           MEMTXATTRS_UNSPECIFIED, NULL);
+    te = address_space_ldq_be(&address_space_memory, to + tx * sizeof(uint64_t),
+                              MEMTXATTRS_UNSPECIFIED, NULL);
 
     if (!te) {
         err = ERR_EVENT_INVALTE;
@@ -669,7 +669,7 @@ static bool set_ind_bit_atomic(uint64_t ind_loc, uint8_t to_be_set)
     /* avoid  multiple fetches */
     uint8_t volatile *ind_addr;
 
-    ind_addr = cpu_physical_memory_map(ind_loc, &len, true);
+    ind_addr = physical_memory_map(ind_loc, &len, true);
     if (!ind_addr) {
         s390_pci_generate_error_event(ERR_EVENT_AIRERR, 0, 0, 0, 0);
         return false;
@@ -679,7 +679,7 @@ static bool set_ind_bit_atomic(uint64_t ind_loc, uint8_t to_be_set)
         expected = actual;
         actual = qatomic_cmpxchg(ind_addr, expected, expected | to_be_set);
     } while (actual != expected);
-    cpu_physical_memory_unmap((void *)ind_addr, len, 1, len);
+    physical_memory_unmap((void *)ind_addr, len, 1, len);
 
     return (actual & to_be_set) ? false : true;
 }
@@ -1248,7 +1248,7 @@ static void s390_pcihost_unplug(HotplugHandler *hotplug_dev, DeviceState *dev,
         pbdev->fid = 0;
         QTAILQ_REMOVE(&s->zpci_devs, pbdev, link);
         g_hash_table_remove(s->zpci_table, &pbdev->idx);
-        if (pbdev->iommu->dma_limit) {
+        if (pbdev->iommu && pbdev->iommu->dma_limit) {
             s390_pci_end_dma_count(s, pbdev->iommu->dma_limit);
         }
         qdev_unrealize(dev);
@@ -1505,7 +1505,7 @@ static void s390_pci_device_reset(DeviceState *dev)
         break;
     }
 
-    if (pbdev->interp && (pbdev->fh & FH_MASK_ENABLE)) {
+    if (pbdev->interp) {
         /* Interpreted devices were using interrupt forwarding */
         s390_pci_kvm_aif_disable(pbdev);
     } else if (pbdev->summary_ind) {

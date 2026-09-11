@@ -43,9 +43,11 @@
 #include "scsi/constants.h"
 #include "scsi/utils.h"
 
-#if defined(__APPLE__) && (__MACH__)
+#ifndef __sun__
 #include <sys/ioctl.h>
-#if defined(HAVE_HOST_BLOCK_DEVICE)
+#endif
+
+#if defined(__APPLE__) && (__MACH__) && defined(HAVE_HOST_BLOCK_DEVICE)
 #include <paths.h>
 #include <sys/param.h>
 #include <sys/mount.h>
@@ -57,7 +59,6 @@
 //#include <IOKit/storage/IOCDTypes.h>
 #include <IOKit/storage/IODVDMedia.h>
 #include <CoreFoundation/CoreFoundation.h>
-#endif /* defined(HAVE_HOST_BLOCK_DEVICE) */
 #endif
 
 #ifdef __sun__
@@ -65,7 +66,6 @@
 #include <sys/dkio.h>
 #endif
 #ifdef __linux__
-#include <sys/ioctl.h>
 #include <sys/param.h>
 #include <sys/syscall.h>
 #include <sys/vfs.h>
@@ -79,7 +79,7 @@
 #include <linux/hdreg.h>
 #include <linux/magic.h>
 #include <scsi/sg.h>
-#ifdef __s390__
+#ifdef __s390x__
 #include <asm/dasd.h>
 #endif
 #ifndef FS_NOCOW_FL
@@ -95,25 +95,18 @@
 #endif
 
 #ifdef __OpenBSD__
-#include <sys/ioctl.h>
 #include <sys/disklabel.h>
 #include <sys/dkio.h>
 #endif
 
 #ifdef __NetBSD__
-#include <sys/ioctl.h>
 #include <sys/disklabel.h>
 #include <sys/dkio.h>
 #include <sys/disk.h>
 #endif
 
 #ifdef __DragonFly__
-#include <sys/ioctl.h>
 #include <sys/diskslice.h>
-#endif
-
-#ifdef EMSCRIPTEN
-#include <sys/ioctl.h>
 #endif
 
 /* OS X does not have O_DSYNC */
@@ -1056,21 +1049,6 @@ static int raw_handle_perm_lock(BlockDriverState *bs,
     return ret;
 }
 
-/* Sets a specific flag */
-static int fcntl_setfl(int fd, int flag)
-{
-    int flags;
-
-    flags = fcntl(fd, F_GETFL);
-    if (flags == -1) {
-        return -errno;
-    }
-    if (fcntl(fd, F_SETFL, flags | flag) == -1) {
-        return -errno;
-    }
-    return 0;
-}
-
 static int raw_reconfigure_getfd(BlockDriverState *bs, int flags,
                                  int *open_flags, uint64_t perm, Error **errp)
 {
@@ -1109,7 +1087,7 @@ static int raw_reconfigure_getfd(BlockDriverState *bs, int flags,
         /* dup the original fd */
         fd = qemu_dup(s->fd);
         if (fd >= 0) {
-            ret = fcntl_setfl(fd, *open_flags);
+            ret = qemu_fcntl_addfl(fd, *open_flags);
             if (ret) {
                 qemu_close(fd);
                 fd = -1;
@@ -2113,7 +2091,7 @@ static int handle_aiocb_write_zeroes_unmap(void *opaque)
 }
 
 #ifndef HAVE_COPY_FILE_RANGE
-#ifndef EMSCRIPTEN
+#if !defined(EMSCRIPTEN) && !defined(__GNU__)
 static
 #endif
 ssize_t copy_file_range(int in_fd, off_t *in_off, int out_fd,

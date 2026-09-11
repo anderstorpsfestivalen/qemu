@@ -14,6 +14,7 @@
 #include "qapi/error.h"
 #include "system/address-spaces.h"
 #include "system/kvm.h"
+#include "system/physmem.h"
 #include "net/net.h"
 #include "hw/virtio/virtio.h"
 #include "migration/qemu-file-types.h"
@@ -834,7 +835,7 @@ static uint8_t virtio_set_ind_atomic(SubchDev *sch, uint64_t ind_loc,
     /* avoid  multiple fetches */
     uint8_t volatile *ind_addr;
 
-    ind_addr = cpu_physical_memory_map(ind_loc, &len, true);
+    ind_addr = physical_memory_map(ind_loc, &len, true);
     if (!ind_addr) {
         error_report("%s(%x.%x.%04x): unable to access indicator",
                      __func__, sch->cssid, sch->ssid, sch->schid);
@@ -846,7 +847,7 @@ static uint8_t virtio_set_ind_atomic(SubchDev *sch, uint64_t ind_loc,
         actual = qatomic_cmpxchg(ind_addr, expected, expected | to_be_set);
     } while (actual != expected);
     trace_virtio_ccw_set_ind(ind_loc, actual, actual | to_be_set);
-    cpu_physical_memory_unmap((void *)ind_addr, len, 1, len);
+    physical_memory_unmap((void *)ind_addr, len, 1, len);
 
     return actual;
 }
@@ -890,26 +891,26 @@ static void virtio_ccw_notify(DeviceState *d, uint16_t vector)
             }
         } else {
             assert(vector < NR_CLASSIC_INDICATOR_BITS);
-            indicators = address_space_ldq(&address_space_memory,
-                                           dev->indicators->addr,
-                                           MEMTXATTRS_UNSPECIFIED,
-                                           NULL);
+            indicators = address_space_ldq_be(&address_space_memory,
+                                              dev->indicators->addr,
+                                              MEMTXATTRS_UNSPECIFIED,
+                                              NULL);
             indicators |= 1ULL << vector;
-            address_space_stq(&address_space_memory, dev->indicators->addr,
-                              indicators, MEMTXATTRS_UNSPECIFIED, NULL);
+            address_space_stq_be(&address_space_memory, dev->indicators->addr,
+                                 indicators, MEMTXATTRS_UNSPECIFIED, NULL);
             css_conditional_io_interrupt(sch);
         }
     } else {
         if (!dev->indicators2) {
             return;
         }
-        indicators = address_space_ldq(&address_space_memory,
-                                       dev->indicators2->addr,
-                                       MEMTXATTRS_UNSPECIFIED,
-                                       NULL);
+        indicators = address_space_ldq_be(&address_space_memory,
+                                          dev->indicators2->addr,
+                                          MEMTXATTRS_UNSPECIFIED,
+                                          NULL);
         indicators |= 1ULL;
-        address_space_stq(&address_space_memory, dev->indicators2->addr,
-                          indicators, MEMTXATTRS_UNSPECIFIED, NULL);
+        address_space_stq_be(&address_space_memory, dev->indicators2->addr,
+                             indicators, MEMTXATTRS_UNSPECIFIED, NULL);
         css_conditional_io_interrupt(sch);
     }
 }
@@ -1025,19 +1026,27 @@ static int virtio_ccw_set_guest_notifier(VirtioCcwDevice *dev, int n,
     VirtQueue *vq = virtio_get_queue(vdev, n);
     EventNotifier *notifier = virtio_queue_get_guest_notifier(vq);
     VirtioDeviceClass *k = VIRTIO_DEVICE_GET_CLASS(vdev);
+    int r;
+
+    if (!assign) {
+        if (k->guest_notifier_mask && vdev->use_guest_notifier_mask) {
+            k->guest_notifier_mask(vdev, n, true);
+        }
+        if (with_irqfd) {
+            virtio_ccw_remove_irqfd(dev, n);
+        }
+    }
+
+    r = virtio_set_guest_notifier(vdev, n, assign, with_irqfd);
+    if (r < 0) {
+        return r;
+    }
 
     if (assign) {
-        int r = event_notifier_init(notifier, 0);
-
-        if (r < 0) {
-            return r;
-        }
-        virtio_queue_set_guest_notifier_fd_handler(vq, true, with_irqfd);
         if (with_irqfd) {
             r = virtio_ccw_add_irqfd(dev, n);
             if (r) {
-                virtio_queue_set_guest_notifier_fd_handler(vq, false,
-                                                           with_irqfd);
+                virtio_set_guest_notifier(vdev, n, false, with_irqfd);
                 return r;
             }
         }
@@ -1053,16 +1062,8 @@ static int virtio_ccw_set_guest_notifier(VirtioCcwDevice *dev, int n,
             k->guest_notifier_pending(vdev, n)) {
             event_notifier_set(notifier);
         }
-    } else {
-        if (k->guest_notifier_mask && vdev->use_guest_notifier_mask) {
-            k->guest_notifier_mask(vdev, n, true);
-        }
-        if (with_irqfd) {
-            virtio_ccw_remove_irqfd(dev, n);
-        }
-        virtio_queue_set_guest_notifier_fd_handler(vq, false, with_irqfd);
-        event_notifier_cleanup(notifier);
     }
+
     return 0;
 }
 

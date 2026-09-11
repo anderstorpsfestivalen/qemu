@@ -456,7 +456,7 @@ fail:
 
 /* @p_info will be set only on success. */
 static void GRAPH_RDLOCK
-bdrv_query_info(BlockBackend *blk, BlockInfo **p_info, Error **errp)
+bdrv_query_info(BlockBackend *blk, bool flat, BlockInfo **p_info, Error **errp)
 {
     BlockInfo *info = g_malloc0(sizeof(*info));
     BlockDriverState *bs = blk_bs(blk);
@@ -488,7 +488,7 @@ bdrv_query_info(BlockBackend *blk, BlockInfo **p_info, Error **errp)
     }
 
     if (bs && bs->drv) {
-        info->inserted = bdrv_block_device_info(blk, bs, false, errp);
+        info->inserted = bdrv_block_device_info(blk, bs, flat, errp);
         if (info->inserted == NULL) {
             goto err;
         }
@@ -534,6 +534,8 @@ static void bdrv_query_blk_stats(BlockDeviceStats *ds, BlockBackend *blk)
     BlockAcctStats *stats = blk_get_stats(blk);
     BlockAcctTimedStats *ts = NULL;
     BlockLatencyHistogram *hgram;
+
+    qemu_mutex_lock(&stats->lock);
 
     ds->rd_bytes = stats->nr_bytes[BLOCK_ACCT_READ];
     ds->wr_bytes = stats->nr_bytes[BLOCK_ACCT_WRITE];
@@ -624,6 +626,7 @@ static void bdrv_query_blk_stats(BlockDeviceStats *ds, BlockBackend *blk)
         = bdrv_latency_histogram_stats(&hgram[BLOCK_ACCT_ZONE_APPEND]);
     ds->flush_latency_histogram
         = bdrv_latency_histogram_stats(&hgram[BLOCK_ACCT_FLUSH]);
+    qemu_mutex_unlock(&stats->lock);
 }
 
 static BlockStats * GRAPH_RDLOCK
@@ -651,7 +654,7 @@ bdrv_query_bds_stats(BlockDriverState *bs, bool blk_level)
         s->node_name = g_strdup(bdrv_get_node_name(bs));
     }
 
-    s->stats->wr_highest_offset = stat64_get(&bs->wr_highest_offset);
+    s->stats->wr_highest_offset = qatomic_read(&bs->wr_highest_offset);
 
     s->driver_specific = bdrv_get_specific_stats(bs);
 
@@ -698,7 +701,7 @@ bdrv_query_bds_stats(BlockDriverState *bs, bool blk_level)
     return s;
 }
 
-BlockInfoList *qmp_query_block(Error **errp)
+BlockInfoList *qmp_query_block(bool has_flat, bool flat, Error **errp)
 {
     BlockInfoList *head = NULL, **p_next = &head;
     BlockBackend *blk;
@@ -714,7 +717,7 @@ BlockInfoList *qmp_query_block(Error **errp)
         }
 
         info = g_malloc0(sizeof(*info));
-        bdrv_query_info(blk, &info->value, &local_err);
+        bdrv_query_info(blk, flat, &info->value, &local_err);
         if (local_err) {
             error_propagate(errp, local_err);
             g_free(info);

@@ -26,7 +26,7 @@
 
 static inline uint64_t cpu_ppc_get_tb(CPUPPCState *env)
 {
-    return cpu_get_host_ticks();
+    return get_clock();
 }
 
 uint64_t cpu_ppc_load_tbl(CPUPPCState *env)
@@ -340,9 +340,13 @@ void cpu_loop(CPUPPCState *env)
                 env->nip -= 4;
                 break;
             }
-            if (ret == (target_ulong)(-QEMU_ESIGRETURN)) {
-                /* Returning from a successful sigreturn syscall.
-                   Avoid corrupting register state.  */
+            if (ret == (target_ulong)(-QEMU_ESIGRETURN) ||
+                ret == (target_ulong)(-QEMU_ESETPC)) {
+                /*
+                 * Returning from a successful sigreturn syscall or from
+                 * control flow diversion in a plugin callback.
+                 * Avoid corrupting register state.
+                 */
                 break;
             }
             if (ret > (target_ulong)(-515)) {

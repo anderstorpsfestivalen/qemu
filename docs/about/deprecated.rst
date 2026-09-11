@@ -54,6 +54,23 @@ as short-form boolean values, and passed to plugins as ``arg_name=on``.
 However, short-form booleans are deprecated and full explicit ``arg_name=on``
 form is preferred.
 
+``debug-threads`` option for ``-name`` (since 11.0)
+'''''''''''''''''''''''''''''''''''''''''''''''''''
+
+The ``debug-threads`` option of the ``-name`` argument is now
+ignored. Thread naming is unconditionally enabled for all platforms
+where it is supported.
+
+``-mon`` option (since 11.1)
+''''''''''''''''''''''''''''
+
+The ``-mon`` option was the generic mechanism for creating monitor
+objects if the convenience ``-qmp`` or ``-monitor`` options were not
+flexible enough. The monitor objects have been converted to QOM, so
+``-mon mode=readline`` is replaced by ``-object monitor-hmp`` and
+``-mon mode=control`` is replaced by ``-object monitor-qmp``. The
+short convenience options are not deprecated, only ``-mon``.
+
 QEMU Machine Protocol (QMP) commands
 ------------------------------------
 
@@ -111,14 +128,6 @@ options are removed in favor of using explicit ``blockdev-create`` and
 ``blockdev-add`` calls. See :doc:`/interop/live-block-operations` for
 details.
 
-``query-migrationthreads`` (since 9.2)
-''''''''''''''''''''''''''''''''''''''
-
-To be removed with no replacement, as it reports only a limited set of
-threads (for example, it only reports source side of multifd threads,
-without reporting any destination threads, or non-multifd source threads).
-For debugging purpose, please use ``-name $VM,debug-threads=on`` instead.
-
 ``block-job-pause`` (since 10.1)
 ''''''''''''''''''''''''''''''''
 
@@ -150,10 +159,10 @@ Use ``job-dismiss`` instead.
 
 Use ``job-finalize`` instead.
 
-``migrate`` argument ``detach`` (since 10.1)
-''''''''''''''''''''''''''''''''''''''''''''
+``query-kvm`` (since 11.0)
+''''''''''''''''''''''''''
 
-This argument has always been ignored.
+Use ``query-accelerators`` instead.
 
 Human Machine Protocol (HMP) commands
 -------------------------------------
@@ -178,36 +187,6 @@ The ``info capture`` command is deprecated and will be removed in a future relea
 Host Architectures
 ------------------
 
-MIPS (since 10.2)
-'''''''''''''''''
-
-MIPS is not supported by Debian 13 ("Trixie") and newer, making it hard to
-maintain our cross-compilation CI tests of the architecture. As we no longer
-have CI coverage support may bitrot away before the deprecation process
-completes.
-
-System emulation on 32-bit x86 hosts (since 8.0)
-''''''''''''''''''''''''''''''''''''''''''''''''
-
-Support for 32-bit x86 host deployments is increasingly uncommon in mainstream
-OS distributions given the widespread availability of 64-bit x86 hardware.
-The QEMU project no longer considers 32-bit x86 support for system emulation to
-be an effective use of its limited resources, and thus intends to discontinue
-it. Since all recent x86 hardware from the past >10 years is capable of the
-64-bit x86 extensions, a corresponding 64-bit OS should be used instead.
-
-TCG Plugin support not enabled by default on 32-bit hosts (since 9.2)
-'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-While it is still possible to enable TCG plugin support for 32-bit
-hosts there are a number of potential pitfalls when instrumenting
-64-bit guests. The plugin APIs typically pass most addresses as
-uint64_t but practices like encoding that address in a host pointer
-for passing as user-data will lose data. As most software analysis
-benefits from having plenty of host memory it seems reasonable to
-encourage users to use 64 bit builds of QEMU for analysis work
-whatever targets they are instrumenting.
-
 TCG Plugin support not enabled by default with TCI (since 9.2)
 ''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
@@ -215,13 +194,6 @@ While the TCG interpreter can interpret the TCG ops used by plugins it
 is going to be so much slower it wouldn't make sense for any serious
 instrumentation. Due to implementation differences there will also be
 anomalies in things like memory instrumentation.
-
-32-bit host operating systems (since 10.0)
-''''''''''''''''''''''''''''''''''''''''''
-
-Keeping 32-bit host support alive is a substantial burden for the
-QEMU project.  Thus QEMU will in future drop the support for all
-32-bit host systems.
 
 System emulator CPUs
 --------------------
@@ -244,24 +216,6 @@ in the QEMU object model anymore. ``Sun-UltraSparc-IIIi+`` and
 but for consistency these will get removed in a future release, too.
 Use ``Sun-UltraSparc-IIIi-plus`` and ``Sun-UltraSparc-IV-plus`` instead.
 
-PPC 405 CPUs (since 10.0)
-'''''''''''''''''''''''''
-
-The PPC 405 CPU has no known users and the ``ref405ep`` machine was
-removed in QEMU 10.0. Since the IBM POWER [8-11] processors uses an
-embedded 405 for power management (OCC) and other internal tasks, it
-is theoretically possible to use QEMU to model them. Let's keep the
-CPU implementation for a while before removing all support.
-
-Power8E and Power8NVL CPUs and corresponding Pnv chips (since 10.1)
-'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-The Power8E and Power8NVL variants of Power8 are not really useful anymore
-in qemu, and are old and unmaintained now.
-
-The CPUs as well as corresponding Power8NVL and Power8E PnvChips will also
-be considered deprecated.
-
 System emulator machines
 ------------------------
 
@@ -280,89 +234,20 @@ deprecated; use the new name ``dtb-randomness`` instead. The new name
 better reflects the way this property affects all random data within
 the device tree blob, not just the ``kaslr-seed`` node.
 
-Arm ``ast2700a0-evb`` machine (since 10.1)
-''''''''''''''''''''''''''''''''''''''''''
-
-The ``ast2700a0-evb`` machine represents the first revision of the AST2700
-and serves as the initial engineering sample rather than a production version.
-A newer revision, A1, is now supported, and the ``ast2700a1-evb`` should
-replace the older A0 version.
-
-Arm ``sonorapass-bmc`` machine (since 10.2)
-'''''''''''''''''''''''''''''''''''''''''''
-
-The ``sonorapass-bmc`` machine represents a lab server that never
-entered production. Since it does not rely on any specific device
-models, it can be replaced by the ``ast2500-evb`` machine using the
-``fmc-model`` option to specify the flash type. The I2C devices
-connected to the board can be defined via the QEMU command line.
-
-Arm ``qcom-dc-scm-v1-bmc`` and ``qcom-firework-bmc`` machine (since 10.2)
-'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-The ``qcom-dc-scm-v1-bmc`` and ``qcom-firework-bmc`` represent lab
-servers that never entered production. Since they do not rely on any
-specific device models, they can be replaced by the ``ast2600-evb``
-machine using the ``fmc-model`` option to specify the flash type. The
-I2C devices connected to the board can be defined via the QEMU command
-line.
-
-Arm ``fp5280g2-bmc`` machine (since 10.2)
-'''''''''''''''''''''''''''''''''''''''''
-
-The ``fp5280g2-bmc`` machine does not rely on any specific device
-models, it can be replaced by the ``ast2500-evb`` machine using the
-``fmc-model`` option to specify the flash type. The I2C devices
-connected to the board can be defined via the QEMU command line.
-
-Arm ``fby35`` machine (since 10.2)
+RISC-V Shakti machine (since 11.1)
 ''''''''''''''''''''''''''''''''''
 
-The ``fby35`` machine was originally added as an example of a
-multi-SoC system, with the expectation the models would evolve over
-time in an heterogeneous system. This hasn't happened and no public
-firmware is available to boot it. It can be replaced by the
-``ast2700fc``, another multi-SoC machine based on the newer AST2700
-SoCs which are excepted to receive better support in the future.
+The RISC-V ``shakti_c`` machine hasn't had meaningful contributions since 2021
+and is currently unmaintained. The machine is scheduled to be removed as it
+appears to have no users.
 
+``memory-encryption`` machine property (since 11.1)
+'''''''''''''''''''''''''''''''''''''''''''''''''''
 
-RISC-V default machine option (since 10.0)
-''''''''''''''''''''''''''''''''''''''''''
-
-RISC-V defines ``spike`` as the default machine if no machine option is
-given in the command line.  This happens because ``spike`` is the first
-RISC-V machine implemented in QEMU and setting it as default was
-convenient at that time.  Now we have 7 riscv64 and 6 riscv32 machines
-and having ``spike`` as a default is no longer justified.  This default
-will also promote situations where users think they're running ``virt``
-(the most used RISC-V machine type in 10.0) when in fact they're
-running ``spike``.
-
-Removing the default machine option forces users to always set the machine
-they want to use and avoids confusion.  Existing users of the ``spike``
-machine must ensure that they're setting the ``spike`` machine in the
-command line (``-M spike``).
-
-Arm ``highbank`` and ``midway`` machines (since 10.1)
-'''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-There are no known users left for these machines (if you still use it,
-please write a mail to the qemu-devel mailing list). If you just want to
-boot a Cortex-A15 or Cortex-A9 Linux, use the ``virt`` machine instead.
-
-
-System emulator binaries
-------------------------
-
-``qemu-system-microblazeel`` (since 10.1)
-'''''''''''''''''''''''''''''''''''''''''
-
-The ``qemu-system-microblaze`` binary can emulate little-endian machines
-now, too, so the separate binary ``qemu-system-microblazeel`` (with the
-``el`` suffix) for little-endian targets is not required anymore. The
-``petalogix-s3adsp1800`` machine can now be switched to little endian by
-setting its ``endianness`` property to ``little``.
-
+Use ``confidential-guest-support`` instead. The ``memory-encryption`` object
+was an early implementation of memory encryption support in QEMU, but it has
+been superseded by the more comprehensive ``confidential-guest-support``
+object.
 
 Backend options
 ---------------
@@ -477,14 +362,6 @@ Specifying the iSCSI password in plain text on the command line using the
 used instead, to refer to a ``--object secret...`` instance that provides
 a password via a file, or encrypted.
 
-``gluster`` backend (since 9.2)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-According to https://marc.info/?l=fedora-devel-list&m=171934833215726
-the GlusterFS development effectively ended. Unless the development
-gains momentum again, the QEMU project will remove the gluster backend
-in a future release.
-
 
 Character device options
 ''''''''''''''''''''''''
@@ -515,6 +392,31 @@ It was implemented as a no-op instruction in TCG up to QEMU 9.0, but
 only with ``-cpu max`` (which does not guarantee migration compatibility
 across versions).
 
+linux-user mode CPUs
+--------------------
+
+OABI and NWFPE support for Arm CPUs
+'''''''''''''''''''''''''''''''''''
+
+Linux for 32-bit Arm has had two major ABIs: the original OABI and the
+more modern EABI. OABI support was marked as obsolete in GCC 4.7 and
+dropped in GCC 4.8 (released in 2013). In the Linux kernel,
+compatibility handling for OABI (OABI_COMPAT) is not generally enabled
+by default and is not compatible with building a Thumb2
+kernel. Distros dropped OABI support fifteen years or more ago.
+
+The original floating-point coprocessor for 32-bit Arm was the
+FPA11. This was not present in many CPUs but did get baked into the
+OABI for how to pass floating point arguments, and so the Linux kernel
+has support for emulating it via the config option FPE_NWFPE; QEMU
+follows that. FPA11 support was also removed from GCC in GCC 4.8.
+
+QEMU's NWFPE code is old and untested and not thread-safe; the OABI
+ABI is long-obsolete. We are therefore deprecating both OABI support
+and NWFPE emulation, and they will be removed in a future QEMU
+release.
+
+
 Backwards compatibility
 -----------------------
 
@@ -544,17 +446,6 @@ versions, aliases will point to newer CPU model versions
 depending on the machine type, so management software must
 resolve CPU model aliases before starting a virtual machine.
 
-RISC-V "virt" board "riscv,delegate" DT property (since 9.1)
-''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-The "riscv,delegate" DT property was added in QEMU 7.0 as part of
-the AIA APLIC support.  The property changed name during the review
-process in Linux and the correct name ended up being
-"riscv,delegation".  Changing the DT property name will break all
-available firmwares that are using the current (wrong) name.  The
-property is kept as is in 9.1, together with "riscv,delegation", to
-give more time for firmware developers to change their code.
-
 x86 "isapc" board use of modern x86 CPUs (since 10.2)
 '''''''''''''''''''''''''''''''''''''''''''''''''''''
 
@@ -568,23 +459,3 @@ If the user requests a modern x86 CPU model (i.e. not one of ``486``,
 ``athlon``, ``kvm32``, ``pentium``, ``pentium2``, ``pentium3``or ``qemu32``)
 a warning will be displayed until a future QEMU version when such CPUs will
 be rejected.
-
-Migration
----------
-
-``fd:`` URI when used for file migration (since 9.1)
-''''''''''''''''''''''''''''''''''''''''''''''''''''
-
-The ``fd:`` URI can currently provide a file descriptor that
-references either a socket or a plain file. These are two different
-types of migration. In order to reduce ambiguity, the ``fd:`` URI
-usage of providing a file descriptor to a plain file has been
-deprecated in favor of explicitly using the ``file:`` URI with the
-file descriptor being passed as an ``fdset``. Refer to the ``add-fd``
-command documentation for details on the ``fdset`` usage.
-
-``zero-blocks`` capability (since 9.2)
-''''''''''''''''''''''''''''''''''''''
-
-The ``zero-blocks`` capability was part of the block migration which
-doesn't exist anymore since it was removed in QEMU v9.1.

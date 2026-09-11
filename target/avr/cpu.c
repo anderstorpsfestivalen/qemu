@@ -116,7 +116,7 @@ static void avr_cpu_reset_hold(Object *obj, ResetType type)
     memset(env->r, 0, sizeof(env->r));
 }
 
-static void avr_cpu_disas_set_info(CPUState *cpu, disassemble_info *info)
+static void avr_cpu_disas_set_info(const CPUState *cpu, disassemble_info *info)
 {
     info->endian = BFD_ENDIAN_LITTLE;
     info->mach = bfd_arch_avr;
@@ -233,7 +233,7 @@ static void avr_cpu_dump_state(CPUState *cs, FILE *f, int flags)
 
 static const struct SysemuCPUOps avr_sysemu_ops = {
     .has_work = avr_cpu_has_work,
-    .get_phys_page_debug = avr_cpu_get_phys_page_debug,
+    .get_phys_addr_debug = avr_cpu_get_phys_addr_debug,
 };
 
 static const TCGCPUOps avr_tcg_ops = {

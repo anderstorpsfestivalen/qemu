@@ -393,6 +393,7 @@ static void scsi_qdev_realize(DeviceState *qdev, Error **errp)
     }
 
     qemu_mutex_init(&dev->requests_lock);
+    qemu_mutex_init(&dev->pr_state.mutex);
     QTAILQ_INIT(&dev->requests);
     scsi_device_realize(dev, &local_err);
     if (local_err) {
@@ -416,6 +417,8 @@ static void scsi_qdev_unrealize(DeviceState *qdev)
     qemu_mutex_destroy(&dev->requests_lock);
 
     scsi_device_unrealize(dev);
+
+    qemu_mutex_destroy(&dev->pr_state.mutex);
 
     blockdev_mark_auto_del(dev->conf.blk);
 }
@@ -482,12 +485,7 @@ void scsi_bus_legacy_handle_cmdline(SCSIBus *bus)
     Location loc;
     DriveInfo *dinfo;
     int unit;
-    BlockConf conf = {
-        .bootindex = -1,
-        .share_rw = false,
-        .rerror = BLOCKDEV_ON_ERROR_AUTO,
-        .werror = BLOCKDEV_ON_ERROR_AUTO,
-    };
+    BlockConf conf = DEFAULT_BLOCK_CONF;
 
     loc_push_none(&loc);
     for (unit = 0; unit <= bus->info->max_target; unit++) {
@@ -700,7 +698,7 @@ static bool scsi_target_emulate_inquiry(SCSITargetReq *r)
         r->buf[7] = 0x10 | (r->req.bus->info->tcq ? 0x02 : 0); /* Sync, TCQ.  */
         memcpy(&r->buf[8], "QEMU    ", 8);
         memcpy(&r->buf[16], "QEMU TARGET     ", 16);
-        pstrcpy((char *) &r->buf[32], 4, qemu_hw_version());
+        pstrcpy((char *) &r->buf[32], 4, QEMU_HW_VERSION);
     }
     return true;
 }
@@ -1513,6 +1511,13 @@ void scsi_req_unref(SCSIRequest *req)
         }
         g_free(req);
     }
+}
+
+void scsi_req_unref_detach_hba(SCSIRequest *req)
+{
+    /* Unref when the HBA frees hba_private separately (e.g. virtio_scsi_free_req) */
+    req->hba_private = NULL;
+    scsi_req_unref(req);
 }
 
 /* Tell the device that we finished processing this chunk of I/O.  It

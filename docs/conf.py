@@ -92,7 +92,7 @@ default_role = 'any'
 
 # General information about the project.
 project = u'QEMU'
-copyright = u'2025, The QEMU Project Developers'
+copyright = u'2026, The QEMU Project Developers'
 author = u'The QEMU Project Developers'
 
 # The version info for the project you're documenting, acts as replacement for
@@ -332,6 +332,9 @@ man_pages = [
      [], 1),
     ('tools/qemu-trace-stap', 'qemu-trace-stap',
      'QEMU SystemTap trace tool',
+     [], 1),
+    ('tools/qemu-vnc', 'qemu-vnc',
+     'QEMU standalone VNC server',
      [], 1),
 ]
 man_make_section_directory = False

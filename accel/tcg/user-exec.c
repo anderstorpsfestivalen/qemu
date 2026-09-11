@@ -25,6 +25,7 @@
 #include "qemu/bitops.h"
 #include "qemu/rcu.h"
 #include "accel/tcg/cpu-ldst-common.h"
+#include "accel/tcg/cpu-loop.h"
 #include "accel/tcg/helper-retaddr.h"
 #include "accel/tcg/probe.h"
 #include "user/cpu_loop.h"
@@ -238,13 +239,16 @@ void page_dump(FILE *f)
 
 int page_get_flags(vaddr address)
 {
-    PageFlagsNode *p = pageflags_find(address, address);
+    PageFlagsNode *p;
+
+    RCU_READ_LOCK_GUARD();
 
     /*
      * See util/interval-tree.c re lockless lookups: no false positives but
      * there are false negatives.  If we find nothing, retry with the mmap
      * lock acquired.
      */
+    p = pageflags_find(address, address);
     if (p) {
         return p->flags;
     }
@@ -300,15 +304,15 @@ static void pageflags_create_merge(vaddr start, vaddr last, int flags)
 
     if (prev) {
         if (next) {
-            prev->itree.last = next->itree.last;
+            pageflags_create(prev->itree.start, next->itree.last, flags);
             g_free_rcu(next, rcu);
         } else {
-            prev->itree.last = last;
+            pageflags_create(prev->itree.start, last, flags);
         }
-        interval_tree_insert(&prev->itree, &pageflags_root);
+        g_free_rcu(prev, rcu);
     } else if (next) {
-        next->itree.start = start;
-        interval_tree_insert(&next->itree, &pageflags_root);
+        pageflags_create(start, next->itree.last, flags);
+        g_free_rcu(next, rcu);
     } else {
         pageflags_create(start, last, flags);
     }
@@ -370,8 +374,8 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
     if (set_flags != merge_flags) {
         if (p_start < start) {
             interval_tree_remove(&p->itree, &pageflags_root);
-            p->itree.last = start - 1;
-            interval_tree_insert(&p->itree, &pageflags_root);
+            pageflags_create(p_start, start - 1, p_flags);
+            g_free_rcu(p, rcu);
 
             if (last < p_last) {
                 if (merge_flags & PAGE_VALID) {
@@ -393,11 +397,11 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
             }
             if (last < p_last) {
                 interval_tree_remove(&p->itree, &pageflags_root);
-                p->itree.start = last + 1;
-                interval_tree_insert(&p->itree, &pageflags_root);
+                pageflags_create(last + 1, p_last, p_flags);
                 if (merge_flags & PAGE_VALID) {
                     pageflags_create(start, last, merge_flags);
                 }
+                g_free_rcu(p, rcu);
             } else {
                 if (merge_flags & PAGE_VALID) {
                     p->flags = merge_flags;
@@ -418,8 +422,8 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
     if (set_flags == p_flags) {
         if (start < p_start) {
             interval_tree_remove(&p->itree, &pageflags_root);
-            p->itree.start = start;
-            interval_tree_insert(&p->itree, &pageflags_root);
+            pageflags_create(start, p_last, p_flags);
+            g_free_rcu(p, rcu);
         }
         if (p_last < last) {
             start = p_last + 1;
@@ -431,8 +435,8 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
     /* Maybe split out head and/or tail ranges with the original flags. */
     interval_tree_remove(&p->itree, &pageflags_root);
     if (p_start < start) {
-        p->itree.last = start - 1;
-        interval_tree_insert(&p->itree, &pageflags_root);
+        pageflags_create(p_start, start - 1, p_flags);
+        g_free_rcu(p, rcu);
 
         if (p_last < last) {
             goto restart;
@@ -441,8 +445,8 @@ static bool pageflags_set_clear(vaddr start, vaddr last,
             pageflags_create(last + 1, p_last, p_flags);
         }
     } else if (last < p_last) {
-        p->itree.start = last + 1;
-        interval_tree_insert(&p->itree, &pageflags_root);
+        pageflags_create(last + 1, p_last, p_flags);
+        g_free_rcu(p, rcu);
     } else {
         g_free_rcu(p, rcu);
         goto restart;
@@ -503,6 +507,8 @@ bool page_check_range(vaddr start, vaddr len, int flags)
     if (last < start) {
         return false; /* wrap around */
     }
+
+    RCU_READ_LOCK_GUARD();
 
     locked = have_mmap_lock();
     while (true) {
@@ -647,7 +653,7 @@ void tb_lock_page0(tb_page_addr_t address)
 
     if (prot & PAGE_WRITE) {
         pageflags_set_clear(start, last, 0, PAGE_WRITE);
-        mprotect(g2h_untagged(start), last - start + 1,
+        mprotect(g2h_untagged_vaddr(start), last - start + 1,
                  prot & (PAGE_READ | PAGE_EXEC) ? PROT_READ : PROT_NONE);
     }
 }
@@ -734,7 +740,7 @@ int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc)
         if (prot & PAGE_EXEC) {
             prot = (prot & ~PAGE_EXEC) | PAGE_READ;
         }
-        mprotect((void *)g2h_untagged(start), len, prot & PAGE_RWX);
+        mprotect((void *)g2h_untagged_vaddr(start), len, prot & PAGE_RWX);
     }
     mmap_unlock();
 
@@ -763,12 +769,12 @@ static int probe_access_internal(CPUArchState *env, vaddr addr,
         g_assert_not_reached();
     }
 
-    if (guest_addr_valid_untagged(addr)) {
+    if (guest_addr_valid_untagged_vaddr(addr)) {
         int page_flags = page_get_flags(addr);
         if (page_flags & acc_flag) {
             if (access_type != MMU_INST_FETCH
                 && cpu_plugin_mem_cbs_enabled(env_cpu(env))) {
-                return TLB_MMIO;
+                return TLB_FORCE_SLOW;
             }
             return 0; /* success */
         }
@@ -792,7 +798,7 @@ int probe_access_flags(CPUArchState *env, vaddr addr, int size,
 
     g_assert(-(addr | TARGET_PAGE_MASK) >= size);
     flags = probe_access_internal(env, addr, size, access_type, nonfault, ra);
-    *phost = (flags & TLB_INVALID_MASK) ? NULL : g2h(env_cpu(env), addr);
+    *phost = (flags & TLB_INVALID_MASK) ? NULL : g2h_vaddr(env_cpu(env), addr);
     return flags;
 }
 
@@ -803,15 +809,15 @@ void *probe_access(CPUArchState *env, vaddr addr, int size,
 
     g_assert(-(addr | TARGET_PAGE_MASK) >= size);
     flags = probe_access_internal(env, addr, size, access_type, false, ra);
-    g_assert((flags & ~TLB_MMIO) == 0);
+    g_assert((flags & ~TLB_FORCE_SLOW) == 0);
 
-    return size ? g2h(env_cpu(env), addr) : NULL;
+    return size ? g2h_vaddr(env_cpu(env), addr) : NULL;
 }
 
 void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
                         MMUAccessType access_type, int mmu_idx)
 {
-    return g2h(env_cpu(env), addr);
+    return g2h_vaddr(env_cpu(env), addr);
 }
 
 tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
@@ -822,9 +828,7 @@ tb_page_addr_t get_page_addr_code_hostp(CPUArchState *env, vaddr addr,
     flags = probe_access_internal(env, addr, 1, MMU_INST_FETCH, false, 0);
     g_assert(flags == 0);
 
-    if (hostp) {
-        *hostp = g2h_untagged(addr);
-    }
+    *hostp = g2h_untagged_vaddr(addr);
     return addr;
 }
 
@@ -940,7 +944,7 @@ static void *cpu_mmu_lookup(CPUState *cpu, vaddr addr,
         cpu_loop_exit_sigbus(cpu, addr, type, ra);
     }
 
-    ret = g2h(cpu, addr);
+    ret = g2h_vaddr(cpu, addr);
     set_helper_retaddr(ra);
     return ret;
 }
@@ -970,7 +974,7 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
         }
         if (is_write) {
             if (flags & PAGE_WRITE) {
-                memcpy(g2h(cpu, addr), buf, l);
+                memcpy(g2h_vaddr(cpu, addr), buf, l);
             } else {
                 /* Bypass the host page protection using ptrace. */
                 if (fd == -1) {
@@ -989,13 +993,13 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
                  */
                 tb_invalidate_phys_range(NULL, addr, addr + l - 1);
                 written = pwrite(fd, buf, l,
-                                 (off_t)(uintptr_t)g2h_untagged(addr));
+                                 (off_t)(uintptr_t)g2h_untagged_vaddr(addr));
                 if (written != l) {
                     goto out_close;
                 }
             }
         } else if (flags & PAGE_READ) {
-            memcpy(buf, g2h(cpu, addr), l);
+            memcpy(buf, g2h_vaddr(cpu, addr), l);
         } else {
             /* Bypass the host page protection using ptrace. */
             if (fd == -1) {
@@ -1005,7 +1009,7 @@ int cpu_memory_rw_debug(CPUState *cpu, vaddr addr,
                 }
             }
             if (pread(fd, buf, l,
-                      (off_t)(uintptr_t)g2h_untagged(addr)) != l) {
+                      (off_t)(uintptr_t)g2h_untagged_vaddr(addr)) != l) {
                 goto out_close;
             }
         }
@@ -1233,7 +1237,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         cpu_loop_exit_atomic(cpu, retaddr);
     }
 
-    ret = g2h(cpu, addr);
+    ret = g2h_vaddr(cpu, addr);
     set_helper_retaddr(retaddr);
     return ret;
 }
@@ -1258,10 +1262,8 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 #define DATA_SIZE 4
 #include "atomic_template.h"
 
-#ifdef CONFIG_ATOMIC64
 #define DATA_SIZE 8
 #include "atomic_template.h"
-#endif
 
 #if defined(CONFIG_ATOMIC128) || HAVE_CMPXCHG128
 #define DATA_SIZE 16

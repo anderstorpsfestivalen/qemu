@@ -26,18 +26,20 @@
 
 #include "qemu/osdep.h"
 #include "qemu/datadir.h"
-#include "cpu.h"
+#include "target/microblaze/cpu.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
 #include "qemu/guest-random.h"
 #include "system/device_tree.h"
+#include "system/physmem.h"
 #include "system/reset.h"
 #include "exec/cpu-common.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
 #include "elf.h"
 #include "qemu/cutils.h"
+#include "qapi/error.h"
 
 #include "boot.h"
 
@@ -105,7 +107,7 @@ static int microblaze_load_dtb(hwaddr addr,
                               initrd_end);
     }
 
-    cpu_physical_memory_write(addr, fdt, fdt_size);
+    physical_memory_write(addr, fdt, fdt_size);
     g_free(fdt);
     return fdt_size;
 }
@@ -171,7 +173,7 @@ void microblaze_load_kernel(MicroBlazeCPU *cpu, bool is_little_endian,
         /* Not an ELF image nor an u-boot image, try a RAW image.  */
         if (kernel_size < 0) {
             kernel_size = load_image_targphys(kernel_filename, ddr_base,
-                                              ramsize, NULL);
+                                              ramsize, &error_fatal);
             boot_info.bootstrap_pc = ddr_base;
             high = (ddr_base + kernel_size + 3) & ~3;
         }

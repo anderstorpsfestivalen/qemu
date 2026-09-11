@@ -39,9 +39,7 @@ static const int gpr_map[CPU_NB_EREGS] = {
 static const int gpr_map32[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 
 /*
- * Keep these in sync with assignment to
- * gdb_num_core_regs in target/i386/cpu.c
- * and with the machine description
+ * Keep these in sync with the machine description
  */
 
 /*
@@ -79,15 +77,9 @@ static const int gpr_map32[8] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 #define IDX_CTL_CR8_REG     (IDX_CTL_REGS + 4)
 #define IDX_CTL_EFER_REG    (IDX_CTL_REGS + 5)
 
-#ifdef TARGET_X86_64
-#define GDB_FORCE_64 1
-#else
-#define GDB_FORCE_64 0
-#endif
-
 static int gdb_read_reg_cs64(uint32_t hflags, GByteArray *buf, target_ulong val)
 {
-    if ((hflags & HF_CS64_MASK) || GDB_FORCE_64) {
+    if ((hflags & HF_CS64_MASK) || TARGET_LONG_BITS == 64) {
         return gdb_get_reg64(buf, val);
     }
     return gdb_get_reg32(buf, val);
@@ -135,7 +127,7 @@ int x86_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
                 return gdb_get_reg64(mem_buf,
                                      env->regs[gpr_map[n]] & 0xffffffffUL);
             } else {
-                return gdb_get_regl(mem_buf, 0);
+                return gdb_get_reg64(mem_buf, 0);
             }
         } else {
             return gdb_get_reg32(mem_buf, env->regs[gpr_map32[n]]);
@@ -289,9 +281,9 @@ int x86_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
     if (n < CPU_NB_REGS) {
         if (TARGET_LONG_BITS == 64) {
             if (env->hflags & HF_CS64_MASK) {
-                env->regs[gpr_map[n]] = ldtul_p(mem_buf);
+                env->regs[gpr_map[n]] = ldq_p(mem_buf);
             } else if (n < CPU_NB_REGS32) {
-                env->regs[gpr_map[n]] = ldtul_p(mem_buf) & 0xffffffffUL;
+                env->regs[gpr_map[n]] = ldq_p(mem_buf) & 0xffffffffUL;
             }
             return sizeof(target_ulong);
         } else if (n < CPU_NB_REGS32) {
@@ -455,8 +447,10 @@ static int i386_cpu_gdb_get_egprs(CPUState *cs, GByteArray *mem_buf, int n)
         /* EGPRs can be only directly accessible in 64-bit mode. */
         if (env->hflags & HF_CS64_MASK) {
             return gdb_get_reg64(mem_buf, env->regs[gpr_map[n + CPU_NB_REGS]]);
+        } else if (TARGET_LONG_BITS == 64) {
+            return gdb_get_reg64(mem_buf, 0);
         } else {
-            return gdb_get_regl(mem_buf, 0);
+            return gdb_get_reg32(mem_buf, 0);
         }
     }
 
@@ -465,6 +459,7 @@ static int i386_cpu_gdb_get_egprs(CPUState *cs, GByteArray *mem_buf, int n)
 
 static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
 {
+    const unsigned regsz = target_long_bits() / 8;
     CPUX86State *env = &X86_CPU(cs)->env;
 
     if (n >= 0 && n < EGPR_NUM) {
@@ -473,7 +468,7 @@ static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
          * XCR0[APX_F] (at least for modification in gdbstub) to be enabled.
          */
         if (env->hflags & HF_CS64_MASK && env->xcr0 & XSTATE_APX_MASK) {
-            env->regs[gpr_map[n + CPU_NB_REGS]] = ldtul_p(mem_buf);
+            env->regs[gpr_map[n + CPU_NB_REGS]] = ldn_p(mem_buf, regsz);
 
             /*
              * Per SDM Vol 1, "Processor Tracking of XSAVE-Managed State",
@@ -492,7 +487,7 @@ static int i386_cpu_gdb_set_egprs(CPUState *cs, uint8_t *mem_buf, int n)
                 env->xstate_bv |= XSTATE_APX_MASK;
             }
         }
-        return sizeof(target_ulong);
+        return regsz;
     }
     return 0;
 }
@@ -506,8 +501,7 @@ void x86_cpu_gdb_init(CPUState *cs)
     if (env->features[FEAT_7_1_EDX] & CPUID_7_1_EDX_APXF) {
         gdb_register_coprocessor(cs, i386_cpu_gdb_get_egprs,
                                  i386_cpu_gdb_set_egprs,
-                                 gdb_find_static_feature("i386-64bit-apx.xml"),
-                                 0);
+                                 gdb_find_static_feature("i386-64bit-apx.xml"));
     }
 #endif
 
@@ -515,10 +509,9 @@ void x86_cpu_gdb_init(CPUState *cs)
     gdb_register_coprocessor(cs, x86_cpu_gdb_read_linux_register,
                              x86_cpu_gdb_write_linux_register,
 #ifdef TARGET_X86_64
-                             gdb_find_static_feature("i386-64bit-linux.xml"),
+                             gdb_find_static_feature("i386-64bit-linux.xml"));
 #else
-                             gdb_find_static_feature("i386-32bit-linux.xml"),
+                             gdb_find_static_feature("i386-32bit-linux.xml"));
 #endif
-                             0);
 #endif
 }

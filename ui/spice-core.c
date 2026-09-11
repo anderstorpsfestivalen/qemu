@@ -583,12 +583,13 @@ static int migration_state_notifier(NotifierWithReturn *notifier,
         return 0;
     }
 
-    if (e->type == MIG_EVENT_PRECOPY_SETUP) {
+    if (e->type == MIG_EVENT_SETUP) {
         spice_server_migrate_start(spice_server);
-    } else if (e->type == MIG_EVENT_PRECOPY_DONE) {
+    } else if (e->type == MIG_EVENT_DONE ||
+               e->type == MIG_EVENT_POSTCOPY_START) {
         spice_server_migrate_end(spice_server, true);
         spice_have_target_host = false;
-    } else if (e->type == MIG_EVENT_PRECOPY_FAILED) {
+    } else if (e->type == MIG_EVENT_FAILED) {
         spice_server_migrate_end(spice_server, false);
         spice_have_target_host = false;
     }
@@ -650,12 +651,15 @@ static void vm_change_state_handler(void *opaque, bool running,
     }
 }
 
+static VMChangeStateEntry *vm_change_entry;
+
 void qemu_spice_display_init_done(void)
 {
     if (runstate_is_running()) {
         qemu_spice_display_start();
     }
-    qemu_add_vm_change_state_handler(vm_change_state_handler, NULL);
+    vm_change_entry =
+        qemu_add_vm_change_state_handler(vm_change_state_handler, NULL);
 }
 
 static void qemu_spice_init(void)
@@ -756,7 +760,7 @@ static void qemu_spice_init(void)
                              tls_ciphers);
     }
     if (password) {
-        qemu_spice.set_passwd(password, false, false);
+        qemu_spice.set_passwd(password, false, false, NULL);
     }
     if (qemu_opt_get_bool(opts, "sasl", 0)) {
         if (spice_server_set_sasl(spice_server, 1) == -1) {
@@ -893,7 +897,8 @@ static int qemu_spice_add_interface(SpiceBaseInstance *sin)
         spice_server = spice_server_new();
         spice_server_set_sasl_appname(spice_server, "qemu");
         spice_server_init(spice_server, &core_interface);
-        qemu_add_vm_change_state_handler(vm_change_state_handler, NULL);
+        vm_change_entry =
+            qemu_add_vm_change_state_handler(vm_change_state_handler, NULL);
     }
 
     return spice_server_add_interface(spice_server, sin);
@@ -919,8 +924,10 @@ int qemu_spice_add_display_interface(QXLInstance *qxlin, QemuConsole *con)
     return qemu_spice_add_interface(&qxlin->base);
 }
 
-static int qemu_spice_set_ticket(bool fail_if_conn, bool disconnect_if_conn)
+static int qemu_spice_set_ticket(bool fail_if_conn, bool disconnect_if_conn,
+                                 Error **errp)
 {
+    int ret;
     time_t lifetime, now = time(NULL);
     char *passwd;
 
@@ -934,26 +941,35 @@ static int qemu_spice_set_ticket(bool fail_if_conn, bool disconnect_if_conn)
         passwd = NULL;
         lifetime = 1;
     }
-    return spice_server_set_ticket(spice_server, passwd, lifetime,
-                                   fail_if_conn, disconnect_if_conn);
+    ret = spice_server_set_ticket(spice_server, passwd, lifetime,
+                                  fail_if_conn, disconnect_if_conn);
+    if (ret < 0) {
+        error_setg(errp, "Unable to set SPICE server ticket");
+        return -1;
+    }
+    return 0;
 }
 
 static int qemu_spice_set_passwd(const char *passwd,
-                                 bool fail_if_conn, bool disconnect_if_conn)
+                                 bool fail_if_conn, bool disconnect_if_conn,
+                                 Error **errp)
 {
     if (strcmp(auth, "spice") != 0) {
+        error_setg(errp, "SPICE authentication is disabled");
+        error_append_hint(errp,
+                          "To enable it use '-spice ...,password-secret=ID'");
         return -1;
     }
 
     g_free(auth_passwd);
     auth_passwd = g_strdup(passwd);
-    return qemu_spice_set_ticket(fail_if_conn, disconnect_if_conn);
+    return qemu_spice_set_ticket(fail_if_conn, disconnect_if_conn, errp);
 }
 
 static int qemu_spice_set_pw_expire(time_t expires)
 {
     auth_expires = expires;
-    return qemu_spice_set_ticket(false, false);
+    return qemu_spice_set_ticket(false, false, NULL);
 }
 
 static int qemu_spice_display_add_client(int csock, int skipauth, int tls)
@@ -993,8 +1009,25 @@ int qemu_spice_display_is_running(SimpleSpiceDisplay *ssd)
     return spice_display_is_running;
 }
 
+static void qemu_spice_cleanup(void)
+{
+    if (!spice_server) {
+        return;
+    }
+
+    qemu_spice_display_cleanup();
+    qemu_spice_input_cleanup();
+    migration_remove_notifier(&migration_state);
+    g_clear_pointer(&spice_consoles, g_slist_free);
+    g_clear_pointer(&auth_passwd, g_free);
+    g_clear_pointer(&spice_server, spice_server_destroy);
+    g_clear_pointer(&vm_change_entry, qemu_del_vm_change_state_handler);
+    using_spice = 0;
+}
+
 static struct QemuSpiceOps real_spice_ops = {
     .init         = qemu_spice_init,
+    .cleanup      = qemu_spice_cleanup,
     .display_init = qemu_spice_display_init,
     .migrate_info = qemu_spice_migrate_info,
     .set_passwd   = qemu_spice_set_passwd,

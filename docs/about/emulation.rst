@@ -463,6 +463,18 @@ Example::
   0x000000004002b0, 1, 4, 66087
   ...
 
+Behaviour can be tweaked with the following arguments:
+
+.. list-table:: Hot Blocks plugin arguments
+  :widths: 20 80
+  :header-rows: 1
+
+  * - Option
+    - Description
+  * - inline=true|false
+    - Use faster inline addition of a single counter.
+  * - limit=N
+    - The number of blocks to be printed. (Default: N = 20, use 0 for no limit).
 
 Hot Pages
 .........
@@ -824,8 +836,8 @@ Uftrace
 This plugin generates a binary trace compatible with
 `uftrace <https://github.com/namhyung/uftrace>`_.
 
-Plugin supports aarch64 and x64, and works in user and system mode, allowing to
-trace a system boot, which is not something possible usually.
+Plugin supports aarch64, x64 and riscv64, and works in user and system mode,
+allowing to trace a system boot, which is not something possible usually.
 
 In user mode, the memory mapping is directly copied from ``/proc/self/maps`` at
 the end of execution. Uftrace should be able to retrieve symbols by itself,
@@ -837,7 +849,7 @@ Symbols must be present in ELF binaries.
 It tracks the call stack (based on frame pointer analysis). Thus, your program
 and its dependencies must be compiled using ``-fno-omit-frame-pointer
 -mno-omit-leaf-frame-pointer``. In 2024, `Ubuntu and Fedora enabled it by
-default again on x64
+default again on 64-bit platforms
 <https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html>`_.
 On aarch64, this is less of a problem, as they are usually part of the ABI,
 except for leaf functions. That's true for user space applications, but not
@@ -860,7 +872,7 @@ Performance wise, overhead compared to normal tcg execution is around x5-x15.
     - Description
   * - trace-privilege-level=[on|off]
     - Generate separate traces for each privilege level (Exception Level +
-      Security State on aarch64, Rings on x64).
+      Security State on aarch64, Privilege levels on riscv64 and Rings on x64).
 
 .. list-table:: uftrace_symbols.py arguments
   :widths: 20 80
@@ -886,24 +898,24 @@ As an example, we can trace qemu itself running git::
     $ uftrace dump --chrome | gzip > ~/qemu_aarch64_git_help.json.gz
 
 For convenience, you can download this trace `qemu_aarch64_git_help.json.gz
-<https://github.com/pbo-linaro/qemu-assets/raw/refs/heads/master/qemu-uftrace/qemu_aarch64_git_help.json.gz>`_.
+<https://github.com/p-b-o/qemu-assets/raw/refs/heads/master/qemu-uftrace/qemu_aarch64_git_help.json.gz>`_.
 Download it and open this trace on https://ui.perfetto.dev/. You can zoom in/out
 using :kbd:`W`, :kbd:`A`, :kbd:`S`, :kbd:`D` keys.
 Some sequences taken from this trace:
 
 - Loading program and its interpreter
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/loader_exec.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/loader_exec.png?raw=true
    :height: 200px
 
 - open syscall
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/open_syscall.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/open_syscall.png?raw=true
    :height: 200px
 
 - TB creation
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/tb_translation.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/tb_translation.png?raw=true
    :height: 200px
 
 It's usually better to use ``uftrace record`` directly. However, tracing
@@ -916,7 +928,7 @@ Example system trace
 
 A full trace example (chrome trace, from instructions below) generated from a
 system boot can be found `here
-<https://github.com/pbo-linaro/qemu-assets/raw/refs/heads/master/qemu-uftrace/aarch64_boot.json.gz>`_.
+<https://github.com/p-b-o/qemu-assets/raw/refs/heads/master/qemu-uftrace/aarch64_boot.json.gz>`_.
 Download it and open this trace on https://ui.perfetto.dev/. You can see code
 executed for all privilege levels, and zoom in/out using
 :kbd:`W`, :kbd:`A`, :kbd:`S`, :kbd:`D` keys. You can find below some sequences
@@ -924,27 +936,27 @@ taken from this trace:
 
 - Two first stages of boot sequence in Arm Trusted Firmware (EL3 and S-EL1)
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/bl3_to_bl1.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/bl3_to_bl1.png?raw=true
    :height: 200px
 
 - U-boot initialization (until code relocation, after which we can't track it)
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/uboot.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/uboot.png?raw=true
    :height: 200px
 
 - Stat and open syscalls in kernel
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/stat.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/stat.png?raw=true
    :height: 200px
 
 - Timer interrupt
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/timer_interrupt.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/timer_interrupt.png?raw=true
    :height: 200px
 
 - Poweroff sequence (from kernel back to firmware, NS-EL2 to EL3)
 
-.. image:: https://github.com/pbo-linaro/qemu-assets/blob/master/qemu-uftrace/poweroff.png?raw=true
+.. image:: https://github.com/p-b-o/qemu-assets/blob/master/qemu-uftrace/poweroff.png?raw=true
    :height: 200px
 
 Build and run system example
@@ -954,7 +966,7 @@ Build and run system example
 
 Building a full system image with frame pointers is not trivial.
 
-We provide a `simple way <https://github.com/pbo-linaro/qemu-linux-stack>`_ to
+We provide a `simple way <https://github.com/p-b-o/qemu-linux-stack>`_ to
 build an aarch64 system, combining Arm Trusted firmware, U-boot, Linux kernel
 and debian userland. It's based on containers (``podman`` only) and
 ``qemu-user-static (binfmt)`` to make sure it's easily reproducible and does not depend
@@ -962,21 +974,32 @@ on machine where you build it.
 
 You can follow the exact same instructions for a x64 system, combining edk2,
 Linux, and Ubuntu, simply by switching to
-`x86_64 <https://github.com/pbo-linaro/qemu-linux-stack/tree/x86_64>`_ branch.
+`x86_64 <https://github.com/p-b-o/qemu-linux-stack/tree/x86_64>`_ branch.
 
-To build the system::
+You can follow the exact same instructions for a riscv64 system, combining
+opensbi, Linux, and Ubuntu, simply by switching to
+`riscv64 <https://github.com/p-b-o/qemu-linux-stack/tree/riscv64>`_ branch.
+
+To build and run the system::
 
     # Install dependencies
     $ sudo apt install -y podman qemu-user-static
 
-    $ git clone https://github.com/pbo-linaro/qemu-linux-stack
+    $ git clone https://github.com/p-b-o/qemu-linux-stack
     $ cd qemu-linux-stack
     $ ./build.sh
 
     # system can be started using:
     $ ./run.sh /path/to/qemu-system-aarch64
 
-To generate a uftrace for a system boot from that::
+    # generate a uftrace for execution (collect symbols automatically)
+    $ ./trace.sh /path/to/qemu-system-aarch64
+    # show output log to read timestamps
+    $ cat uftrace.data/exec.log
+    # generate final trace (compressed) for perfetto
+    $ ./perfetto.sh <start_timestamp> <end_timestamp> ~/trace.gz
+
+To generate manually the same trace::
 
     # run true and poweroff the system
     $ env INIT=true ./run.sh path/to/qemu-system-aarch64 \
@@ -1020,8 +1043,177 @@ Count traps
 
 ``contrib/plugins/traps.c``
 
-This plugin counts the number of interrupts (asyncronous events), exceptions
+This plugin counts the number of interrupts (asynchronous events), exceptions
 (synchronous events) and host calls (e.g. semihosting) per cpu.
+
+Dynamic Linking Call
+....................
+
+``contrib/plugins/dlcall.c``
+
+This plugin provides a dynamic linking function call interception mechanism
+for linux-user guests: the guest hands a call off to the host, where the plugin
+runs native code in its place instead of the guest emulating it. Interception
+alone enables several uses, for instance tracing or auditing guest calls.
+One use is acceleration by leveraging the host's native shared libraries. For
+example, a thunk layer can run the stock zlib ``minizip`` utility under
+emulation while forwarding its ``deflate`` calls to the host's native zlib
+library (libz). This avoids emulating those selected library calls instruction
+by instruction.
+
+The guest issues a reserved "magic" system call (4096 by default, configurable
+with ``syscall_num=N``) whose first argument selects a pass-through operation:
+dlopen/dlclose a host library, dlsym a symbol, and invoke a resolved host
+function. The plugin performs the operation on the host and consumes the
+syscall, so the real kernel never sees it.
+
+.. warning::
+
+   Trusted guests only. The guest can load arbitrary host libraries and run
+   arbitrary code in the QEMU host process. The plugin is not a sandbox and
+   provides no isolation. It also requires ``guest_base == 0`` (qemu-user's
+   default) and a guest whose pointer width and endianness match the host's, as
+   guest pointers are dereferenced as host addresses with no translation.
+
+The plugin intentionally keeps the QEMU side lightweight and knows nothing
+about any particular library or its calling convention. Producing the thunks
+for a real library is done entirely in userspace, and any toolchain can
+implement the interface.
+
+Loading the plugin is all that is required from QEMU's side:
+
+.. code-block:: shell
+
+   qemu-x86_64 -plugin contrib/plugins/libdlcall.so <guest-program> ...
+
+If the default number does not suit the guest ABI, pick another one, and build
+the userspace side to issue the same one:
+
+.. code-block:: shell
+
+   qemu-x86_64 -plugin contrib/plugins/libdlcall.so,syscall_num=8192 \
+       <guest-program> ...
+
+`Lorelei <https://github.com/rover2024/lorelei>`_ is one end-to-end userspace
+implementation of this: it provides the guest and host runtimes and an
+automated toolchain that generates the thunks from a library's headers, so guest
+library calls run on the host's native libraries. How it handles the parts the
+plugin leaves out, including argument marshalling, callbacks and variadic
+functions, can serve as a reference. It supports an x86_64 guest running on an
+x86_64, aarch64 or riscv64 host.
+
+A minimal end-to-end example uses a one-function library, ``libhello.so``, built
+two ways: the guest build tags its output ``(from the guest)`` and the host
+build ``(from the host)``. An unmodified guest program ``main`` calls
+``hello("World", 7)``, and the thunk makes that same binary reach the host build
+in place of its own. The sources live under ``src/``:
+
+.. code-block:: c
+
+   /* src/hello.h */
+   void hello(const char *name, int lucky);
+
+.. code-block:: c
+
+   /* src/hello_guest.c */
+   #include "hello.h"
+   #include <stdio.h>
+
+   void hello(const char *name, int lucky)
+   {
+       printf("Hello, %s! Your lucky number is %d. (from the guest)\n", name, lucky);
+   }
+
+.. code-block:: c
+
+   /* src/hello_host.c */
+   #include "hello.h"
+   #include <stdio.h>
+
+   void hello(const char *name, int lucky)
+   {
+       printf("Hello, %s! Your lucky number is %d. (from the host)\n", name, lucky);
+   }
+
+.. code-block:: c
+
+   /* src/main.c */
+   #include "hello.h"
+
+   int main(void)
+   {
+       hello("World", 7);
+       return 0;
+   }
+
+Lorelei ships a prebuilt toolchain (a "devkit") in its releases. Download the
+one for your host and unpack it:
+
+.. code-block:: shell
+
+   # ARCH is your host's architecture: x86_64, aarch64 or riscv64. This example uses aarch64.
+   # See https://github.com/rover2024/lorelei/releases
+   ARCH=aarch64
+   VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+         https://github.com/rover2024/lorelei/releases/latest | sed 's|.*/tag/v||')
+   wget "https://github.com/rover2024/lorelei/releases/download/v$VERSION/lorelei-devkit-$ARCH-$VERSION.tar.xz"
+   tar -xf lorelei-devkit-$ARCH-$VERSION.tar.xz
+   DEVKIT=lorelei-devkit-$ARCH
+
+Build the guest ``libhello.so`` (x86_64) and the host ``libhello.so`` (this
+host's architecture), then the guest program:
+
+.. code-block:: shell
+
+   mkdir -p build/guest build/host
+   $DEVKIT/bin/x86_64-linux-gnu-clang -shared -fPIC src/hello_guest.c -o build/guest/libhello.so
+   cc -shared -fPIC src/hello_host.c -o build/host/libhello.so
+   $DEVKIT/bin/x86_64-linux-gnu-clang src/main.c -Isrc -Lbuild/guest -lhello -o build/guest/main
+
+Run it under qemu:
+
+.. code-block:: shell
+
+   qemu-x86_64 -L /usr/x86_64-linux-gnu/ -E LD_LIBRARY_PATH=build/guest build/guest/main
+
+which prints::
+
+   Hello, World! Your lucky number is 7. (from the guest)
+
+Now generate the thunk from the host ``libhello.so``. This produces a guest-side
+``libhello.so`` that stands in for the guest build, and a host-side thunk library
+that dispatches to the host build:
+
+.. code-block:: shell
+
+   $DEVKIT/bin/LoreMakeThunk.py --name hello --lib build/host/libhello.so \
+       --header hello.h -o thunks -- -Isrc
+
+Run the same ``main`` under the plugin. The call reaches the host build now:
+
+.. code-block:: shell
+
+   LD_LIBRARY_PATH=$DEVKIT/lib:build/host \
+       qemu-x86_64 -plugin contrib/plugins/libdlcall.so \
+       -E LD_LIBRARY_PATH=$DEVKIT/x86_64/lib:thunks/x86_64 \
+       -L /usr/x86_64-linux-gnu/ \
+       build/guest/main
+
+which prints::
+
+   Hello, World! Your lucky number is 7. (from the host)
+
+.. list-table:: Dynamic Linking Call arguments
+  :widths: 20 80
+  :header-rows: 1
+
+  * - Option
+    - Description
+  * - syscall_num=N
+    - The magic syscall number the guest issues (default 4096). It must be a
+      number the guest ABI does not use for a real syscall, and does not
+      reject before the plugin sees it, which bounds the choice from both
+      sides.
 
 Other emulation features
 ------------------------

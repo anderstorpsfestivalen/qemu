@@ -12,6 +12,7 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/audio.h"
+#include "qom/object.h"
 #include "qemu/memfd.h"
 #include "qemu/error-report.h"
 
@@ -54,14 +55,20 @@ typedef struct JukeAudioHeader {
     /* Audio samples follow (ring_frames * channels * bytes_per_sample) */
 } JukeAudioHeader;
 
-typedef struct JukeAudioState {
+#define TYPE_AUDIO_JUKE "audio-juke"
+OBJECT_DECLARE_SIMPLE_TYPE(JukeAudioState, AUDIO_JUKE)
+
+static AudioBackendClass *audio_juke_parent_class;
+
+struct JukeAudioState {
+    AudioMixengBackend parent_obj;
     JukeAudioHeader *shmem;
     size_t shmem_size;
     int shmem_fd;
     char *socket_path;
     int client_fd;
     bool fd_sent;
-} JukeAudioState;
+};
 
 typedef struct JukeVoiceOut {
     HWVoiceOut hw;
@@ -214,10 +221,10 @@ static size_t juke_write(HWVoiceOut *hw, void *buf, size_t len)
     return bytes_to_write;
 }
 
-static int juke_init_out(HWVoiceOut *hw, struct audsettings *as, void *drv_opaque)
+static int juke_init_out(HWVoiceOut *hw, struct audsettings *as)
 {
     JukeVoiceOut *juke = (JukeVoiceOut *)hw;
-    JukeAudioState *s = (JukeAudioState *)drv_opaque;
+    JukeAudioState *s = AUDIO_JUKE(hw->s);
 
     juke->state = s;
 
@@ -266,7 +273,7 @@ static int juke_init_out(HWVoiceOut *hw, struct audsettings *as, void *drv_opaqu
 
 static void juke_fini_out(HWVoiceOut *hw)
 {
-    /* Cleanup handled in juke_audio_fini */
+    /* Cleanup handled in juke_audio_finalize */
 }
 
 /*
@@ -306,63 +313,68 @@ static void juke_enable_out(HWVoiceOut *hw, bool enable)
     /* Note: s->shmem->enabled is controlled by Juke (reader), not QEMU */
 }
 
-static void *juke_audio_init(Audiodev *dev, Error **errp)
+static void juke_audio_instance_init(Object *obj)
 {
-    JukeAudioState *s;
+    JukeAudioState *s = AUDIO_JUKE(obj);
 
-    /* Get socket path from audiodev options (required) */
-    const char *socket_path = dev->u.juke.path;
-
-    s = g_new0(JukeAudioState, 1);
-    s->socket_path = g_strdup(socket_path);
     s->shmem_fd = -1;
     s->client_fd = -1;
-
-    error_report("juke-audio: initialized, will connect to %s", socket_path);
-
-    return s;
 }
 
-static void juke_audio_fini(void *opaque)
+static bool juke_audio_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
 {
-    JukeAudioState *s = (JukeAudioState *)opaque;
+    JukeAudioState *s = AUDIO_JUKE(abe);
+
+    s->socket_path = g_strdup(dev->u.juke.path);
+    error_report("juke-audio: initialized, will connect to %s", s->socket_path);
+
+    return audio_juke_parent_class->realize(abe, dev, errp);
+}
+
+static void juke_audio_finalize(Object *obj)
+{
+    JukeAudioState *s = AUDIO_JUKE(obj);
 
     if (s->client_fd >= 0) {
         close(s->client_fd);
     }
-
     if (s->shmem) {
         qemu_memfd_free(s->shmem, s->shmem_size, s->shmem_fd);
     }
-
     g_free(s->socket_path);
-    g_free(s);
 }
 
-static struct audio_pcm_ops juke_pcm_ops = {
-    .init_out = juke_init_out,
-    .fini_out = juke_fini_out,
-    .write    = juke_write,
-    .buffer_get_free = audio_generic_buffer_get_free,
-    .run_buffer_out = audio_generic_run_buffer_out,
-    .enable_out = juke_enable_out,
-    .volume_out = juke_volume_out,
-    /* No input support for now */
-};
-
-static struct audio_driver juke_audio_driver = {
-    .name           = "juke",
-    .init           = juke_audio_init,
-    .fini           = juke_audio_fini,
-    .pcm_ops        = &juke_pcm_ops,
-    .max_voices_out = 1,
-    .max_voices_in  = 0,
-    .voice_size_out = sizeof(JukeVoiceOut),
-    .voice_size_in  = 0,
-};
-
-static void register_audio_juke(void)
+static void audio_juke_class_init(ObjectClass *klass, const void *data)
 {
-    audio_driver_register(&juke_audio_driver);
+    AudioBackendClass *b = AUDIO_BACKEND_CLASS(klass);
+    AudioMixengBackendClass *k = AUDIO_MIXENG_BACKEND_CLASS(klass);
+
+    audio_juke_parent_class = AUDIO_BACKEND_CLASS(object_class_get_parent(klass));
+    b->realize = juke_audio_realize;
+
+    k->max_voices_out = 1;
+    k->max_voices_in = 0;
+    k->voice_size_out = sizeof(JukeVoiceOut);
+    k->voice_size_in = 0;
+    k->init_out = juke_init_out;
+    k->fini_out = juke_fini_out;
+    k->write = juke_write;
+    k->buffer_get_free = audio_generic_buffer_get_free;
+    k->run_buffer_out = audio_generic_run_buffer_out;
+    k->enable_out = juke_enable_out;
+    k->volume_out = juke_volume_out;
 }
-type_init(register_audio_juke);
+
+static const TypeInfo audio_types[] = {
+    {
+        .name = TYPE_AUDIO_JUKE,
+        .parent = TYPE_AUDIO_MIXENG_BACKEND,
+        .instance_size = sizeof(JukeAudioState),
+        .instance_init = juke_audio_instance_init,
+        .instance_finalize = juke_audio_finalize,
+        .class_init = audio_juke_class_init,
+    },
+};
+
+DEFINE_TYPES(audio_types)
+module_obj(TYPE_AUDIO_JUKE);

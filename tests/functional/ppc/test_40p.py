@@ -2,7 +2,7 @@
 #
 # Functional test that boots a PReP/40p machine and checks its serial console.
 #
-# Copyright (c) Philippe Mathieu-Daudé <f4bug@amsat.org>
+# Copyright (c) Philippe Mathieu-Daudé
 #
 # This work is licensed under the terms of the GNU GPL, version 2 or
 # later. See the COPYING file in the top-level directory.
@@ -27,7 +27,7 @@ class IbmPrep40pMachine(QemuSystemTest):
         'f86236e9d01b3f0dd0f5d3b8d5bbd40c68e78b4db560a108358f5ad58e636619')
     ASSET_NETBSD71 = Asset(
         ('https://archive.netbsd.org/pub/NetBSD-archive/'
-         'NetBSD-7.1.2/iso/NetBSD-7.1.2-prep.iso'),
+         'NetBSD-7.1.2/iso/NetBSD-7.1.2-prep.iso?key=NetBSD'),
         'cc7cb290b06aaa839362deb7bd9f417ac5015557db24088508330f76c3f825ec')
 
     # 12H0455 PPS Firmware Licensed Materials

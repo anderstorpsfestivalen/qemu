@@ -27,7 +27,7 @@
 #include "cpu.h"
 #include "qemu/module.h"
 #include "hw/core/qdev-properties.h"
-#include "accel/tcg/cpu-ldst.h"
+#include "accel/tcg/cpu-ldst-common.h"
 #include "exec/gdbstub.h"
 #include "exec/translation-block.h"
 #include "fpu/softfloat-helpers.h"
@@ -233,12 +233,12 @@ static void mb_cpu_reset_hold(Object *obj, ResetType type)
 #endif
 }
 
-static void mb_disas_set_info(CPUState *cpu, disassemble_info *info)
+static void mb_disas_set_info(const CPUState *cpu, disassemble_info *info)
 {
     info->mach = bfd_arch_microblaze;
     info->print_insn = print_insn_microblaze;
-    info->endian = TARGET_BIG_ENDIAN ? BFD_ENDIAN_BIG
-                                     : BFD_ENDIAN_LITTLE;
+    info->endian = MICROBLAZE_CPU(cpu)->cfg.endi ? BFD_ENDIAN_LITTLE
+                                                 : BFD_ENDIAN_BIG;
 }
 
 static void mb_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -265,8 +265,7 @@ static void mb_cpu_realizefn(DeviceState *dev, Error **errp)
 
     gdb_register_coprocessor(cs, mb_cpu_gdb_read_stack_protect,
                              mb_cpu_gdb_write_stack_protect,
-                             gdb_find_static_feature("microblaze-stack-protect.xml"),
-                             0);
+                             gdb_find_static_feature("microblaze-stack-protect.xml"));
 
     qemu_init_vcpu(cs);
 
@@ -429,7 +428,7 @@ static ObjectClass *mb_cpu_class_by_name(const char *cpu_model)
 
 static const struct SysemuCPUOps mb_sysemu_ops = {
     .has_work = mb_cpu_has_work,
-    .get_phys_page_attrs_debug = mb_cpu_get_phys_page_attrs_debug,
+    .translate_for_debug = mb_cpu_translate_for_debug,
 };
 #endif
 

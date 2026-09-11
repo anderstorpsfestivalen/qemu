@@ -14,7 +14,7 @@
 #include <libfdt.h>
 #include "hw/arm/boot.h"
 #include "hw/arm/linux-boot-if.h"
-#include "cpu.h"
+#include "target/arm/cpu.h"
 #include "exec/tswap.h"
 #include "exec/target_page.h"
 #include "system/kvm.h"
@@ -766,16 +766,12 @@ static ssize_t arm_load_elf(struct arm_boot_info *info, uint64_t *pentry,
     int data_swab = 0;
     int elf_data_order;
     ssize_t ret;
-    Error *err = NULL;
 
-
-    load_elf_hdr(info->kernel_filename, &elf_header, &elf_is64, &err);
-    if (err) {
+    if (!load_elf_hdr(info->kernel_filename, &elf_header, &elf_is64, NULL)) {
         /*
          * If the file is not an ELF file we silently return.
          * The caller will fall back to try other formats.
          */
-        error_free(err);
         return -1;
     }
 
@@ -820,14 +816,14 @@ static ssize_t arm_load_elf(struct arm_boot_info *info, uint64_t *pentry,
 static uint64_t load_aarch64_image(const char *filename, hwaddr mem_base,
                                    hwaddr *entry, AddressSpace *as)
 {
+    const size_t max_bytes = LOAD_IMAGE_MAX_DECOMPRESSED_BYTES;
     hwaddr kernel_load_offset = KERNEL64_LOAD_ADDR;
     uint64_t kernel_size = 0;
     uint8_t *buffer;
     ssize_t size;
 
     /* On aarch64, it's the bootloader's job to uncompress the kernel. */
-    size = load_image_gzipped_buffer(filename, LOAD_IMAGE_MAX_GUNZIP_BYTES,
-                                     &buffer);
+    size = load_image_gzipped_buffer(filename, max_bytes, &buffer);
 
     if (size < 0) {
         gsize len;
@@ -1165,6 +1161,11 @@ static void arm_setup_firmware_boot(ARMCPU *cpu, struct arm_boot_info *info)
             fw_cfg_add_string(fw_cfg, FW_CFG_CMDLINE_DATA,
                               info->kernel_cmdline);
         }
+
+        if (info->shim_filename) {
+            load_image_to_fw_cfg_file(fw_cfg, "etc/boot/shim",
+                                      info->shim_filename);
+        }
     }
 
     /*
@@ -1199,6 +1200,7 @@ void arm_load_kernel(ARMCPU *cpu, MachineState *ms, struct arm_boot_info *info)
      * doesn't support secure.
      */
     assert(!(info->secure_board_setup && kvm_enabled()));
+    info->shim_filename = ms->shim_filename;
     info->kernel_filename = ms->kernel_filename;
     info->kernel_cmdline = ms->kernel_cmdline;
     info->initrd_filename = ms->initrd_filename;

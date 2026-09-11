@@ -42,6 +42,7 @@
 #include "qapi/qapi-commands-run-state.h"
 #include "qapi/qapi-events-run-state.h"
 #include "qemu/accel.h"
+#include "accel/accel-ops.h"
 #include "qemu/error-report.h"
 #include "qemu/job.h"
 #include "qemu/log.h"
@@ -57,8 +58,11 @@
 #include "system/reset.h"
 #include "system/runstate.h"
 #include "system/runstate-action.h"
+#include "system/confidential-guest-support.h"
 #include "system/system.h"
 #include "system/tpm.h"
+#include "ui/console.h"
+
 #include "trace.h"
 
 static NotifierList exit_notifiers =
@@ -347,6 +351,9 @@ VMChangeStateEntry *qemu_add_vm_change_state_handler(VMChangeStateHandler *cb,
 
 void qemu_del_vm_change_state_handler(VMChangeStateEntry *e)
 {
+    if (!e) {
+        return;
+    }
     QTAILQ_REMOVE(&vm_change_state_head, e, entries);
     g_free(e);
 }
@@ -506,10 +513,13 @@ static int qemu_debug_requested(void)
  */
 void qemu_system_reset(ShutdownCause reason)
 {
-    MachineClass *mc;
+    MachineClass *mc = current_machine ? MACHINE_GET_CLASS(current_machine) : NULL;
+    AccelClass *ac = ACCEL_GET_CLASS(current_accel());
+    bool force_vmfd_change =
+        current_machine ? current_machine->new_accel_vmfd_on_reset : false;
+    bool guest_state_rebuilt = false;
+    int ret;
     ResetType type;
-
-    mc = current_machine ? MACHINE_GET_CLASS(current_machine) : NULL;
 
     cpu_synchronize_all_states();
 
@@ -520,6 +530,31 @@ void qemu_system_reset(ShutdownCause reason)
     default:
         type = RESET_TYPE_COLD;
     }
+
+    if ((reason == SHUTDOWN_CAUSE_GUEST_RESET ||
+         reason == SHUTDOWN_CAUSE_HOST_QMP_SYSTEM_RESET) &&
+        (force_vmfd_change || !cpus_are_resettable())) {
+        if (ac->rebuild_guest) {
+            ret = ac->rebuild_guest(current_machine);
+            if (ret < 0 && ret != -EOPNOTSUPP) {
+                error_report("unable to rebuild guest: %s(%d)",
+                             strerror(-ret), ret);
+                vm_stop(RUN_STATE_INTERNAL_ERROR);
+            } else if (ret == -EOPNOTSUPP) {
+                error_report("accelerator does not support reset!");
+            } else {
+                info_report("virtual machine state has been rebuilt with new "
+                            "guest file handle.");
+                guest_state_rebuilt = true;
+            }
+        } else if (!cpus_are_resettable())  {
+            error_report("accelerator does not support reset!");
+        } else {
+            error_report("accelerator does not support rebuilding guest state,"
+                         " proceeding with normal reset!");
+        }
+    }
+
     if (mc && mc->reset) {
         mc->reset(current_machine, type);
     } else {
@@ -542,9 +577,16 @@ void qemu_system_reset(ShutdownCause reason)
      * it does _more_  than cpu_synchronize_all_post_reset().
      */
     if (cpus_are_resettable()) {
-        cpu_synchronize_all_post_reset();
-    } else {
-        assert(runstate_check(RUN_STATE_PRELAUNCH));
+        if (guest_state_rebuilt) {
+            /*
+             * If guest state has been rebuilt, then we
+             * need to sync full cpu state for non confidential guests post
+             * reset.
+             */
+            cpu_synchronize_all_post_init();
+        } else {
+            cpu_synchronize_all_post_reset();
+        }
     }
 
     vm_set_suspended(false);
@@ -664,11 +706,15 @@ void qemu_system_guest_panicked(GuestPanicInformation *info)
                           " error code: 0x%" PRIx32 " error message:\"%s\"\n",
                           info->u.tdx.error_code, message);
             g_free(message);
-            if (info->u.tdx.gpa != -1ull) {
+            if (info->u.tdx.has_gpa) {
                 qemu_log_mask(LOG_GUEST_ERROR, "Additional error information "
                               "can be found at gpa page: 0x%" PRIx64 "\n",
                               info->u.tdx.gpa);
             }
+        } else if (info->type == GUEST_PANIC_INFORMATION_TYPE_SEV) {
+            qemu_log_mask(LOG_GUEST_ERROR, "SEV termination (reason set: %d code: %d)",
+                          info->u.sev.set,
+                          info->u.sev.code);
         }
 
         qapi_free_GuestPanicInformation(info);
@@ -693,7 +739,8 @@ void qemu_system_reset_request(ShutdownCause reason)
     if (reboot_action == REBOOT_ACTION_SHUTDOWN &&
         reason != SHUTDOWN_CAUSE_SUBSYSTEM_RESET) {
         shutdown_requested = reason;
-    } else if (!cpus_are_resettable()) {
+    } else if (!cpus_are_resettable() &&
+               !confidential_guest_can_rebuild_state(current_machine->cgs)) {
         error_report("cpus are not resettable, terminating");
         shutdown_requested = reason;
     } else {
@@ -998,6 +1045,7 @@ void qemu_cleanup(int status)
     audio_cleanup();
     monitor_cleanup();
     qemu_chr_cleanup();
+    qemu_display_cleanup();
     user_creatable_cleanup();
     /* TODO: unref root container, check all devices are ok */
 }

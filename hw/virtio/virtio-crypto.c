@@ -216,6 +216,12 @@ virtio_crypto_create_asym_session(VirtIOCrypto *vcrypto,
         return -VIRTIO_CRYPTO_NOTSUPP;
     }
 
+    if (unlikely(keylen > vcrypto->conf.max_size)) {
+        error_report("virtio-crypto length of akcipher key is too large: %u",
+                     keylen);
+        return -VIRTIO_CRYPTO_ERR;
+    }
+
     if (keylen) {
         asym_info->key = g_malloc(keylen);
         if (iov_to_buf(iov, out_num, 0, asym_info->key, keylen) != keylen) {
@@ -767,10 +773,17 @@ virtio_crypto_handle_asym_req(VirtIOCrypto *vcrypto,
     uint32_t len;
     uint8_t *src = NULL;
     uint8_t *dst = NULL;
+    uint64_t max_len;
 
     asym_op_info = g_new0(CryptoDevBackendAsymOpInfo, 1);
     src_len = ldl_le_p(&req->para.src_data_len);
     dst_len = ldl_le_p(&req->para.dst_data_len);
+
+    max_len = (uint64_t)src_len + dst_len;
+    if (unlikely(max_len > vcrypto->conf.max_size)) {
+        virtio_error(vdev, "virtio-crypto asym request is too large");
+        goto err;
+    }
 
     if (src_len > 0) {
         src = g_malloc0(src_len);

@@ -91,16 +91,12 @@ typedef struct DisasContext {
     bool is_pa20;
     bool insn_start_updated;
 
-#ifdef CONFIG_USER_ONLY
-    MemOp unalign;
-#endif
+    MemOp mo_align;
 } DisasContext;
 
 #ifdef CONFIG_USER_ONLY
-#define UNALIGN(C)       (C)->unalign
 #define MMU_DISABLED(C)  false
 #else
-#define UNALIGN(C)       MO_ALIGN
 #define MMU_DISABLED(C)  MMU_IDX_MMU_DISABLED((C)->mmu_idx)
 #endif
 
@@ -307,9 +303,9 @@ void hppa_translate_init(void)
 
     cpu_gr[0] = NULL;
     for (i = 1; i < 32; i++) {
-        cpu_gr[i] = tcg_global_mem_new(tcg_env,
-                                       offsetof(CPUHPPAState, gr[i]),
-                                       gr_names[i]);
+        cpu_gr[i] = tcg_global_mem_new_i64(tcg_env,
+                                           offsetof(CPUHPPAState, gr[i]),
+                                           gr_names[i]);
     }
     for (i = 0; i < 4; i++) {
         cpu_sr[i] = tcg_global_mem_new_i64(tcg_env,
@@ -322,7 +318,7 @@ void hppa_translate_init(void)
 
     for (i = 0; i < ARRAY_SIZE(vars); ++i) {
         const GlobalVar *v = &vars[i];
-        *v->var = tcg_global_mem_new(tcg_env, v->ofs, v->name);
+        *v->var = tcg_global_mem_new_i64(tcg_env, v->ofs, v->name);
     }
 
     cpu_psw_xb = tcg_global_mem_new_i32(tcg_env,
@@ -1605,10 +1601,11 @@ static void do_load_32(DisasContext *ctx, TCGv_i32 dest, unsigned rb,
     /* Caller uses nullify_over/nullify_end.  */
     assert(ctx->null_cond.c == TCG_COND_NEVER);
 
+    mop |= ctx->mo_align;
     mop |= mo_endian(ctx);
     form_gva(ctx, &addr, &ofs, rb, rx, scale, disp, sp, modify,
              MMU_DISABLED(ctx));
-    tcg_gen_qemu_ld_i32(dest, addr, ctx->mmu_idx, mop | UNALIGN(ctx));
+    tcg_gen_qemu_ld_i32(dest, addr, ctx->mmu_idx, mop);
     if (modify) {
         save_gpr(ctx, rb, ofs);
     }
@@ -1624,10 +1621,11 @@ static void do_load_64(DisasContext *ctx, TCGv_i64 dest, unsigned rb,
     /* Caller uses nullify_over/nullify_end.  */
     assert(ctx->null_cond.c == TCG_COND_NEVER);
 
+    mop |= ctx->mo_align;
     mop |= mo_endian(ctx);
-    form_gva(ctx, &addr, &ofs, rb, rx, scale, disp, sp, modify,
+     form_gva(ctx, &addr, &ofs, rb, rx, scale, disp, sp, modify,
              MMU_DISABLED(ctx));
-    tcg_gen_qemu_ld_i64(dest, addr, ctx->mmu_idx, mop | UNALIGN(ctx));
+    tcg_gen_qemu_ld_i64(dest, addr, ctx->mmu_idx, mop);
     if (modify) {
         save_gpr(ctx, rb, ofs);
     }
@@ -1643,10 +1641,11 @@ static void do_store_32(DisasContext *ctx, TCGv_i32 src, unsigned rb,
     /* Caller uses nullify_over/nullify_end.  */
     assert(ctx->null_cond.c == TCG_COND_NEVER);
 
+    mop |= ctx->mo_align;
     mop |= mo_endian(ctx);
     form_gva(ctx, &addr, &ofs, rb, rx, scale, disp, sp, modify,
              MMU_DISABLED(ctx));
-    tcg_gen_qemu_st_i32(src, addr, ctx->mmu_idx, mop | UNALIGN(ctx));
+    tcg_gen_qemu_st_i32(src, addr, ctx->mmu_idx, mop);
     if (modify) {
         save_gpr(ctx, rb, ofs);
     }
@@ -1662,10 +1661,11 @@ static void do_store_64(DisasContext *ctx, TCGv_i64 src, unsigned rb,
     /* Caller uses nullify_over/nullify_end.  */
     assert(ctx->null_cond.c == TCG_COND_NEVER);
 
+    mop |= ctx->mo_align;
     mop |= mo_endian(ctx);
     form_gva(ctx, &addr, &ofs, rb, rx, scale, disp, sp, modify,
              MMU_DISABLED(ctx));
-    tcg_gen_qemu_st_i64(src, addr, ctx->mmu_idx, mop | UNALIGN(ctx));
+    tcg_gen_qemu_st_i64(src, addr, ctx->mmu_idx, mop);
     if (modify) {
         save_gpr(ctx, rb, ofs);
     }
@@ -2570,7 +2570,7 @@ static bool trans_ixtlbx(DisasContext *ctx, arg_ixtlbx *a)
     }
 
     /* Exit TB for TLB change if mmu is enabled.  */
-    if (ctx->tb_flags & PSW_C) {
+    if (ctx->tb_flags & PSW_C && !a->addr) {
         ctx->base.is_jmp = DISAS_IAQ_N_STALE;
     }
     return nullify_end(ctx);
@@ -2687,7 +2687,7 @@ static bool trans_ixtlbxf(DisasContext *ctx, arg_ixtlbxf *a)
     }
 
     /* Exit TB for TLB change if mmu is enabled.  */
-    if (ctx->tb_flags & PSW_C) {
+    if (ctx->tb_flags & PSW_C && !a->addr) {
         ctx->base.is_jmp = DISAS_IAQ_N_STALE;
     }
     return nullify_end(ctx);
@@ -4654,12 +4654,13 @@ static void hppa_tr_init_disas_context(DisasContextBase *dcbase, CPUState *cs)
 #ifdef CONFIG_USER_ONLY
     ctx->privilege = PRIV_USER;
     ctx->mmu_idx = MMU_USER_IDX;
-    ctx->unalign = (ctx->tb_flags & TB_FLAG_UNALIGN ? MO_UNALN : MO_ALIGN);
+    ctx->mo_align = (ctx->tb_flags & TB_FLAG_UNALIGN) ? MO_UNALN : MO_ALIGN;
 #else
     ctx->privilege = (ctx->tb_flags >> TB_FLAG_PRIV_SHIFT) & 3;
     ctx->mmu_idx = (ctx->tb_flags & PSW_D
                     ? PRIV_P_TO_MMU_IDX(ctx->privilege, ctx->tb_flags & PSW_P)
                     : ctx->tb_flags & PSW_W ? MMU_ABS_W_IDX : MMU_ABS_IDX);
+    ctx->mo_align = MO_ALIGN;
 #endif
 
     cs_base = ctx->base.tb->cs_base;
@@ -4737,7 +4738,8 @@ static void hppa_tr_translate_insn(DisasContextBase *dcbase, CPUState *cs)
     {
         /* Always fetch the insn, even if nullified, so that we check
            the page permissions for execute.  */
-        uint32_t insn = translator_ldl(env, &ctx->base, ctx->base.pc_next);
+        uint32_t insn = translator_ldl_end(env, &ctx->base, ctx->base.pc_next,
+                                           mo_endian(ctx));
 
         /*
          * Set up the IA queue for the next insn.
@@ -4863,7 +4865,7 @@ static void hppa_tr_tb_stop(DisasContextBase *dcbase, CPUState *cs)
 static bool hppa_tr_disas_log(const DisasContextBase *dcbase,
                               CPUState *cs, FILE *logfile)
 {
-    target_ulong pc = dcbase->pc_first;
+    vaddr pc = dcbase->pc_first;
 
     switch (pc) {
     case 0x00:
@@ -4898,5 +4900,6 @@ void hppa_translate_code(CPUState *cs, TranslationBlock *tb,
                          int *max_insns, vaddr pc, void *host_pc)
 {
     DisasContext ctx = { };
-    translator_loop(cs, tb, max_insns, pc, host_pc, &hppa_tr_ops, &ctx.base);
+    translator_loop(cs, tb, max_insns, pc, host_pc, &hppa_tr_ops, &ctx.base,
+                    TCG_TYPE_VA);
 }
