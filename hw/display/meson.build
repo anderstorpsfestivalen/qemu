@@ -19,7 +19,34 @@ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 
 system_ss.add(when: 'CONFIG_VGA_PCI', if_true: files('vga-pci.c'))
-system_ss.add(when: 'CONFIG_JUKE_RETRO_GPU', if_true: files('juke-retro-gpu.c'))
+if config_all_devices.has_key('CONFIG_JUKE_RETRO_GPU')
+  # DreamGPU owns the host engine outside QEMU. A separate Cargo target directory
+  # prevents recursive locking when QEMU is itself built from a Cargo build script.
+  dreamgpu_root = meson.project_source_root() / '../..'
+  dreamgpu_host = dreamgpu_root / 'crates/dreamgpu-host'
+  dreamgpu_cargo = find_program('cargo', required: true)
+  dreamgpu_archive = custom_target('dreamgpu-host',
+    input: [dreamgpu_host / 'Cargo.toml', dreamgpu_host / 'src/lib.rs',
+            dreamgpu_host / 'src/desktop.rs',
+            dreamgpu_host / 'src/cursor.rs',
+            dreamgpu_host / 'src/gl.rs',
+            dreamgpu_host / 'src/gl_api.rs', dreamgpu_host / 'src/scalar.rs',
+            dreamgpu_host / 'src/arrays.rs', dreamgpu_host / 'src/gl_validation.rs',
+            dreamgpu_host / 'src/texture.rs',
+            dreamgpu_host / 'src/texture/names.rs',
+            dreamgpu_root / 'Cargo.toml', dreamgpu_root / 'Cargo.lock'],
+    output: 'libdreamgpu_host.a',
+    command: [python, files('../../scripts/dreamgpu-host-build.py'),
+              '--cargo', dreamgpu_cargo,
+              '--manifest', dreamgpu_host / 'Cargo.toml',
+              '--target-dir', meson.project_build_root() / 'dreamgpu-rust',
+              '--output', '@OUTPUT@'])
+  dreamgpu_dep = declare_dependency(link_with: dreamgpu_archive,
+    include_directories: include_directories('../../../../crates/dreamgpu-host/include',
+                                           '../../../../crates/dreamgpu-host/bindings'))
+  system_ss.add(when: 'CONFIG_JUKE_RETRO_GPU',
+                if_true: [files('juke-retro-gpu.c'), dreamgpu_dep])
+endif
 if juke_gl_deps.length() > 0
   system_ss.add(when: 'CONFIG_JUKE_RETRO_GPU',
                 if_true: [files('juke-retro-gl.c', 'juke-retro-gl-platform.c'),

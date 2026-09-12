@@ -3,6 +3,7 @@
  * Bounded process/context-aware GL execution and native image transport.
  */
 #include "qemu/osdep.h"
+#include "dreamgpu-host.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "qemu/error-report.h"
@@ -25,17 +26,8 @@
 #include <servers/bootstrap.h>
 #endif
 
-typedef struct JrgContext {
-    uint32_t client, id, drawable;
-    JrgGLContext *native;
-} JrgContext;
-
-typedef struct JrgDrawable {
-    uint32_t client, id, width, height;
-    uint64_t epoch, generation;
-    uint64_t published_epoch, published_generation;
-    JrgGLDrawable *native;
-} JrgDrawable;
+typedef DreamGpuContext JrgContext;
+typedef DreamGpuDrawable JrgDrawable;
 
 typedef enum SlotState { SLOT_FREE, SLOT_RENDERING, SLOT_PENDING,
                          SLOT_PUBLISHED } SlotState;
@@ -104,7 +96,6 @@ struct JrgGLEngine {
     GQueue completions;
     GQueue pending_output;
     uint32_t pending_count, pending_desktop;
-    uint64_t next_epoch;
     uint64_t desktop_epoch, desktop_sequence;
     uint32_t desktop_width, desktop_height;
     bool desktop_active, desktop_coherent;
@@ -118,8 +109,7 @@ struct JrgGLEngine {
     uint64_t reply_epoch, reply_sequence, reply_token;
     uint8_t reply_packet[JGPU_PACKET_BYTES];
     int reply_fd;
-    JrgContext contexts[JRG_GL_MAX_CONTEXTS];
-    JrgDrawable drawables[JRG_GL_MAX_DRAWABLES];
+    DreamGpuResources resources;
     JrgSlot slots[JRG_GL_MAX_DRAWABLES * JRG_GL_EXPORT_SLOTS];
     JrgContext *current_context;
     JrgDrawable *current_drawable;
@@ -132,77 +122,12 @@ static uint32_t word(const uint8_t *p, unsigned offset)
     return ldl_le_p(p + offset);
 }
 
-static bool desktop_rect(uint32_t x, uint32_t y, uint32_t width,
-                          uint32_t height, uint32_t limit_w, uint32_t limit_h)
-{
-    return width && height && x <= limit_w && y <= limit_h &&
-           width <= limit_w - x && height <= limit_h - y;
-}
-
 static uint32_t validate_desktop(const uint8_t *r, uint32_t primary_width,
                                   uint32_t primary_height, uint32_t vram_size,
                                   uint64_t *work)
 {
-    uint32_t op = word(r, JRG_DESKTOP_OP);
-    uint32_t flags = word(r, JRG_DESKTOP_FLAGS);
-    uint32_t x = word(r, JRG_DESKTOP_DST_X);
-    uint32_t y = word(r, JRG_DESKTOP_DST_Y);
-    uint32_t w = word(r, JRG_DESKTOP_WIDTH);
-    uint32_t h = word(r, JRG_DESKTOP_HEIGHT);
-    uint32_t sx = word(r, JRG_DESKTOP_SRC_X);
-    uint32_t sy = word(r, JRG_DESKTOP_SRC_Y);
-    uint32_t offset = word(r, JRG_DESKTOP_SLOT_OR_OFFSET);
-    uint32_t stride = word(r, JRG_DESKTOP_VRAM_STRIDE);
-    uint64_t epoch = ldq_le_p(r + JRG_DESKTOP_IMAGE_EPOCH);
-    uint64_t frame = ldq_le_p(r + JRG_DESKTOP_IMAGE_FRAME);
-    bool image = op == JRG_DESKTOP_BLIT || op == JRG_DESKTOP_DISCARD;
-    bool cpu = op == JRG_DESKTOP_SEED || op == JRG_DESKTOP_PATCH ||
-               op == JRG_DESKTOP_RETURN || op == JRG_DESKTOP_READBACK;
-
-    if (op < JRG_DESKTOP_SEED || op > JRG_DESKTOP_DISCARD ||
-        word(r, JRG_DESKTOP_RESERVED0) || word(r, JRG_DESKTOP_RESERVED1) ||
-        (flags && (op != JRG_DESKTOP_BLIT ||
-                   flags != JRG_DESKTOP_BLIT_FINAL))) {
-        return JRG_GL_ERROR_BATCH;
-    }
-    if (op == JRG_DESKTOP_DISCARD) {
-        if (x || y || w || h || sx || sy) {
-            return JRG_GL_ERROR_BATCH;
-        }
-    } else if (!desktop_rect(x, y, w, h, primary_width, primary_height)) {
-        return JRG_GL_ERROR_DESKTOP;
-    }
-    if (op == JRG_DESKTOP_SEED || op == JRG_DESKTOP_RETURN) {
-        if (x || y || w != primary_width || h != primary_height) {
-            return JRG_GL_ERROR_DESKTOP;
-        }
-    }
-    if (op == JRG_DESKTOP_COPY &&
-        !desktop_rect(sx, sy, w, h, primary_width, primary_height)) {
-        return JRG_GL_ERROR_DESKTOP;
-    }
-    if (image) {
-        if (offset >= JGPU_MAX_EXPORT_SLOTS || !epoch || !frame || stride) {
-            return JRG_GL_ERROR_DESKTOP;
-        }
-    } else if (epoch || frame || (!cpu && (offset || stride))) {
-        return JRG_GL_ERROR_BATCH;
-    }
-    if (op != JRG_DESKTOP_COPY && op != JRG_DESKTOP_BLIT &&
-        (sy || (sx && op != JRG_DESKTOP_FILL))) {
-        return JRG_GL_ERROR_BATCH;
-    }
-    if (cpu) {
-        uint64_t end = (uint64_t)offset + (uint64_t)(h - 1) * stride + w * 4;
-        uint64_t export_bytes = QEMU_ALIGN_UP(
-            (uint64_t)QEMU_ALIGN_UP(w * 4, 256) * h, 65536);
-        if ((offset & 3) || (stride & 3) || stride < w * 4 ||
-            end > vram_size || export_bytes > JGPU_MAX_CPU_BYTES) {
-            return JRG_GL_ERROR_DESKTOP;
-        }
-    }
-    *work += (uint64_t)w * h * 4;
-    return *work > JRG_DESKTOP_MAX_BYTES ? JRG_GL_ERROR_LIMIT : 0;
+    return dreamgpu_desktop_validate(r, primary_width, primary_height,
+                                    vram_size, work);
 }
 
 /* Failure-only diagnostics carry bounded numeric command headers, never payloads. */
@@ -733,7 +658,7 @@ static void *completion_worker(void *opaque)
         }
         if (sent) {
             unsigned index = (s - e->slots) / JRG_GL_EXPORT_SLOTS;
-            JrgDrawable *d = &e->drawables[index];
+            JrgDrawable *d = &e->resources.drawables[index];
             d->published_epoch = ldq_le_p(s->packet + JGPU_OFF_EPOCH);
             d->published_generation = s->generation;
         }
@@ -742,28 +667,6 @@ static void *completion_worker(void *opaque)
         qemu_cond_broadcast(&e->cond);
     }
     qemu_mutex_unlock(&e->lock);
-    return NULL;
-}
-
-static JrgContext *find_context(JrgGLEngine *e, uint32_t client, uint32_t id)
-{
-    for (unsigned i = 0; i < G_N_ELEMENTS(e->contexts); i++) {
-        if (e->contexts[i].native && e->contexts[i].client == client &&
-            e->contexts[i].id == id) {
-            return &e->contexts[i];
-        }
-    }
-    return NULL;
-}
-
-static JrgDrawable *find_drawable(JrgGLEngine *e, uint32_t client, uint32_t id)
-{
-    for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-        if (e->drawables[i].native && e->drawables[i].client == client &&
-            e->drawables[i].id == id) {
-            return &e->drawables[i];
-        }
-    }
     return NULL;
 }
 
@@ -848,7 +751,7 @@ static void drop_drawable_resource(JrgGLEngine *e, JrgDrawable *d)
 
 static void delete_drawable(JrgGLEngine *e, JrgDrawable *d)
 {
-    unsigned index = d - e->drawables;
+    unsigned index = d - e->resources.drawables;
 
     drain_output(e);
     if (!e->reset) {
@@ -871,33 +774,14 @@ static void delete_drawable(JrgGLEngine *e, JrgDrawable *d)
         qemu_mutex_unlock(&e->lock);
     }
     jrg_gl_drawable_free(e->platform, d->native);
-    memset(d, 0, sizeof(*d));
 }
 
-static void close_client(JrgGLEngine *e, uint32_t client)
-{
-    drain_output(e);
-    e->current_context = NULL;
-    e->current_drawable = NULL;
-    for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-        if (e->drawables[i].native && (!client ||
-                                     e->drawables[i].client == client)) {
-            delete_drawable(e, &e->drawables[i]);
-        }
-    }
-    for (unsigned i = 0; i < G_N_ELEMENTS(e->contexts); i++) {
-        if (e->contexts[i].native && (!client ||
-                                    e->contexts[i].client == client)) {
-            jrg_gl_context_free(e->contexts[i].native);
-            memset(&e->contexts[i], 0, sizeof(e->contexts[i]));
-        }
-    }
-}
+static void close_client(JrgGLEngine *e, uint32_t client);
 
 static uint32_t present(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
                          uint32_t flags, Error **errp)
 {
-    unsigned first = (d - e->drawables) * JRG_GL_EXPORT_SLOTS;
+    unsigned first = (d - e->resources.drawables) * JRG_GL_EXPORT_SLOTS;
     JrgSlot *s = NULL;
     uint32_t stride, offset;
     uint64_t modifier;
@@ -1270,7 +1154,7 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
             s->generation == frame &&
             (word(s->packet, JGPU_OFF_FLAGS) & JGPU_FLAG_RETAIN_FOR_DESKTOP);
         if (op == JRG_DESKTOP_BLIT) {
-            valid &= desktop_rect(word(r, JRG_DESKTOP_SRC_X),
+            valid &= dreamgpu_desktop_rect(word(r, JRG_DESKTOP_SRC_X),
                                     word(r, JRG_DESKTOP_SRC_Y), w, h,
                                     word(s->packet, JGPU_OFF_WIDTH),
                                     word(s->packet, JGPU_OFF_HEIGHT));
@@ -1362,169 +1246,158 @@ void jrg_gl_engine_transfer_done(JrgGLEngine *e, uint32_t error,
 
 
 
-static uint32_t execute_record(JrgGLEngine *e, const uint8_t *r,
-                                JrgBatch *batch, Error **errp)
-{
-    uint32_t op = word(r, JRG_GL_OFF_OP);
-    uint32_t client = word(r, JRG_GL_OFF_CLIENT);
-    uint32_t context = word(r, JRG_GL_OFF_CONTEXT);
-    uint32_t drawable = word(r, JRG_GL_OFF_DRAWABLE);
-    JrgContext *c = find_context(e, client, context);
-    JrgDrawable *d = find_drawable(e, client, drawable);
+/* Native API callbacks deliberately contain no command routing or resource
+ * admission policy; the Rust dispatcher owns those decisions and registry. */
+typedef struct JrgDispatch {
+    JrgGLEngine *engine;
+    JrgBatch *batch;
+    Error **errp;
+} JrgDispatch;
 
-    switch (op) {
-    case JRG_GL_DESKTOP:
-        return execute_desktop(e, r, batch, errp);
-    case JRG_GL_CREATE_CONTEXT: {
-        JrgContext *share = find_context(e, client, word(r, 32));
-        if (!context || c || (word(r, 32) && !share)) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->contexts); i++) {
-            if (!e->contexts[i].native) {
-                c = &e->contexts[i];
-                c->native = jrg_gl_context_new(e->platform,
-                                               share ? share->native : NULL,
-                                               errp);
-                if (!c->native) {
-                    return JRG_GL_ERROR_HOST;
-                }
-                c->id = context;
-                c->client = client;
-                return 0;
-            }
-        }
+static void *host_context_new(void *opaque, void *share)
+{
+    JrgDispatch *d = opaque;
+    return jrg_gl_context_new(d->engine->platform, share, d->errp);
+}
+
+static void *host_drawable_new(void *opaque, uint32_t width, uint32_t height)
+{
+    JrgDispatch *d = opaque;
+    JrgGLEngine *e = d->engine;
+    drain_output(e);
+    if (e->current_context && e->current_drawable &&
+        !jrg_gl_context_in_begin(e->current_context->native)) {
+        jrg_gl_flush_drawable(e->current_drawable->native);
+    }
+    void *native = jrg_gl_drawable_new(e->platform, width, height, d->errp);
+    e->current_context = NULL;
+    e->current_drawable = NULL;
+    return native;
+}
+
+static void host_context_free(void *opaque, uint32_t index)
+{
+    JrgDispatch *d = opaque;
+    JrgGLEngine *e = d->engine;
+    JrgContext *c = &e->resources.contexts[index];
+    drain_output(e);
+    if (e->current_context == c && e->current_drawable &&
+        !jrg_gl_context_in_begin(c->native)) {
+        jrg_gl_flush_drawable(e->current_drawable->native);
+    }
+    jrg_gl_context_free(c->native);
+    e->current_context = NULL;
+}
+
+static void host_drawable_free(void *opaque, uint32_t index)
+{
+    JrgDispatch *d = opaque;
+    delete_drawable(d->engine, &d->engine->resources.drawables[index]);
+}
+
+static void host_close_begin(void *opaque)
+{
+    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
+    drain_output(e);
+    e->current_context = NULL;
+    e->current_drawable = NULL;
+}
+
+static uint32_t host_in_begin(void *opaque, uint32_t index)
+{
+    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
+    return jrg_gl_context_in_begin(e->resources.contexts[index].native);
+}
+
+static uint32_t host_make_current(void *opaque, uint32_t ci, uint32_t di)
+{
+    JrgDispatch *d = opaque;
+    return make_current(d->engine, &d->engine->resources.contexts[ci],
+                        &d->engine->resources.drawables[di], d->errp) ?
+           0 : JRG_GL_ERROR_HOST;
+}
+
+static uint32_t host_call(void *opaque, uint32_t ci, uint32_t fn,
+                           const uint8_t *args)
+{
+    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
+    return jrg_gl_call(e->resources.contexts[ci].native, fn, args);
+}
+
+static uint32_t host_data(void *opaque, uint32_t ci, uint32_t fn,
+                           const uint8_t *args, const uint8_t *data,
+                           uint32_t bytes)
+{
+    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
+    return jrg_gl_data_call(e->resources.contexts[ci].native, fn, args,
+                            data, bytes);
+}
+
+static uint32_t host_words(void *opaque, uint32_t fn)
+{
+    return jrg_gl_function_words(fn);
+}
+
+static uint32_t host_query(void *opaque, uint32_t ci, uint32_t fn,
+                            const uint8_t *args)
+{
+    JrgDispatch *d = opaque;
+    JrgBatch *batch = d->batch;
+    uint32_t required = jrg_gl_query_result_bytes(fn, args);
+    if (required > JRG_GL_MAX_READBACK_BYTES) {
         return JRG_GL_ERROR_LIMIT;
     }
-    case JRG_GL_CREATE_DRAWABLE:
-        if (!drawable || d) {
-            return JRG_GL_ERROR_DRAWABLE;
-        }
-        /* Front + back + depth/stencil + three immutable export slots. */
-        uint64_t allocation = (uint64_t)word(r, 32) * word(r, 36) * 24;
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-            allocation += (uint64_t)e->drawables[i].width *
-                          e->drawables[i].height * 24;
-        }
-        if (allocation > JRG_GL_MAX_IMAGE_BYTES) {
+    if (required > sizeof(batch->result)) {
+        batch->bulk_result = g_try_malloc(required);
+        if (!batch->bulk_result) {
             return JRG_GL_ERROR_LIMIT;
         }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-            if (!e->drawables[i].native) {
-                drain_output(e);
-                if (e->current_context && e->current_drawable &&
-                    !jrg_gl_context_in_begin(e->current_context->native)) {
-                    jrg_gl_flush_drawable(e->current_drawable->native);
-                }
-                d = &e->drawables[i];
-                d->native = jrg_gl_drawable_new(e->platform, word(r, 32),
-                                                word(r, 36), errp);
-                e->current_context = NULL;
-                e->current_drawable = NULL;
-                if (!d->native) {
-                    return JRG_GL_ERROR_HOST;
-                }
-                d->client = client;
-                d->id = drawable;
-                d->width = word(r, 32);
-                d->height = word(r, 36);
-                ++e->next_epoch;
-                for (unsigned j = 0; j < G_N_ELEMENTS(e->drawables); j++) {
-                    e->drawables[j].epoch = e->next_epoch;
-                }
-                return 0;
-            }
-        }
-        return JRG_GL_ERROR_LIMIT;
-    case JRG_GL_CLOSE_CLIENT:
-        close_client(e, client);
-        return 0;
-    case JRG_GL_DESTROY_CONTEXT:
-        if (!c) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        drain_output(e);
-        if (e->current_context == c && e->current_drawable &&
-            !jrg_gl_context_in_begin(c->native)) {
-            jrg_gl_flush_drawable(e->current_drawable->native);
-        }
-        jrg_gl_context_free(c->native);
-        memset(c, 0, sizeof(*c));
-        e->current_context = NULL;
-        return 0;
-    case JRG_GL_DESTROY_DRAWABLE:
-        if (!d) {
-            return JRG_GL_ERROR_DRAWABLE;
-        }
-        delete_drawable(e, d);
-        return 0;
-    case JRG_GL_MAKE_CURRENT:
-        if (!c || !d) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        if (!make_current(e, c, d, errp)) {
-            return JRG_GL_ERROR_HOST;
-        }
-        c->drawable = drawable;
-        return 0;
-    case JRG_GL_CALL:
-    case JRG_GL_DATA_CALL:
-    case JRG_GL_QUERY:
-    case JRG_GL_PRESENT:
-        if (!c) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        d = find_drawable(e, client, c->drawable);
-        if (!d || (drawable && d->id != drawable)) {
-            return JRG_GL_ERROR_DRAWABLE;
-        }
-        if (op == JRG_GL_PRESENT &&
-            (word(r, JRG_GL_OFF_FLAGS) & JRG_GL_PRESENT_BOUNDED) &&
-            (word(r, 32) != d->width || word(r, 36) != d->height)) {
-            /*
-             * The window may have resized since the frontend submitted its
-             * drawing. Reject its locked WNDOBJ size before any exchange or
-             * export can feed stale image dimensions to the compositor.
-             */
-            return JRG_GL_ERROR_DRAWABLE;
-        }
-        if (op != JRG_GL_CALL && jrg_gl_context_in_begin(c->native)) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        if (!make_current(e, c, d, errp)) {
-            return JRG_GL_ERROR_HOST;
-        }
-        if (op == JRG_GL_CALL) {
-            return jrg_gl_call(c->native, word(r, 32), r + 36);
-        }
-        if (op == JRG_GL_DATA_CALL) {
-            uint32_t fn = word(r, JRG_GL_DATA_FUNCTION);
-            uint32_t count = jrg_gl_function_words(fn) &
-                             ~JRG_GL_FUNCTION_INLINE_DATA;
-            return jrg_gl_data_call(c->native, fn, r + JRG_GL_DATA_ARGS,
-                                    r + JRG_GL_DATA_ARGS + count * 4,
-                                    word(r, JRG_GL_DATA_BYTES));
-        }
-        if (op == JRG_GL_QUERY) {
-            uint32_t required = jrg_gl_query_result_bytes(word(r, 32), r + 36);
-            if (required > JRG_GL_MAX_READBACK_BYTES) return JRG_GL_ERROR_LIMIT;
-            if (required > sizeof(batch->result)) {
-                batch->bulk_result = g_try_malloc(required);
-                if (!batch->bulk_result) return JRG_GL_ERROR_LIMIT;
-            }
-            return jrg_gl_query(c->native, word(r, 32), r + 36,
-                                batch->bulk_result ? batch->bulk_result : batch->result,
-                                &batch->result_bytes, &batch->result_type);
-        }
-        if ((word(r, JRG_GL_OFF_FLAGS) & JRG_GL_PRESENT_EXCLUSIVE) &&
-            (d->width != batch->primary_width ||
-             d->height != batch->primary_height)) {
-            return JRG_GL_ERROR_DRAWABLE;
-        }
-        return present(e, c, d, word(r, JRG_GL_OFF_FLAGS), errp);
-    default:
-        return JRG_GL_ERROR_UNSUPPORTED;
     }
+    return jrg_gl_query(d->engine->resources.contexts[ci].native, fn, args,
+                        batch->bulk_result ? batch->bulk_result : batch->result,
+                        &batch->result_bytes, &batch->result_type);
+}
+
+static uint32_t host_present(void *opaque, uint32_t ci, uint32_t di,
+                              uint32_t flags)
+{
+    JrgDispatch *d = opaque;
+    return present(d->engine, &d->engine->resources.contexts[ci],
+                   &d->engine->resources.drawables[di], flags, d->errp);
+}
+
+static uint32_t host_desktop(void *opaque, const uint8_t *record)
+{
+    JrgDispatch *d = opaque;
+    return execute_desktop(d->engine, record, d->batch, d->errp);
+}
+
+static DreamGpuPlatform host_platform(JrgDispatch *dispatch)
+{
+    return (DreamGpuPlatform) {
+        .opaque = dispatch, .context_new = host_context_new,
+        .drawable_new = host_drawable_new, .context_free = host_context_free,
+        .drawable_free = host_drawable_free, .close_begin = host_close_begin,
+        .in_begin = host_in_begin, .make_current = host_make_current,
+        .call = host_call, .data = host_data, .words = host_words,
+        .query = host_query, .present = host_present, .desktop = host_desktop,
+    };
+}
+
+static void close_client(JrgGLEngine *e, uint32_t client)
+{
+    JrgDispatch dispatch = { .engine = e };
+    DreamGpuPlatform platform = host_platform(&dispatch);
+    dreamgpu_gl_close_client(&e->resources, &platform, client);
+}
+
+static uint32_t execute_record(JrgGLEngine *e, const uint8_t *record,
+                                JrgBatch *batch,
+                                const DreamGpuPlatform *platform)
+{
+    return dreamgpu_gl_execute(&e->resources, platform, record,
+                               word(record, JRG_GL_OFF_SIZE),
+                               batch->primary_width, batch->primary_height);
 }
 
 static void *render_worker(void *opaque)
@@ -1565,9 +1438,9 @@ static void *render_worker(void *opaque)
         if (e->reset) {
             qemu_mutex_unlock(&e->lock);
             drain_output(e);
-            for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-                if (e->drawables[i].native) {
-                    drop_drawable_resource(e, &e->drawables[i]);
+            for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.drawables); i++) {
+                if (e->resources.drawables[i].native) {
+                    drop_drawable_resource(e, &e->resources.drawables[i]);
                 }
             }
             uint8_t reset_packet[JGPU_PACKET_BYTES];
@@ -1604,6 +1477,8 @@ static void *render_worker(void *opaque)
         qemu_mutex_unlock(&e->lock);
         uint64_t trace_start_us = batch->trace_queued_us ?
                                  g_get_monotonic_time() : 0;
+        JrgDispatch dispatch = { e, batch, &err };
+        DreamGpuPlatform platform = host_platform(&dispatch);
         for (size_t offset = 0; !result && offset < batch->bytes;) {
             qemu_mutex_lock(&e->lock);
             bool cancelled = e->reset || e->stopping;
@@ -1613,7 +1488,7 @@ static void *render_worker(void *opaque)
                 break;
             }
             err = NULL;
-            result = execute_record(e, batch->data + offset, batch, &err);
+            result = execute_record(e, batch->data + offset, batch, &platform);
             if (result) {
                 trace_rejection(batch->data + offset,
                     word(batch->data + offset, JRG_GL_OFF_SIZE),
@@ -1648,11 +1523,11 @@ static void *render_worker(void *opaque)
                 memcpy(done->result, batch->result, batch->result_bytes);
             }
         }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->contexts); i++) {
-            done->resources_live |= e->contexts[i].native != NULL;
+        for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.contexts); i++) {
+            done->resources_live |= e->resources.contexts[i].native != NULL;
         }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
-            done->resources_live |= e->drawables[i].native != NULL;
+        for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.drawables); i++) {
+            done->resources_live |= e->resources.drawables[i].native != NULL;
         }
         g_free(batch->bulk_result);
         g_free(batch->data);

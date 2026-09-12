@@ -24,6 +24,7 @@
 #include "ui/juke-shmem.h"
 #include "trace.h"
 #include "juke-retro-diagnostics.h"
+#include "dreamgpu-host.h"
 
 #define TYPE_JUKE_RETRO_GPU "qemu-retro-gpu"
 OBJECT_DECLARE_SIMPLE_TYPE(JukeRetroGPU, JUKE_RETRO_GPU)
@@ -98,26 +99,6 @@ static void jrg_complete(JukeRetroGPU *s, uint32_t error)
     jrg_update_irq(s);
 }
 
-static bool jrg_cursor_pixels_valid(const uint8_t *data, uint32_t count,
-                                    uint32_t format)
-{
-    for (uint32_t i = 0; i < count; i++) {
-        uint32_t a = ldl_le_p(data + i * 8);
-        uint32_t b = ldl_le_p(data + i * 8 + 4);
-
-        if (format == JRG_CURSOR_AND_XOR) {
-            if ((a | b) & 0xff000000) {
-                return false;
-            }
-        } else if (b || (a & 255) > (a >> 24) ||
-                   ((a >> 8) & 255) > (a >> 24) ||
-                   ((a >> 16) & 255) > (a >> 24)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool jrg_cursor_source_ram(JukeRetroGPU *s, uint64_t address,
                                   uint32_t bytes)
 {
@@ -159,7 +140,7 @@ static void jrg_cursor_submit(JukeRetroGPU *s, uint32_t operation)
             if (pci_dma_read(&s->parent_obj, address, data,
                               s->cursor_bytes) != MEMTX_OK) {
                 error = JRG_CURSOR_ERROR_DMA;
-            } else if (!jrg_cursor_pixels_valid(data,
+            } else if (!dreamgpu_cursor_validate(data,
                         s->cursor_width * s->cursor_height, s->cursor_format)) {
                 error = JRG_CURSOR_ERROR_SHAPE;
             }
@@ -621,127 +602,67 @@ static void jrg_gl_write(JukeRetroGPU *s, hwaddr addr, uint32_t value)
 }
 #endif
 
-static bool jrg_rect_valid(JukeRetroGPU *s, uint32_t offset,
-                           uint32_t stride, uint32_t width, uint32_t height,
-                           uint32_t bpp)
-{
-    uint64_t row_bytes = (uint64_t)width * bpp;
-    uint64_t end = (uint64_t)offset + (uint64_t)(height - 1) * stride +
-                   row_bytes;
-
-    return width && height && !(offset % bpp) && !(stride % bpp) &&
-           row_bytes <= stride && end <= s->vga.vram_size;
-}
-
-/* Validate the entire immutable batch before any framebuffer changes. */
+/* The host Rust engine validates the complete immutable DMA snapshot. */
 static uint32_t jrg_validate(JukeRetroGPU *s)
 {
-    uint64_t work = 0;
-    unsigned i;
+    return dreamgpu_2d_validate(s->commands, s->active_count,
+                               s->vga.vram_size, &s->validated_bytes);
+}
 
-    if (!s->active_count || s->active_count > JRG_MAX_COMMANDS) {
-        return JRG_ERROR_BATCH_COUNT;
-    }
-    for (i = 0; i < s->active_count; i++) {
-        const uint8_t *c = s->commands + i * JRG_COMMAND_BYTES;
-        uint32_t op = cmd_word(c, JRG_CMD_OPCODE);
-        uint32_t bpp = cmd_word(c, JRG_CMD_BPP);
-        uint32_t src = cmd_word(c, JRG_CMD_SRC_OFFSET);
-        uint32_t dst = cmd_word(c, JRG_CMD_DST_OFFSET);
-        uint32_t ss = cmd_word(c, JRG_CMD_SRC_STRIDE);
-        uint32_t ds = cmd_word(c, JRG_CMD_DST_STRIDE);
-        uint32_t width = cmd_word(c, JRG_CMD_WIDTH);
-        uint32_t height = cmd_word(c, JRG_CMD_HEIGHT);
+static void jrg_transfer(void *opaque, uint32_t op, uint32_t bpp,
+                          uint64_t src, uint64_t dst, uint32_t bytes,
+                          uint32_t color)
+{
+    JukeRetroGPU *s = opaque;
+    uint8_t *out = s->vga.vram_ptr + dst;
 
-        if ((op != JRG_CMD_FILL && op != JRG_CMD_COPY &&
-             op != JRG_CMD_DAMAGE) || (bpp != 1 && bpp != 2 && bpp != 4) ||
-            cmd_word(c, JRG_CMD_RESERVED) ||
-            (op != JRG_CMD_COPY && (src || ss)) ||
-            (op != JRG_CMD_FILL && cmd_word(c, JRG_CMD_COLOR))) {
-            return JRG_ERROR_COMMAND;
-        }
-        if (!jrg_rect_valid(s, dst, ds, width, height, bpp) ||
-            (op == JRG_CMD_COPY &&
-             (ss != ds || !jrg_rect_valid(s, src, ss, width, height, bpp)))) {
-            return JRG_ERROR_BOUNDS;
-        }
-        work += (uint64_t)width * height * bpp;
-        if (work > JRG_MAX_WORK_BYTES) {
-            return JRG_ERROR_WORK_LIMIT;
+    /* Guest CPU threads can access VRAM outside BQL. Keep RAM access in QEMU:
+     * Rust receives integer bounds only and never creates guest RAM references. */
+    if (op == JRG_CMD_COPY) {
+        memmove(out, s->vga.vram_ptr + src, bytes);
+    } else if (op == JRG_CMD_FILL) {
+        if (bpp == 1) {
+            memset(out, color, bytes);
+        } else {
+            for (uint32_t x = 0; x < bytes; x += bpp) {
+                if (bpp == 2) {
+                    stw_le_p(out + x, color);
+                } else {
+                    stl_le_p(out + x, color);
+                }
+            }
         }
     }
-    s->validated_bytes = work;
-    return JRG_ERROR_NONE;
+    memory_region_set_dirty(&s->vga.vram, dst, bytes);
 }
 
 static void jrg_run(JukeRetroGPU *s, uint32_t budget)
 {
-    uint64_t work = 0;
-    uint32_t rows = 0;
+    DreamGpuProgress progress = {
+        s->command_index, s->row, s->column,
+    };
+    DreamGpuWork work;
+    uint32_t error;
     bool tracing = trace_event_get_state_backends(TRACE_JUKE_RETRO_GPU_WORK);
     uint64_t start_us = tracing ? g_get_monotonic_time() : 0;
 
     if (s->trace_start_us) {
         s->trace_chunks++;
     }
-    while ((s->status & JRG_STATUS_BUSY) &&
-           s->command_index < s->active_count) {
-        const uint8_t *c = s->commands +
-                           s->command_index * JRG_COMMAND_BYTES;
-        uint32_t op = cmd_word(c, JRG_CMD_OPCODE);
-        uint32_t bpp = cmd_word(c, JRG_CMD_BPP);
-        uint32_t src = cmd_word(c, JRG_CMD_SRC_OFFSET);
-        uint32_t dst = cmd_word(c, JRG_CMD_DST_OFFSET);
-        uint32_t stride = cmd_word(c, JRG_CMD_DST_STRIDE);
-        uint32_t width = cmd_word(c, JRG_CMD_WIDTH);
-        uint32_t height = cmd_word(c, JRG_CMD_HEIGHT);
-        uint32_t bytes = width * bpp;
-        bool reverse = op == JRG_CMD_COPY && dst > src;
-        uint32_t y = reverse ? height - 1 - s->row : s->row;
-        uint32_t n = MIN(bytes - s->column, budget - work) &
-                     ~(bpp - 1);
-        uint32_t xoffset = reverse ? bytes - s->column - n : s->column;
-        uint32_t offset = dst + y * stride + xoffset;
-        uint8_t *out = s->vga.vram_ptr + offset;
-
-        if (!n) {
-            break;
-        }
-        if (op == JRG_CMD_COPY) {
-            memmove(out, s->vga.vram_ptr + src + y * stride + xoffset, n);
-        } else if (op == JRG_CMD_FILL) {
-            uint32_t color = cmd_word(c, JRG_CMD_COLOR);
-            uint32_t x;
-
-            if (bpp == 1) {
-                memset(out, color, n);
-            } else {
-                for (x = 0; x < n; x += bpp) {
-                    if (bpp == 2) {
-                        stw_le_p(out + x, color);
-                    } else {
-                        stl_le_p(out + x, color);
-                    }
-                }
-            }
-        }
-        memory_region_set_dirty(&s->vga.vram, offset, n);
-        work += n;
-        s->column += n;
-        if (s->column == bytes) {
-            s->column = 0;
-            if (++s->row == height) {
-                s->row = 0;
-                s->command_index++;
-            }
-        }
-        ++rows;
-        if (work >= budget || rows == JRG_ROW_QUANTUM) {
-            break;
-        }
+    /* The BQL remains held; Rust never stores VRAM pointers or invokes QEMU
+     * asynchronously. Preserve the existing migratable progress fields. */
+    error = dreamgpu_2d_execute(s->commands, s->active_count,
+                               s->vga.vram_size,
+                               &progress, budget, jrg_transfer, s, &work);
+    if (error) {
+        jrg_complete(s, error);
+        return;
     }
+    s->command_index = progress.command;
+    s->row = progress.row;
+    s->column = progress.column;
     if (tracing) {
-        trace_juke_retro_gpu_work(s->active_sequence, work, rows,
+        trace_juke_retro_gpu_work(s->active_sequence, work.bytes, work.chunks,
                                  g_get_monotonic_time() - start_us,
                                  budget == JRG_INLINE_QUANTUM);
     }
@@ -964,7 +885,7 @@ static int jrg_post_load(void *opaque, int version_id)
           s->cursor.hot_y >= s->cursor.height ||
           (s->cursor.format != JRG_CURSOR_ARGB_PREMULTIPLIED &&
            s->cursor.format != JRG_CURSOR_AND_XOR) ||
-          !jrg_cursor_pixels_valid(s->cursor.pixels,
+          !dreamgpu_cursor_validate(s->cursor.pixels,
                     s->cursor.width * s->cursor.height, s->cursor.format)))) {
         return -EINVAL;
     }

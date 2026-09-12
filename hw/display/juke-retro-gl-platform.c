@@ -49,27 +49,15 @@
 #define jrgFramebufferRenderbuffer glFramebufferRenderbuffer
 #endif
 
-typedef struct JrgTexture {
-    GLuint name;
-    GLenum target;
-    uint64_t version;
-    uint32_t guest_name;
-    uint32_t refs;
-    bool deleted;
-    uint32_t undefined_levels;
-    GLsync last_write;
-    uint64_t writer_serial, waiter_serial;
-    uint32_t widths[JRG_GL_MAX_TEXTURE_LEVEL + 1];
-    uint32_t heights[JRG_GL_MAX_TEXTURE_LEVEL + 1];
-    uint64_t levels[JRG_GL_MAX_TEXTURE_LEVEL + 1];
-} JrgTexture;
+#include "dreamgpu-host.h"
+#include "gl-api.h"
 
-typedef struct JrgTextureNamespace {
-    uint32_t refs;
-    GHashTable *names;
-} JrgTextureNamespace;
+typedef DreamGpuTexture JrgTexture;
+
+typedef DreamGpuTextureNamespace JrgTextureNamespace;
 
 struct JrgGLPlatform {
+    DreamGpuGlApi gl_api;
     uint64_t next_context_serial;
     uint64_t texture_bytes;
     uint32_t texture_count;
@@ -109,7 +97,8 @@ struct JrgGLContext {
 #endif
     gatomicrefcount refs;
     GLuint framebuffer;
-    bool initialized, in_begin;
+    bool initialized;
+    uint32_t in_begin;
     JrgGLDrawable *drawable;
     JrgTextureNamespace *textures;
     JrgTexture *default_texture, *bound_texture;
@@ -142,178 +131,37 @@ struct JrgGLImage {
 
 static void texture_unref(JrgGLPlatform *p, JrgTexture *texture);
 static void texture_namespace_unref(JrgGLPlatform *p, JrgTextureNamespace *ns);
+/* Pure command vocabulary and validation are owned by the Rust core. */
+static unsigned texture_params(uint32_t target, uint32_t pname)
+{ return dreamgpu_gl_texture_params(target, pname); }
+static unsigned texture_env_params(uint32_t target, uint32_t pname)
+{ return dreamgpu_gl_texture_env_params(target, pname); }
+static unsigned vector_bytes(uint32_t fn, const uint32_t *args)
+{ return dreamgpu_gl_vector_bytes(fn, args); }
+static bool vector_function(uint32_t fn)
+{ return dreamgpu_gl_vector_function(fn); }
+static unsigned index_bytes(uint32_t type)
+{ return dreamgpu_gl_index_bytes(type); }
+static bool buffer_selection(uint32_t mode, bool draw)
+{ return dreamgpu_gl_buffer_selection(mode, draw); }
+static const char *query_string(uint32_t name)
+{ return dreamgpu_gl_query_string(name); }
+static unsigned query_shape(uint32_t fn, const uint8_t *args, uint32_t *type)
+{ return dreamgpu_gl_query_shape(fn, args, type); }
+uint32_t jrg_gl_call_validate(uint32_t fn, const uint8_t *args)
+{ return dreamgpu_gl_call_validate(fn, args); }
+uint32_t jrg_gl_data_validate(uint32_t fn, const uint8_t *args,
+                              const uint8_t *data, uint32_t bytes)
+{ return dreamgpu_gl_data_validate(fn, args, data, bytes); }
+uint32_t jrg_gl_query_validate(uint32_t fn, const uint8_t *args)
+{ return dreamgpu_gl_query_validate(fn, args); }
+uint32_t jrg_gl_query_result_bytes(uint32_t fn, const uint8_t *args)
+{ return dreamgpu_gl_query_result_bytes(fn, args); }
+uint32_t jrg_gl_function_words(uint32_t fn)
+{ return dreamgpu_gl_function_words(fn); }
+
 static GLfloat gl_arg_float(const uint8_t *p);
 static GLdouble gl_arg_double(const uint8_t *p);
-
-static unsigned light_params(uint32_t light, uint32_t pname)
-{
-    if (light < GL_LIGHT0 || light > GL_LIGHT7) {
-        return 0;
-    }
-    switch (pname) {
-    case GL_AMBIENT:
-    case GL_DIFFUSE:
-    case GL_SPECULAR:
-    case GL_POSITION:
-        return 4;
-    case GL_SPOT_DIRECTION:
-        return 3;
-    case GL_SPOT_EXPONENT:
-    case GL_SPOT_CUTOFF:
-    case GL_CONSTANT_ATTENUATION:
-    case GL_LINEAR_ATTENUATION:
-    case GL_QUADRATIC_ATTENUATION:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned material_params(uint32_t face, uint32_t pname)
-{
-    if (face != GL_FRONT && face != GL_BACK && face != GL_FRONT_AND_BACK) {
-        return 0;
-    }
-    switch (pname) {
-    case GL_AMBIENT:
-    case GL_DIFFUSE:
-    case GL_SPECULAR:
-    case GL_EMISSION:
-    case GL_AMBIENT_AND_DIFFUSE:
-        return 4;
-    case GL_COLOR_INDEXES:
-        return 3;
-    case GL_SHININESS:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned fog_params(uint32_t pname)
-{
-    switch (pname) {
-    case GL_FOG_COLOR:
-        return 4;
-    case GL_FOG_MODE:
-    case GL_FOG_DENSITY:
-    case GL_FOG_START:
-    case GL_FOG_END:
-    case GL_FOG_INDEX:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned light_model_params(uint32_t pname)
-{
-    switch (pname) {
-    case GL_LIGHT_MODEL_AMBIENT:
-        return 4;
-    case GL_LIGHT_MODEL_LOCAL_VIEWER:
-    case GL_LIGHT_MODEL_TWO_SIDE:
-    case GL_LIGHT_MODEL_COLOR_CONTROL:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned texgen_params(uint32_t coord, uint32_t pname)
-{
-    if (coord != GL_S && coord != GL_T && coord != GL_R && coord != GL_Q) {
-        return 0;
-    }
-    switch (pname) {
-    case GL_TEXTURE_GEN_MODE:
-        return 1;
-    case GL_OBJECT_PLANE:
-    case GL_EYE_PLANE:
-        return 4;
-    default:
-        return 0;
-    }
-}
-
-static unsigned texture_params(uint32_t target, uint32_t pname)
-{
-    if (target != GL_TEXTURE_1D && target != GL_TEXTURE_2D) {
-        return 0;
-    }
-    switch (pname) {
-    case GL_TEXTURE_BORDER_COLOR:
-        return 4;
-    case GL_TEXTURE_MIN_FILTER:
-    case GL_TEXTURE_MAG_FILTER:
-    case GL_TEXTURE_WRAP_S:
-    case GL_TEXTURE_WRAP_T:
-    case GL_TEXTURE_BASE_LEVEL:
-    case GL_TEXTURE_MAX_LEVEL:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned texture_env_params(uint32_t target, uint32_t pname)
-{
-    if (target != GL_TEXTURE_ENV) {
-        return 0;
-    }
-    switch (pname) {
-    case GL_TEXTURE_ENV_COLOR:
-        return 4;
-    case GL_TEXTURE_ENV_MODE:
-    case GL_COMBINE_RGB: case GL_COMBINE_ALPHA:
-    case GL_RGB_SCALE: case GL_ALPHA_SCALE:
-    case GL_SOURCE0_RGB: case GL_SOURCE1_RGB: case GL_SOURCE2_RGB:
-    case GL_SOURCE0_ALPHA: case GL_SOURCE1_ALPHA: case GL_SOURCE2_ALPHA:
-    case GL_OPERAND0_RGB: case GL_OPERAND1_RGB: case GL_OPERAND2_RGB:
-    case GL_OPERAND0_ALPHA: case GL_OPERAND1_ALPHA: case GL_OPERAND2_ALPHA:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static unsigned vector_bytes(uint32_t fn, const uint32_t *a)
-{
-    switch (fn) {
-    case FEnum_glTexParameterfv:
-    case FEnum_glTexParameteriv:
-        return texture_params(a[0], a[1]) * 4;
-    case FEnum_glTexEnvfv:
-    case FEnum_glTexEnviv:
-        return texture_env_params(a[0], a[1]) * 4;
-    case FEnum_glLightfv:
-        return light_params(a[0], a[1]) * 4;
-    case FEnum_glMaterialfv:
-        return material_params(a[0], a[1]) * 4;
-    case FEnum_glFogfv:
-        return fog_params(a[0]) * 4;
-    case FEnum_glLightModelfv:
-        return light_model_params(a[0]) * 4;
-    case FEnum_glTexGenfv:
-        return texgen_params(a[0], a[1]) * 4;
-    case FEnum_glTexGendv:
-        return texgen_params(a[0], a[1]) * 8;
-    case FEnum_glClipPlane:
-        return a[0] >= GL_CLIP_PLANE0 && a[0] <= GL_CLIP_PLANE5 ? 32 : 0;
-    default:
-        return 0;
-    }
-}
-
-static bool vector_function(uint32_t fn)
-{
-    return fn == FEnum_glTexParameterfv || fn == FEnum_glTexParameteriv ||
-           fn == FEnum_glTexEnvfv || fn == FEnum_glTexEnviv ||
-           fn == FEnum_glLightfv || fn == FEnum_glMaterialfv ||
-           fn == FEnum_glFogfv || fn == FEnum_glLightModelfv ||
-           fn == FEnum_glTexGenfv || fn == FEnum_glTexGendv ||
-           fn == FEnum_glClipPlane;
-}
 
 static void vector_call(uint32_t fn, const uint32_t *a, const uint8_t *data)
 {
@@ -460,6 +308,7 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
         return NULL;
     }
 #endif
+    p->gl_api = (DreamGpuGlApi) { DREAMGPU_GL_API_INIT };
     return p;
 }
 
@@ -547,9 +396,6 @@ JrgGLContext *jrg_gl_context_new(JrgGLPlatform *p, JrgGLContext *share,
     }
 #endif
     c->textures = share ? share->textures : g_new0(JrgTextureNamespace, 1);
-    if (!share) {
-        c->textures->names = g_hash_table_new(g_direct_hash, g_direct_equal);
-    }
     c->textures->refs++;
     c->default_texture = g_new0(JrgTexture, 1);
     c->default_texture->refs = 2; /* context ownership plus current binding */
@@ -814,43 +660,45 @@ bool jrg_gl_make_current(JrgGLContext *c, JrgGLDrawable *d, Error **errp)
     return true;
 }
 
-static void texture_unref(JrgGLPlatform *p, JrgTexture *texture)
+static void *host_texture_allocate(void *opaque, size_t bytes)
 {
-    if (!texture || --texture->refs) {
-        return;
-    }
+    return g_try_malloc0(bytes);
+}
+
+static void host_texture_free(void *opaque, void *object)
+{
+    g_free(object);
+}
+
+static void host_texture_forget_read(void *opaque, DreamGpuTexture *texture)
+{
+    JrgGLPlatform *p = opaque;
     if (p->read_texture == texture) {
         g_clear_pointer(&p->read_pixels, g_free);
         p->read_texture = NULL;
         p->read_bytes = 0;
     }
-    if (texture->last_write) {
-        glDeleteSync(texture->last_write);
-    }
-    if (texture->name && !texture->deleted) {
-        glDeleteTextures(1, &texture->name);
-    }
-    for (unsigned level = 0; level <= JRG_GL_MAX_TEXTURE_LEVEL; level++) {
-        p->texture_bytes -= texture->levels[level];
-    }
-    p->texture_count--;
-    g_free(texture);
+}
+
+static DreamGpuTextureMemory texture_memory(JrgGLPlatform *p)
+{
+    return (DreamGpuTextureMemory) {
+        .api = &p->gl_api, .bytes = &p->texture_bytes, .count = &p->texture_count,
+        .opaque = p, .allocate = host_texture_allocate, .free = host_texture_free,
+        .forget_read = host_texture_forget_read,
+    };
+}
+
+static void texture_unref(JrgGLPlatform *p, JrgTexture *texture)
+{
+    DreamGpuTextureMemory memory = texture_memory(p);
+    dreamgpu_texture_unref(&memory, texture);
 }
 
 static void texture_namespace_unref(JrgGLPlatform *p, JrgTextureNamespace *ns)
 {
-    GHashTableIter iter;
-    gpointer value;
-
-    if (!ns || --ns->refs) {
-        return;
-    }
-    g_hash_table_iter_init(&iter, ns->names);
-    while (g_hash_table_iter_next(&iter, NULL, &value)) {
-        texture_unref(p, value);
-    }
-    g_hash_table_destroy(ns->names);
-    g_free(ns);
+    DreamGpuTextureMemory memory = texture_memory(p);
+    dreamgpu_texture_namespace_unref(&memory, ns);
 }
 
 static void store_guest_error(JrgGLContext *c, GLenum error)
@@ -875,26 +723,12 @@ static void remember_guest_error(JrgGLContext *c)
 
 static void texture_wait(JrgGLContext *c, JrgTexture *texture)
 {
-    /* One context already orders its uploads and draws. A foreign context
-     * needs one server dependency per write, not another wait on every draw.
-     * Serials are never reused even when a context allocation address is. */
-    if (texture->last_write && texture->writer_serial != c->serial &&
-        texture->waiter_serial != c->serial) {
-        glWaitSync(texture->last_write, 0, GL_TIMEOUT_IGNORED);
-        texture->waiter_serial = c->serial;
-    }
+    dreamgpu_texture_wait(&c->platform->gl_api, texture, c->serial);
 }
 
 static void texture_written(JrgGLContext *c, JrgTexture *texture)
 {
-    texture->version++;
-    texture->writer_serial = c->serial;
-    texture->waiter_serial = 0;
-    if (texture->last_write) {
-        glDeleteSync(texture->last_write);
-    }
-    texture->last_write = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    /* The normal context switch / present flush submits this fence too. */
+    dreamgpu_texture_written(&c->platform->gl_api, texture, c->serial);
 }
 
 static JrgTexture *bound_texture(JrgGLContext *c, GLenum target)
@@ -905,173 +739,20 @@ static JrgTexture *bound_texture(JrgGLContext *c, GLenum target)
 static uint32_t bind_texture(JrgGLContext *c, GLenum target,
                              uint32_t guest_name)
 {
-    JrgTexture *texture, **binding;
-    if (target != GL_TEXTURE_1D && target != GL_TEXTURE_2D) {
-        return JRG_GL_ERROR_TEXTURE;
-    }
-    binding = target == GL_TEXTURE_1D ? &c->bound_texture_1d : &c->bound_texture;
-    texture = guest_name ?
-        g_hash_table_lookup(c->textures->names, GUINT_TO_POINTER(guest_name)) :
-        (target == GL_TEXTURE_1D ? c->default_texture_1d : c->default_texture);
-    if (texture && texture->target != target) {
-        store_guest_error(c, GL_INVALID_OPERATION);
-        return 0;
-    }
-    if (!texture) {
-        if (c->platform->texture_count == JRG_GL_MAX_TEXTURES) {
-            return JRG_GL_ERROR_LIMIT;
-        }
-        texture = g_new0(JrgTexture, 1);
-        texture->guest_name = guest_name;
-        texture->target = target;
-        remember_guest_error(c);
-        glGenTextures(1, &texture->name);
-        if (!texture->name) {
-            g_free(texture);
-            return JRG_GL_ERROR_HOST;
-        }
-        texture->refs = 1;
-        c->platform->texture_count++;
-        g_hash_table_insert(c->textures->names, GUINT_TO_POINTER(guest_name), texture);
-    }
-    texture_wait(c, texture);
-    glBindTexture(target, texture->name);
-    if (*binding != texture) {
-        texture->refs++;
-        texture_unref(c->platform, *binding);
-        *binding = texture;
-    }
-    return 0;
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    return dreamgpu_texture_bind(&memory, c->textures, target, guest_name,
+                                 target == GL_TEXTURE_1D ? c->default_texture_1d : c->default_texture,
+                                 target == GL_TEXTURE_1D ? &c->bound_texture_1d : &c->bound_texture,
+                                 c->serial, &c->guest_errors);
 }
 
 static void delete_textures(JrgGLContext *c, const uint8_t *data,
-                              uint32_t count)
+                             uint32_t count)
 {
-    for (unsigned i = 0; i < count; i++) {
-        uint32_t name = ldl_le_p(data + i * 4);
-        JrgTexture *texture = g_hash_table_lookup(c->textures->names,
-                                                  GUINT_TO_POINTER(name));
-        if (!texture) {
-            continue;
-        }
-        glDeleteTextures(1, &texture->name);
-        texture->deleted = true;
-        g_hash_table_remove(c->textures->names, GUINT_TO_POINTER(name));
-        if (c->bound_texture == texture) {
-            c->default_texture->refs++;
-            c->bound_texture = c->default_texture;
-            texture_unref(c->platform, texture);
-        }
-        if (c->bound_texture_1d == texture) {
-            c->default_texture_1d->refs++;
-            c->bound_texture_1d = c->default_texture_1d;
-            texture_unref(c->platform, texture);
-        }
-        texture_unref(c->platform, texture);
-    }
-}
-
-static unsigned texture_components(uint32_t format)
-{
-    switch (format) {
-    case GL_ALPHA:
-    case GL_LUMINANCE:
-        return 1;
-    case GL_LUMINANCE_ALPHA:
-        return 2;
-    case GL_RGB:
-    case GL_BGR:
-        return 3;
-    case GL_RGBA:
-    case GL_BGRA:
-        return 4;
-    default:
-        return 0;
-    }
-}
-
-static bool texture_internal_format(uint32_t format)
-{
-    switch (format) {
-    case 1:
-    case 2:
-    case 3:
-    case 4:
-    case GL_ALPHA:
-    case GL_LUMINANCE:
-    case GL_LUMINANCE_ALPHA:
-    case GL_RGB:
-    case GL_RGBA:
-    case GL_R3_G3_B2:
-    case GL_LUMINANCE4_ALPHA4:
-    case GL_RGB4:
-    case GL_RGB5:
-    case GL_RGBA4:
-    case GL_RGB5_A1:
-    case GL_ALPHA8:
-    case GL_LUMINANCE8:
-    case GL_LUMINANCE8_ALPHA8:
-    case GL_RGB8:
-    case GL_RGBA8:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static bool buffer_selection(uint32_t mode, bool draw)
-{
-    switch (mode) {
-    case GL_FRONT: case GL_FRONT_LEFT: case GL_BACK: case GL_BACK_LEFT:
-    case GL_LEFT:
-        return true;
-    case GL_NONE: case GL_FRONT_AND_BACK:
-        return draw;
-    default:
-        /* No right-eye or auxiliary storage exists in this pixel format. */
-        return false;
-    }
-}
-
-static bool hint_target(uint32_t target)
-{
-    return target == GL_PERSPECTIVE_CORRECTION_HINT ||
-           target == GL_POINT_SMOOTH_HINT || target == GL_LINE_SMOOTH_HINT ||
-           target == GL_POLYGON_SMOOTH_HINT || target == GL_FOG_HINT;
-}
-
-uint32_t jrg_gl_call_validate(uint32_t fn, const uint8_t *args)
-{
-    bool image = fn == FEnum_glCopyTexImage2D;
-    uint32_t a[8];
-
-    if (fn == FEnum_glDrawBuffer || fn == FEnum_glReadBuffer) {
-        return buffer_selection(ldl_le_p(args), fn == FEnum_glDrawBuffer) ?
-               0 : JRG_GL_ERROR_UNSUPPORTED;
-    }
-    if (fn == FEnum_glHint) {
-        uint32_t mode = ldl_le_p(args + 4);
-        return hint_target(ldl_le_p(args)) &&
-               (mode == GL_DONT_CARE || mode == GL_FASTEST ||
-                mode == GL_NICEST) ? 0 : JRG_GL_ERROR_UNSUPPORTED;
-    }
-    if (!image && fn != FEnum_glCopyTexSubImage2D) {
-        return 0;
-    }
-    for (unsigned i = 0; i < G_N_ELEMENTS(a); i++) {
-        a[i] = ldl_le_p(args + i * 4);
-    }
-    unsigned wi = image ? 5 : 6;
-    unsigned hi = image ? 6 : 7;
-    if (a[0] != GL_TEXTURE_2D || a[1] > JRG_GL_MAX_TEXTURE_LEVEL ||
-        a[wi] > JRG_GL_MAX_TEXTURE_DIMENSION ||
-        a[hi] > JRG_GL_MAX_TEXTURE_DIMENSION ||
-        (image && (a[7] || a[2] <= 4 || !texture_internal_format(a[2]) ||
-                   a[wi] > (JRG_GL_MAX_TEXTURE_DIMENSION >> a[1]) ||
-                   a[hi] > (JRG_GL_MAX_TEXTURE_DIMENSION >> a[1])))) {
-        return JRG_GL_ERROR_TEXTURE;
-    }
-    return 0;
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    dreamgpu_texture_delete(&memory, c->textures, data, count,
+                             c->default_texture, c->default_texture_1d,
+                             &c->bound_texture, &c->bound_texture_1d);
 }
 
 static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
@@ -1134,62 +815,6 @@ static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
     return 0;
 }
 
-static unsigned index_bytes(uint32_t type)
-{
-    switch (type) {
-    case GL_UNSIGNED_BYTE:
-        return 1;
-    case GL_UNSIGNED_SHORT:
-        return 2;
-    case GL_UNSIGNED_INT:
-        return 4;
-    default:
-        return 0;
-    }
-}
-
-static uint32_t array_index(const uint8_t *p, unsigned size)
-{
-    return size == 1 ? *p : size == 2 ? lduw_le_p(p) : ldl_le_p(p);
-}
-
-static uint32_t validate_arrays(uint32_t fn, const uint32_t *a,
-                                const uint8_t *data, uint32_t bytes)
-{
-    bool elements = fn == FEnum_glDrawElements;
-    uint32_t vertices = a[elements ? 3 : 2];
-    uint32_t attributes = a[elements ? 4 : 3];
-    uint32_t indices = elements ? a[1] : 0;
-    unsigned index_size = elements ? index_bytes(a[2]) : 0;
-    unsigned stride = JRG_GL_VERTEX_SIZE(attributes);
-    uint64_t vertex_bytes = (uint64_t)vertices * stride;
-
-    if (a[0] > GL_POLYGON || vertices > JRG_GL_MAX_VERTICES ||
-        indices > JRG_GL_MAX_INDICES || (elements && !index_size) ||
-        (!elements && a[1]) || (attributes & ~JRG_GL_ARRAY_MASK) ||
-        !(attributes & JRG_GL_ARRAY_POSITION) ||
-        vertex_bytes + (uint64_t)indices * index_size != bytes) {
-        return JRG_GL_ERROR_BATCH;
-    }
-    for (unsigned i = 0; i < vertices; i++) {
-        if (ldl_le_p(data + i * stride +
-                      JRG_GL_VERTEX_RESERVED)) {
-            return JRG_GL_ERROR_BATCH;
-        }
-        if ((attributes & JRG_GL_ARRAY_SECONDARY) &&
-            ldl_le_p(data + i * stride + JRG_GL_VERTEX_SECONDARY_PAD)) {
-            return JRG_GL_ERROR_BATCH;
-        }
-    }
-    const uint8_t *index_data = data + vertex_bytes;
-    for (unsigned i = 0; i < indices; i++) {
-        if (array_index(index_data + i * index_size, index_size) >= vertices) {
-            return JRG_GL_ERROR_BATCH;
-        }
-    }
-    return 0;
-}
-
 static uint32_t draw_arrays(JrgGLContext *c, uint32_t fn, const uint32_t *a,
                              const uint8_t *data, uint32_t bytes)
 {
@@ -1232,54 +857,13 @@ static uint32_t draw_arrays(JrgGLContext *c, uint32_t fn, const uint32_t *a,
     texture_wait(c, c->bound_texture);
     texture_wait(c, c->bound_texture_1d);
     remember_guest_error(c);
-    /* Preserve current attributes and leave no borrowed CPU pointer in GL. */
-    GLfloat current_color[4], current_normal[3], current_texcoord[4];
-    GLfloat current_secondary[4];
-    glGetFloatv(GL_CURRENT_COLOR, current_color);
-    glGetFloatv(GL_CURRENT_SECONDARY_COLOR, current_secondary);
-    glGetFloatv(GL_CURRENT_NORMAL, current_normal);
-    glGetFloatv(GL_CURRENT_TEXTURE_COORDS, current_texcoord);
-    glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT);
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glVertexPointer(4, GL_FLOAT, stride,
-                     data + JRG_GL_VERTEX_POSITION);
-#define ARRAY(enabled, cap) do { \
-    if (attributes & (enabled)) { \
-        glEnableClientState(cap); \
-    } else { \
-        glDisableClientState(cap); \
-    } \
-} while (0)
-    ARRAY(JRG_GL_ARRAY_COLOR, GL_COLOR_ARRAY);
-    ARRAY(JRG_GL_ARRAY_SECONDARY, GL_SECONDARY_COLOR_ARRAY);
-    ARRAY(JRG_GL_ARRAY_NORMAL, GL_NORMAL_ARRAY);
-    ARRAY(JRG_GL_ARRAY_TEXCOORD, GL_TEXTURE_COORD_ARRAY);
-#undef ARRAY
-    glColorPointer(4, GL_FLOAT, stride,
-                    data + JRG_GL_VERTEX_COLOR);
-    glNormalPointer(GL_FLOAT, stride,
-                     data + JRG_GL_VERTEX_NORMAL);
-    glTexCoordPointer(4, GL_FLOAT, stride,
-                       data + JRG_GL_VERTEX_TEXCOORD);
-    if (attributes & JRG_GL_ARRAY_SECONDARY) {
-        glSecondaryColorPointer(3, GL_FLOAT, stride, data + JRG_GL_VERTEX_SECONDARY);
+    uint32_t gl_error = GL_NO_ERROR;
+    uint32_t error = dreamgpu_gl_arrays(&c->platform->gl_api, fn, a,
+                                        data, bytes, &gl_error);
+    if (gl_error != GL_NO_ERROR) {
+        store_guest_error(c, gl_error);
     }
-    if (elements) {
-        glDrawElements(a[0], a[1], a[2], indices);
-    } else {
-        glDrawArrays(a[0], 0, vertices);
-    }
-    GLenum error = glGetError();
-    glPopClientAttrib();
-    glColor4fv(current_color);
-    glSecondaryColor3fv(current_secondary);
-    glNormal3fv(current_normal);
-    glTexCoord4fv(current_texcoord);
-    if (error != GL_NO_ERROR) {
-        store_guest_error(c, error);
-        return JRG_GL_ERROR_HOST;
-    }
-    return 0;
+    return error;
 }
 
 /* Initialize allocation-only images without exposing recycled texture bytes. */
@@ -1361,45 +945,11 @@ static GLenum zero_texture(JrgTexture *t, uint32_t level, uint32_t w,
     return error;
 }
 
-uint32_t jrg_gl_data_validate(uint32_t fn, const uint8_t *args,
-                               const uint8_t *data, uint32_t bytes)
+static uint32_t host_zero_texture(void *opaque, DreamGpuTexture *texture,
+                                   uint32_t level, uint32_t width,
+                                   uint32_t height)
 {
-    uint32_t a[8] = { 0 };
-    uint32_t words = jrg_gl_function_words(fn) & ~JRG_GL_FUNCTION_INLINE_DATA;
-
-    for (unsigned i = 0; i < words; i++) {
-        a[i] = ldl_le_p(args + i * 4);
-    }
-    if (vector_function(fn)) {
-        unsigned required = vector_bytes(fn, a);
-        return required && bytes == required ? 0 : JRG_GL_ERROR_BATCH;
-    }
-    if (fn == FEnum_glDrawArrays || fn == FEnum_glDrawElements) {
-        return validate_arrays(fn, a, data, bytes);
-    }
-    if (fn == FEnum_glDeleteTextures) {
-        return a[0] <= JRG_GL_MAX_TEXTURES && bytes == a[0] * 4 ?
-               0 : JRG_GL_ERROR_BATCH;
-    }
-    bool image = fn == FEnum_glTexImage2D || fn == FEnum_glTexImage1D;
-    bool one = fn == FEnum_glTexImage1D || fn == FEnum_glTexSubImage1D;
-    uint32_t w = a[image ? 3 : 4];
-    uint32_t h = a[image ? 4 : 5];
-    unsigned components = texture_components(a[6]);
-    bool allocate_only = image && !bytes;
-    if (a[0] != (one ? GL_TEXTURE_1D : GL_TEXTURE_2D) || (one && (h != 1 || (!image && a[3]))) ||
-        a[1] > JRG_GL_MAX_TEXTURE_LEVEL ||
-        !w || !h || w > JRG_GL_MAX_TEXTURE_DIMENSION ||
-        h > JRG_GL_MAX_TEXTURE_DIMENSION || !components ||
-        a[7] != GL_UNSIGNED_BYTE ||
-        (!allocate_only && (uint64_t)w * h * components != bytes) ||
-        (image &&
-         (a[5] || !texture_internal_format(a[2]) ||
-          w > (JRG_GL_MAX_TEXTURE_DIMENSION >> a[1]) ||
-          h > (JRG_GL_MAX_TEXTURE_DIMENSION >> a[1])))) {
-        return JRG_GL_ERROR_TEXTURE;
-    }
-    return 0;
+    return zero_texture(texture, level, width, height);
 }
 
 uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
@@ -1407,8 +957,6 @@ uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
 {
     uint32_t a[8] = { 0 };
     uint32_t words = jrg_gl_function_words(fn) & ~JRG_GL_FUNCTION_INLINE_DATA;
-    GLint unpack_alignment = 4, unpack_row_length = 0;
-    GLint unpack_skip_rows = 0, unpack_skip_pixels = 0, unpack_swap_bytes = 0;
     JrgTexture *texture = c->bound_texture;
 
     if (c->in_begin && fn != FEnum_glMaterialfv) {
@@ -1443,259 +991,23 @@ uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
         delete_textures(c, data, a[0]);
         return 0;
     }
-    uint32_t level = a[1];
-    bool image = fn == FEnum_glTexImage2D || fn == FEnum_glTexImage1D;
-    bool one = fn == FEnum_glTexImage1D || fn == FEnum_glTexSubImage1D;
-    uint32_t w = a[image ? 3 : 4];
-    uint32_t h = a[image ? 4 : 5];
-    uint64_t allocation = (uint64_t)w * h * 4;
     texture = bound_texture(c, a[0]);
-    if (image) {
-        if (c->platform->texture_bytes - texture->levels[level] + allocation >
-            JRG_GL_MAX_TEXTURE_BYTES) {
-            return JRG_GL_ERROR_LIMIT;
-        }
-    } else if (a[2] > texture->widths[level] ||
-               a[3] > texture->heights[level] ||
-               w > texture->widths[level] - a[2] ||
-               h > texture->heights[level] - a[3]) {
-        return JRG_GL_ERROR_TEXTURE;
-    }
     texture_wait(c, texture);
     remember_guest_error(c);
-    glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_alignment);
-    glGetIntegerv(GL_UNPACK_ROW_LENGTH, &unpack_row_length);
-    glGetIntegerv(GL_UNPACK_SKIP_ROWS, &unpack_skip_rows);
-    glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &unpack_skip_pixels);
-    glGetIntegerv(GL_UNPACK_SWAP_BYTES, &unpack_swap_bytes);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-    glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
-    glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
-    glPixelStorei(GL_UNPACK_SWAP_BYTES, 0);
-    if (one && image) {
-        glTexImage1D(a[0], level, a[2], w, 0, a[6], a[7], bytes ? data : NULL);
-    } else if (one) {
-        glTexSubImage1D(a[0], level, a[2], w, a[6], a[7], data);
-    } else if (image) {
-        glTexImage2D(a[0], level, a[2], w, h, 0, a[6], a[7],
-                     bytes ? data : NULL);
-    } else {
-        glTexSubImage2D(a[0], level, a[2], a[3], w, h, a[6], a[7], data);
+    uint32_t gl_error = GL_NO_ERROR;
+    uint32_t error = dreamgpu_texture_upload(&c->platform->gl_api, texture,
+                                             &c->platform->texture_bytes,
+                                             c->serial, fn, a, data, bytes,
+                                             host_zero_texture, c, &gl_error);
+    if (gl_error != GL_NO_ERROR) {
+        store_guest_error(c, gl_error);
     }
-    GLenum error = glGetError();
-    bool image_written = !error && image;
-    if (!error && image && !bytes) {
-        error = zero_texture(texture, level, w, h);
-    }
-    glPixelStorei(GL_UNPACK_ALIGNMENT, unpack_alignment);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, unpack_row_length);
-    glPixelStorei(GL_UNPACK_SKIP_ROWS, unpack_skip_rows);
-    glPixelStorei(GL_UNPACK_SKIP_PIXELS, unpack_skip_pixels);
-    glPixelStorei(GL_UNPACK_SWAP_BYTES, unpack_swap_bytes);
-    if (image_written) {
-        c->platform->texture_bytes = c->platform->texture_bytes -
-                                     texture->levels[level] + allocation;
-        texture->levels[level] = allocation;
-        texture->widths[level] = w;
-        texture->heights[level] = h;
-        /*
-         * Even a failed zero clear allocated storage: account it, and forbid
-         * sampling until a later complete upload initializes this level.
-         */
-        if (error) {
-            texture->undefined_levels |= 1U << level;
-        } else {
-            texture->undefined_levels &= ~(1U << level);
-        }
-    }
-    if (image_written || !error) {
-        texture_written(c, texture);
-    }
-    if (error != GL_NO_ERROR) {
-        store_guest_error(c, error);
-        return JRG_GL_ERROR_TEXTURE;
-    }
-    if (!image && !a[2] && !a[3] &&
-        w == texture->widths[level] && h == texture->heights[level]) {
-        texture->undefined_levels &= ~(1U << level);
-    }
-    return 0;
+    return error;
 }
 
 bool jrg_gl_context_in_begin(JrgGLContext *c)
 {
     return c->in_begin;
-}
-
-static bool query_cap(uint32_t pname)
-{
-    if ((pname >= GL_LIGHT0 && pname <= GL_LIGHT7) ||
-        (pname >= GL_CLIP_PLANE0 && pname <= GL_CLIP_PLANE5)) {
-        return true;
-    }
-    switch (pname) {
-    case GL_BLEND:
-    case GL_DEPTH_TEST:
-    case GL_STENCIL_TEST:
-    case GL_SCISSOR_TEST:
-    case GL_TEXTURE_1D:
-    case GL_TEXTURE_2D:
-    case GL_CULL_FACE:
-    case GL_LIGHTING:
-    case GL_FOG:
-    case GL_ALPHA_TEST:
-    case GL_DITHER:
-    case GL_NORMALIZE:
-    case GL_POLYGON_OFFSET_FILL:
-    case GL_POLYGON_OFFSET_LINE:
-    case GL_POLYGON_OFFSET_POINT:
-    case GL_POLYGON_SMOOTH:
-    case GL_POLYGON_STIPPLE:
-    case GL_LINE_SMOOTH:
-    case GL_LINE_STIPPLE:
-    case GL_POINT_SMOOTH:
-    case GL_COLOR_MATERIAL:
-    case GL_COLOR_SUM:
-    case GL_TEXTURE_GEN_S:
-    case GL_TEXTURE_GEN_T:
-    case GL_TEXTURE_GEN_R:
-    case GL_TEXTURE_GEN_Q:
-        return true;
-    default:
-        return false;
-    }
-}
-
-static unsigned query_state_count(uint32_t pname)
-{
-    if (query_cap(pname)) {
-        return 1;
-    }
-    switch (pname) {
-    case GL_MODELVIEW_MATRIX:
-    case GL_PROJECTION_MATRIX:
-    case GL_TEXTURE_MATRIX:
-        return 16;
-    case GL_CURRENT_COLOR:
-    case GL_CURRENT_SECONDARY_COLOR:
-    case GL_CURRENT_TEXTURE_COORDS:
-    case GL_VIEWPORT:
-    case GL_SCISSOR_BOX:
-    case GL_COLOR_CLEAR_VALUE:
-    case GL_COLOR_WRITEMASK:
-    case GL_FOG_COLOR:
-    case GL_LIGHT_MODEL_AMBIENT:
-        return 4;
-    case GL_CURRENT_NORMAL:
-        return 3;
-    case GL_DEPTH_RANGE:
-    case GL_MAX_VIEWPORT_DIMS:
-    case GL_POLYGON_MODE:
-    case GL_POINT_SIZE_RANGE:
-    case GL_ALIASED_POINT_SIZE_RANGE:
-    case GL_ALIASED_LINE_WIDTH_RANGE:
-    case GL_LINE_WIDTH_RANGE:
-        return 2;
-    case GL_PACK_SWAP_BYTES:
-    case GL_PACK_LSB_FIRST:
-    case GL_PACK_ROW_LENGTH:
-    case GL_PACK_SKIP_ROWS:
-    case GL_PACK_SKIP_PIXELS:
-    case GL_PACK_ALIGNMENT:
-    case GL_UNPACK_SWAP_BYTES:
-    case GL_UNPACK_LSB_FIRST:
-    case GL_UNPACK_ROW_LENGTH:
-    case GL_UNPACK_SKIP_ROWS:
-    case GL_UNPACK_SKIP_PIXELS:
-    case GL_UNPACK_ALIGNMENT:
-    case GL_TEXTURE_BINDING_1D:
-    case GL_TEXTURE_BINDING_2D:
-    case GL_ATTRIB_STACK_DEPTH:
-    case GL_MAX_ATTRIB_STACK_DEPTH:
-    case GL_MATRIX_MODE:
-    case GL_MODELVIEW_STACK_DEPTH:
-    case GL_PROJECTION_STACK_DEPTH:
-    case GL_TEXTURE_STACK_DEPTH:
-    case GL_MAX_MODELVIEW_STACK_DEPTH:
-    case GL_MAX_PROJECTION_STACK_DEPTH:
-    case GL_MAX_TEXTURE_STACK_DEPTH:
-    case GL_MAX_TEXTURE_SIZE:
-    case GL_BLEND_SRC:
-    case GL_BLEND_DST:
-    case GL_DEPTH_FUNC:
-    case GL_DEPTH_WRITEMASK:
-    case GL_DEPTH_CLEAR_VALUE:
-    case GL_STENCIL_CLEAR_VALUE:
-    case GL_STENCIL_FUNC:
-    case GL_STENCIL_VALUE_MASK:
-    case GL_STENCIL_REF:
-    case GL_STENCIL_FAIL:
-    case GL_STENCIL_PASS_DEPTH_FAIL:
-    case GL_STENCIL_PASS_DEPTH_PASS:
-    case GL_STENCIL_WRITEMASK:
-    case GL_FOG_MODE:
-    case GL_FOG_DENSITY:
-    case GL_FOG_START:
-    case GL_FOG_END:
-    case GL_FOG_INDEX:
-    case GL_LIGHT_MODEL_LOCAL_VIEWER:
-    case GL_LIGHT_MODEL_TWO_SIDE:
-    case GL_LIGHT_MODEL_COLOR_CONTROL:
-    case GL_COLOR_MATERIAL_FACE:
-    case GL_COLOR_MATERIAL_PARAMETER:
-    case GL_MAX_LIGHTS:
-    case GL_MAX_CLIP_PLANES:
-    case GL_POLYGON_OFFSET_FACTOR:
-    case GL_POLYGON_OFFSET_UNITS:
-    case GL_POINT_SIZE:
-    case GL_POINT_SIZE_GRANULARITY:
-    case GL_LINE_WIDTH:
-    case GL_LINE_WIDTH_GRANULARITY:
-    case GL_LINE_STIPPLE_PATTERN:
-    case GL_LINE_STIPPLE_REPEAT:
-    case GL_ALPHA_TEST_FUNC:
-    case GL_ALPHA_TEST_REF:
-    case GL_SHADE_MODEL:
-    case GL_FRONT_FACE:
-    case GL_CULL_FACE_MODE:
-    case GL_RED_BITS:
-    case GL_GREEN_BITS:
-    case GL_BLUE_BITS:
-    case GL_ALPHA_BITS:
-    case GL_DEPTH_BITS:
-    case GL_STENCIL_BITS:
-    case GL_RGBA_MODE:
-    case GL_INDEX_MODE:
-    case GL_DOUBLEBUFFER:
-    case GL_DRAW_BUFFER:
-    case GL_READ_BUFFER:
-    case GL_PERSPECTIVE_CORRECTION_HINT:
-    case GL_POINT_SMOOTH_HINT:
-    case GL_LINE_SMOOTH_HINT:
-    case GL_POLYGON_SMOOTH_HINT:
-    case GL_FOG_HINT:
-    case GL_STEREO:
-    case GL_AUX_BUFFERS:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-static const char *query_string(uint32_t name)
-{
-    switch (name) {
-    case GL_VENDOR:
-        return "Juke";
-    case GL_RENDERER:
-        return "Juke retro GPU (native host OpenGL)";
-    case GL_EXTENSIONS:
-        return "";
-    default:
-        /* No complete OpenGL version is implemented or advertised yet. */
-        return NULL;
-    }
 }
 
 /* Read one bounded canonical tile (128 pixels for legacy requests). The first tile
@@ -1762,135 +1074,6 @@ static uint32_t texture_read(JrgGLContext *c, GLenum target, uint32_t level,
         p->read_bytes = 0;
     }
     return 0;
-}
-
-static unsigned query_shape(uint32_t fn, const uint8_t *args, uint32_t *type)
-{
-    uint32_t a = ldl_le_p(args), b = ldl_le_p(args + 4);
-    uint32_t d = ldl_le_p(args + 8);
-    unsigned count = 0;
-
-    *type = JRG_GL_RESULT_INT;
-    switch (fn) {
-    case FEnum_glGetTexImage:
-        return (a == GL_TEXTURE_1D || a == GL_TEXTURE_2D) &&
-               (b & 0xffff) <= JRG_GL_MAX_TEXTURE_LEVEL &&
-               (b >> JRG_GL_TEXTURE_READ_COUNT_SHIFT) <= JRG_GL_MAX_READBACK_BYTES / 4 &&
-               d < JRG_GL_MAX_TEXTURE_DIMENSION * JRG_GL_MAX_TEXTURE_DIMENSION ?
-               (b >> JRG_GL_TEXTURE_READ_COUNT_SHIFT ? b >> JRG_GL_TEXTURE_READ_COUNT_SHIFT : JRG_GL_MAX_RESULT_BYTES / 4) : 0;
-    case FEnum_glReadPixels: {
-        unsigned width = d & 0xffff, height = d >> 16;
-        return a < JRG_GL_MAX_DIMENSION && b < JRG_GL_MAX_DIMENSION &&
-               width && height && width <= JRG_GL_READ_PIXELS_MAX / height ?
-               width * height : 0;
-    }
-    case FEnum_glGetError:
-        return !a && !b && !d;
-    case FEnum_glIsTexture:
-        *type = JRG_GL_RESULT_BOOL;
-        return !b && !d;
-    case FEnum_glIsEnabled:
-        *type = JRG_GL_RESULT_BOOL;
-        return !b && !d && query_cap(a);
-    case FEnum_glGetString: {
-        const char *s = query_string(a);
-        *type = JRG_GL_RESULT_STRING;
-        return !b && !d && s ? strlen(s) + 1 : 0;
-    }
-    case FEnum_glGetBooleanv:
-        *type = JRG_GL_RESULT_BOOL;
-        return !b && !d ? query_state_count(a) : 0;
-    case FEnum_glGetFloatv:
-        *type = JRG_GL_RESULT_FLOAT;
-        return !b && !d ? query_state_count(a) : 0;
-    case FEnum_glGetDoublev:
-        *type = JRG_GL_RESULT_DOUBLE;
-        return !b && !d ? query_state_count(a) : 0;
-    case FEnum_glGetIntegerv:
-        return !b && !d ? query_state_count(a) : 0;
-    case FEnum_glGetTexParameterfv:
-    case FEnum_glGetTexParameteriv:
-        count = !d ? texture_params(a, b) : 0;
-        *type = fn == FEnum_glGetTexParameterfv ? JRG_GL_RESULT_FLOAT :
-                                                JRG_GL_RESULT_INT;
-        return count;
-    case FEnum_glGetTexLevelParameterfv:
-    case FEnum_glGetTexLevelParameteriv:
-        if ((a == GL_TEXTURE_1D || a == GL_TEXTURE_2D) && b <= JRG_GL_MAX_TEXTURE_LEVEL) {
-            switch (d) {
-            case GL_TEXTURE_WIDTH:
-            case GL_TEXTURE_HEIGHT:
-            case GL_TEXTURE_INTERNAL_FORMAT:
-            case GL_TEXTURE_BORDER:
-            case GL_TEXTURE_RED_SIZE:
-            case GL_TEXTURE_GREEN_SIZE:
-            case GL_TEXTURE_BLUE_SIZE:
-            case GL_TEXTURE_ALPHA_SIZE:
-            case GL_TEXTURE_LUMINANCE_SIZE:
-            case GL_TEXTURE_INTENSITY_SIZE:
-                count = 1;
-                break;
-            }
-        }
-        *type = fn == FEnum_glGetTexLevelParameterfv ? JRG_GL_RESULT_FLOAT :
-                                                     JRG_GL_RESULT_INT;
-        return count;
-    case FEnum_glGetTexEnvfv:
-    case FEnum_glGetTexEnviv:
-        count = !d ? texture_env_params(a, b) : 0;
-        *type = fn == FEnum_glGetTexEnvfv ? JRG_GL_RESULT_FLOAT :
-                                          JRG_GL_RESULT_INT;
-        return count;
-    case FEnum_glGetLightfv:
-    case FEnum_glGetLightiv:
-        *type = fn == FEnum_glGetLightfv ? JRG_GL_RESULT_FLOAT :
-                                          JRG_GL_RESULT_INT;
-        return !d ? light_params(a, b) : 0;
-    case FEnum_glGetMaterialfv:
-    case FEnum_glGetMaterialiv:
-        *type = fn == FEnum_glGetMaterialfv ? JRG_GL_RESULT_FLOAT :
-                                             JRG_GL_RESULT_INT;
-        return !d && a != GL_FRONT_AND_BACK && b != GL_AMBIENT_AND_DIFFUSE ?
-               material_params(a, b) : 0;
-    case FEnum_glGetTexGenfv:
-    case FEnum_glGetTexGeniv:
-    case FEnum_glGetTexGendv:
-        *type = fn == FEnum_glGetTexGendv ? JRG_GL_RESULT_DOUBLE :
-                fn == FEnum_glGetTexGenfv ? JRG_GL_RESULT_FLOAT :
-                                           JRG_GL_RESULT_INT;
-        return !d ? texgen_params(a, b) : 0;
-    case FEnum_glGetClipPlane:
-        *type = JRG_GL_RESULT_DOUBLE;
-        return !b && !d && a >= GL_CLIP_PLANE0 && a <= GL_CLIP_PLANE5 ? 4 : 0;
-    default:
-        return 0;
-    }
-}
-
-uint32_t jrg_gl_query_result_bytes(uint32_t fn, const uint8_t *args)
-{
-    uint32_t type;
-    unsigned count = query_shape(fn, args, &type);
-    unsigned size = type == JRG_GL_RESULT_DOUBLE ? 8 :
-                    type == JRG_GL_RESULT_INT || type == JRG_GL_RESULT_FLOAT ?
-                    4 : 1;
-    return count * size;
-}
-
-uint32_t jrg_gl_query_validate(uint32_t fn, const uint8_t *args)
-{
-    uint32_t words = jrg_gl_function_words(fn);
-    if (words == UINT32_MAX ||
-        (words & JRG_GL_FUNCTION_KIND_MASK) != JRG_GL_FUNCTION_QUERY) {
-        return JRG_GL_ERROR_UNSUPPORTED;
-    }
-    words &= ~JRG_GL_FUNCTION_KIND_MASK;
-    for (unsigned i = words; i < 3; i++) {
-        if (ldl_le_p(args + i * 4)) {
-            return JRG_GL_ERROR_BATCH;
-        }
-    }
-    return jrg_gl_query_result_bytes(fn, args) ? 0 : JRG_GL_ERROR_UNSUPPORTED;
 }
 
 uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
@@ -1960,8 +1143,7 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
     } else if (fn == FEnum_glGetString) {
         memcpy(result, query_string(a), count);
     } else if (fn == FEnum_glIsTexture) {
-        booleans[0] = a && g_hash_table_contains(c->textures->names,
-                                                GUINT_TO_POINTER(a));
+        booleans[0] = a && (dreamgpu_texture_lookup(c->textures, a) != NULL);
     } else if (fn == FEnum_glIsEnabled) {
         booleans[0] = glIsEnabled(a);
     } else if (fn == FEnum_glGetTexParameteriv) {
@@ -2104,145 +1286,6 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
     return 0;
 }
 
-uint32_t jrg_gl_function_words(uint32_t fn)
-{
-    switch (fn) {
-    case FEnum_glGetError:
-        return JRG_GL_FUNCTION_QUERY;
-    case FEnum_glGetBooleanv:
-    case FEnum_glGetIntegerv:
-    case FEnum_glGetFloatv:
-    case FEnum_glGetDoublev:
-    case FEnum_glGetString:
-    case FEnum_glIsEnabled:
-    case FEnum_glIsTexture:
-    case FEnum_glGetClipPlane:
-        return JRG_GL_FUNCTION_QUERY | 1;
-    case FEnum_glGetTexParameterfv:
-    case FEnum_glGetTexParameteriv:
-    case FEnum_glGetTexEnvfv:
-    case FEnum_glGetTexEnviv:
-    case FEnum_glGetLightfv:
-    case FEnum_glGetLightiv:
-    case FEnum_glGetMaterialfv:
-    case FEnum_glGetMaterialiv:
-    case FEnum_glGetTexGenfv:
-    case FEnum_glGetTexGeniv:
-    case FEnum_glGetTexGendv:
-        return JRG_GL_FUNCTION_QUERY | 2;
-    case FEnum_glGetTexLevelParameterfv:
-    case FEnum_glGetTexLevelParameteriv:
-    case FEnum_glGetTexImage:
-    case FEnum_glReadPixels:
-        return JRG_GL_FUNCTION_QUERY | 3;
-    case FEnum_glDrawArrays:
-        return JRG_GL_FUNCTION_INLINE_DATA | 4;
-    case FEnum_glDrawElements:
-        return JRG_GL_FUNCTION_INLINE_DATA | 5;
-    case FEnum_glTexImage1D:
-    case FEnum_glTexSubImage1D:
-    case FEnum_glTexImage2D:
-    case FEnum_glTexSubImage2D:
-        return JRG_GL_FUNCTION_INLINE_DATA | 8;
-    case FEnum_glDeleteTextures:
-    case FEnum_glFogfv:
-    case FEnum_glLightModelfv:
-    case FEnum_glClipPlane:
-        return JRG_GL_FUNCTION_INLINE_DATA | 1;
-    case FEnum_glLightfv:
-    case FEnum_glMaterialfv:
-    case FEnum_glTexGenfv:
-    case FEnum_glTexGendv:
-    case FEnum_glTexParameterfv:
-    case FEnum_glTexParameteriv:
-    case FEnum_glTexEnvfv:
-    case FEnum_glTexEnviv:
-        return JRG_GL_FUNCTION_INLINE_DATA | 2;
-    case FEnum_glBindTexture:
-        return 2;
-    case FEnum_glTexParameteri:
-    case FEnum_glTexParameterf:
-    case FEnum_glTexEnvi:
-    case FEnum_glTexEnvf:
-        return 3;
-    case FEnum_glEnd:
-    case FEnum_glFlush:
-    case FEnum_glFinish:
-    case FEnum_glLoadIdentity:
-    case FEnum_glPushMatrix:
-    case FEnum_glPopAttrib:
-    case FEnum_glPopMatrix:
-        return 0;
-    case FEnum_glBegin:
-    case FEnum_glPushAttrib:
-    case FEnum_glClear:
-    case FEnum_glEnable:
-    case FEnum_glDisable:
-    case FEnum_glMatrixMode:
-    case FEnum_glDepthFunc:
-    case FEnum_glDepthMask:
-    case FEnum_glClearStencil:
-    case FEnum_glStencilMask:
-    case FEnum_glCullFace:
-    case FEnum_glFrontFace:
-    case FEnum_glLineWidth:
-    case FEnum_glPointSize:
-    case FEnum_glShadeModel:
-    case FEnum_glDrawBuffer:
-    case FEnum_glReadBuffer:
-        return 1;
-    case FEnum_glBlendFunc:
-    case FEnum_glVertex2f:
-    case FEnum_glTexCoord2f:
-    case FEnum_glClearDepth:
-    case FEnum_glAlphaFunc:
-    case FEnum_glPolygonMode:
-    case FEnum_glPolygonOffset:
-    case FEnum_glLineStipple:
-    case FEnum_glColorMaterial:
-    case FEnum_glFogf:
-    case FEnum_glLightModelf:
-    case FEnum_glHint:
-        return 2;
-    case FEnum_glVertex3f:
-    case FEnum_glColor3f:
-    case FEnum_glSecondaryColor3f:
-    case FEnum_glTranslatef:
-    case FEnum_glScalef:
-    case FEnum_glStencilFunc:
-    case FEnum_glStencilOp:
-    case FEnum_glNormal3f:
-    case FEnum_glLightf:
-    case FEnum_glMaterialf:
-    case FEnum_glTexGenf:
-        return 3;
-    case FEnum_glClearColor:
-    case FEnum_glColor4f:
-    case FEnum_glViewport:
-    case FEnum_glScissor:
-    case FEnum_glRotatef:
-    case FEnum_glDepthRange:
-    case FEnum_glColorMask:
-    case FEnum_glVertex4f:
-    case FEnum_glTexCoord4f:
-        return 4;
-    case FEnum_glCopyTexImage2D:
-    case FEnum_glCopyTexSubImage2D:
-        return 8;
-    case FEnum_glOrtho:
-    case FEnum_glFrustum:
-        return 12;
-    case FEnum_glLoadMatrixf:
-    case FEnum_glMultMatrixf:
-        return 16;
-    case FEnum_glLoadMatrixd:
-    case FEnum_glMultMatrixd:
-        return 32;
-    default:
-        return UINT32_MAX;
-    }
-}
-
 static GLfloat gl_arg_float(const uint8_t *p)
 {
     union { uint32_t bits; float f; } v = { .bits = ldl_le_p(p) };
@@ -2338,20 +1381,10 @@ static uint32_t attrib_pop(JrgGLContext *c)
     return 0;
 }
 
-uint32_t jrg_gl_call(JrgGLContext *c, uint32_t fn, const uint8_t *args)
+/* Remaining resource-side operations; scalar GL execution is Rust-owned. */
+static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
 {
-    GLfloat matrix[16];
-    GLdouble wide_matrix[16];
-    int i;
-
-    if (c->in_begin && fn != FEnum_glEnd && fn != FEnum_glVertex2f &&
-        fn != FEnum_glVertex3f && fn != FEnum_glVertex4f &&
-        fn != FEnum_glTexCoord4f && fn != FEnum_glColor3f &&
-        fn != FEnum_glColor4f && fn != FEnum_glSecondaryColor3f &&
-        fn != FEnum_glTexCoord2f &&
-        fn != FEnum_glNormal3f && fn != FEnum_glMaterialf) {
-        return JRG_GL_ERROR_CONTEXT;
-    }
+    JrgGLContext *c = opaque;
     switch (fn) {
     case FEnum_glPushAttrib:
         return attrib_push(c, U(0));
@@ -2414,193 +1447,21 @@ uint32_t jrg_gl_call(JrgGLContext *c, uint32_t fn, const uint8_t *args)
         }
         texture_wait(c, c->bound_texture);
         texture_wait(c, c->bound_texture_1d);
-        c->in_begin = true;
-        glBegin(U(0));
         break;
-    case FEnum_glEnd:
-        if (!c->in_begin) {
-            return JRG_GL_ERROR_CONTEXT;
-        }
-        glEnd();
-        c->in_begin = false;
-        break;
-    case FEnum_glClear:
-        glClear(U(0));
-        break;
-    case FEnum_glClearColor:
-        glClearColor(F(0), F(1), F(2), F(3));
-        break;
-    case FEnum_glClearDepth:
-        glClearDepth(D(0));
-        break;
-    case FEnum_glViewport:
-        glViewport(U(0), U(1), U(2), U(3));
-        break;
-    case FEnum_glScissor:
-        glScissor(U(0), U(1), U(2), U(3));
-        break;
-    case FEnum_glFlush:
-        glFlush();
-        break;
-    case FEnum_glFinish:
-        glFinish();
-        break;
-    case FEnum_glEnable:
-        glEnable(U(0));
-        break;
-    case FEnum_glDisable:
-        glDisable(U(0));
-        break;
-    case FEnum_glMatrixMode:
-        glMatrixMode(U(0));
-        break;
-    case FEnum_glLoadIdentity:
-        glLoadIdentity();
-        break;
-    case FEnum_glPushMatrix:
-        glPushMatrix();
-        break;
-    case FEnum_glPopMatrix:
-        glPopMatrix();
-        break;
-    case FEnum_glDepthFunc:
-        glDepthFunc(U(0));
-        break;
-    case FEnum_glDepthMask:
-        glDepthMask(!!U(0));
-        break;
-    case FEnum_glDepthRange:
-        glDepthRange(D(0), D(2));
-        break;
-    case FEnum_glColorMask:
-        glColorMask(!!U(0), !!U(1), !!U(2), !!U(3));
-        break;
-    case FEnum_glAlphaFunc:
-        glAlphaFunc(U(0), F(1));
-        break;
-    case FEnum_glClearStencil:
-        glClearStencil(U(0));
-        break;
-    case FEnum_glStencilMask:
-        glStencilMask(U(0));
-        break;
-    case FEnum_glStencilFunc:
-        glStencilFunc(U(0), U(1), U(2));
-        break;
-    case FEnum_glStencilOp:
-        glStencilOp(U(0), U(1), U(2));
-        break;
-    case FEnum_glCullFace:
-        glCullFace(U(0));
-        break;
-    case FEnum_glFrontFace:
-        glFrontFace(U(0));
-        break;
-    case FEnum_glPolygonMode:
-        glPolygonMode(U(0), U(1));
-        break;
-    case FEnum_glPolygonOffset:
-        glPolygonOffset(F(0), F(1));
-        break;
-    case FEnum_glLineWidth:
-        glLineWidth(F(0));
-        break;
-    case FEnum_glLineStipple:
-        glLineStipple(U(0), U(1));
-        break;
-    case FEnum_glPointSize:
-        glPointSize(F(0));
-        break;
-    case FEnum_glShadeModel:
-        glShadeModel(U(0));
-        break;
-    case FEnum_glNormal3f:
-        glNormal3f(F(0), F(1), F(2));
-        break;
-    case FEnum_glColorMaterial:
-        glColorMaterial(U(0), U(1));
-        break;
-    case FEnum_glFogf:
-        glFogf(U(0), F(1));
-        break;
-    case FEnum_glLightModelf:
-        glLightModelf(U(0), F(1));
-        break;
-    case FEnum_glLightf:
-        glLightf(U(0), U(1), F(2));
-        break;
-    case FEnum_glMaterialf:
-        glMaterialf(U(0), U(1), F(2));
-        break;
-    case FEnum_glTexGenf:
-        glTexGenf(U(0), U(1), F(2));
-        break;
-    case FEnum_glBlendFunc:
-        glBlendFunc(U(0), U(1));
-        break;
-    case FEnum_glVertex2f:
-        glVertex2f(F(0), F(1));
-        break;
-    case FEnum_glTexCoord2f:
-        glTexCoord2f(F(0), F(1));
-        break;
-    case FEnum_glTexCoord4f:
-        glTexCoord4f(F(0), F(1), F(2), F(3));
-        break;
-    case FEnum_glVertex3f:
-        glVertex3f(F(0), F(1), F(2));
-        break;
-    case FEnum_glVertex4f:
-        glVertex4f(F(0), F(1), F(2), F(3));
-        break;
-    case FEnum_glSecondaryColor3f:
-        glSecondaryColor3f(F(0), F(1), F(2));
-        break;
-    case FEnum_glColor3f:
-        glColor3f(F(0), F(1), F(2));
-        break;
-    case FEnum_glColor4f:
-        glColor4f(F(0), F(1), F(2), F(3));
-        break;
-    case FEnum_glTranslatef:
-        glTranslatef(F(0), F(1), F(2));
-        break;
-    case FEnum_glScalef:
-        glScalef(F(0), F(1), F(2));
-        break;
-    case FEnum_glRotatef:
-        glRotatef(F(0), F(1), F(2), F(3));
-        break;
-    case FEnum_glOrtho:
-        glOrtho(D(0), D(2), D(4), D(6), D(8), D(10));
-        break;
-    case FEnum_glFrustum:
-        glFrustum(D(0), D(2), D(4), D(6), D(8), D(10));
-        break;
-    case FEnum_glLoadMatrixd:
-    case FEnum_glMultMatrixd:
-        for (i = 0; i < 16; i++) {
-            wide_matrix[i] = D(i * 2);
-        }
-        if (fn == FEnum_glLoadMatrixd) {
-            glLoadMatrixd(wide_matrix);
-        } else {
-            glMultMatrixd(wide_matrix);
-        }
-        break;
-    case FEnum_glLoadMatrixf:
-    case FEnum_glMultMatrixf:
-        for (i = 0; i < 16; i++) {
-            matrix[i] = F(i);
-        }
-        if (fn == FEnum_glLoadMatrixf) {
-            glLoadMatrixf(matrix);
-        } else {
-            glMultMatrixf(matrix);
-        }
-        break;
+    default:
+        return JRG_GL_ERROR_UNSUPPORTED;
     }
     return 0;
+}
+
+uint32_t jrg_gl_call(JrgGLContext *c, uint32_t fn, const uint8_t *args)
+{
+    uint32_t words = jrg_gl_function_words(fn);
+    if (words > 32) {
+        return JRG_GL_ERROR_UNSUPPORTED;
+    }
+    return dreamgpu_gl_scalar(&c->platform->gl_api, &c->in_begin,
+                              scalar_resource, c, fn, args, words * 4);
 }
 #undef U
 #undef F
