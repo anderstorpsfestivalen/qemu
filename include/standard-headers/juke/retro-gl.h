@@ -5,6 +5,7 @@
 #define JRG_CAP_GL_TRANSPORT       0x100
 #define JRG_CAP_GL_FRONT_BUFFERS   0x200
 #define JRG_CAP_GL_PRESENT_BOUNDS  0x400
+#define JRG_CAP_GL_BULK_READBACK   0x800
 #define JRG_IRQ_GL_COMPLETION      0x02
 #define JRG_GL_REG_VERSION         0x1100
 #define JRG_GL_REG_ADDR_LO         0x1104
@@ -106,7 +107,7 @@
  * Mismatch rejects before exchange/export, never enters desktop composition.
  * Combine with normal, FRONT_ONLY or NO_EXPORT presentation semantics. */
 #define JRG_GL_PRESENT_BOUNDED     16
-#define JRG_GL_READ_PIXELS_MAX     128
+#define JRG_GL_READ_PIXELS_MAX     16384
 /* QUERY glReadPixels has three normalized words: nonnegative x, y, and
  * width | (height << 16). Nonempty rectangles contain <=128 pixels and must
  * fit the selected drawable. Result INT words contain canonical RGBA8 bytes
@@ -185,6 +186,15 @@
 #define JRG_GL_MAX_TEXTURE_BYTES    0x10000000
 #define JRG_GL_MAX_TEXTURE_LEVEL    11
 
+/* TexImage1D/TexSubImage1D use the same eight-word image/tile DATA shape
+ * as their 2D counterparts, with target TEXTURE_1D, height1 and tile yoffset0.
+ * Targets bind independent objects; an existing name cannot change targets.
+ * GetTexImage QUERY arguments: target, level, first_pixel. Each result is128
+ * canonical little-endian RGBA8 pixels (RESULT_INT,512bytes), zero-padded at
+ * level end. The public wrapper applies packing and requested color format.
+ * First-pixel0 starts a fresh bounded snapshot; writes invalidate its version.
+ */
+
 /* Client arrays are copied at draw time, never retained as guest pointers.
  * DrawArrays scalar words: mode, first(0), vertex_count, enabled attributes.
  * DrawElements: mode, index_count, index_type, vertex_count, attributes.
@@ -203,7 +213,13 @@
 #define JRG_GL_ARRAY_COLOR           2
 #define JRG_GL_ARRAY_NORMAL          4
 #define JRG_GL_ARRAY_TEXCOORD        8
-#define JRG_GL_ARRAY_MASK            15
+#define JRG_GL_ARRAY_SECONDARY       16
+#define JRG_GL_ARRAY_MASK            31
+/* Existing vertices remain64bytes; secondary color appends RGB and zero pad. */
+#define JRG_GL_VERTEX_SECONDARY      64
+#define JRG_GL_VERTEX_SECONDARY_PAD  76
+#define JRG_GL_VERTEX_SECONDARY_BYTES 80
+#define JRG_GL_VERTEX_SIZE(mask) (((mask) & JRG_GL_ARRAY_SECONDARY) ? JRG_GL_VERTEX_SECONDARY_BYTES : JRG_GL_VERTEX_BYTES)
 #define JRG_GL_MAX_VERTICES          65536
 #define JRG_GL_MAX_INDICES           262144
 
@@ -218,6 +234,9 @@
  */
 #define JRG_GL_QUERY_BYTES           48
 #define JRG_GL_MAX_RESULT_BYTES      512
+#define JRG_GL_MAX_READBACK_BYTES    65536
+/* GetTexImage: level low16, optional pixel count high16; zero keeps legacy128. */
+#define JRG_GL_TEXTURE_READ_COUNT_SHIFT 16
 #define JRG_GL_RESULT_BOOL           1
 #define JRG_GL_RESULT_INT            2
 #define JRG_GL_RESULT_FLOAT          3

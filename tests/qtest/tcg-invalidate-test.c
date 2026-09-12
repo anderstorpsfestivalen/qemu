@@ -208,6 +208,85 @@ static void guest_spanning_write(Fixture *f, gconstpointer unused)
     run_function(f, 0x2ffe, 0x5634);
 }
 
+/* A page's former data bucket can gain translated code. A cached negative
+ * coverage result must not survive that TB insertion. */
+static void guest_new_code(Fixture *f, gconstpointer unused)
+{
+    static const uint8_t patch[] = {
+        0xc6, 0x06, 0x01, 0x28, 0x78, /* mov byte [0x2801], 0x78 */
+        0xb8, 0x00, 0x00,
+        0xc3,
+    };
+    unsigned before;
+
+    function(f, 0x2800, 0x1234);
+    qtest_memwrite(f->qts, 0x2100, patch, sizeof(patch));
+    run_function(f, 0x2100, 0); /* The target is still data. */
+    run_function(f, 0x2800, 0x1278); /* Now the target has a TB. */
+    qtest_writeb(f->qts, 0x2104, 0x56);
+    before = invalidations(f);
+    run_function(f, 0x2100, 0);
+    g_assert_cmpuint(invalidations(f), >, before);
+    run_function(f, 0x2800, 0x1256);
+}
+
+/* Execute a spanning instruction whose two virtual pages alias one physical
+ * page. Both the slow physical writer and the guest NOTDIRTY writer must
+ * invalidate its second-page bytes, even though it has only one page-list link. */
+static void aliased_pages(Fixture *f, gconstpointer unused)
+{
+    static const uint8_t enter_paging[] = {
+        0xfa, 0x31, 0xc0, 0x8e, 0xd8, /* cli; zero ds */
+        0x0f, 0x01, 0x16, 0x00, 0xc0, /* lgdt [0xc000] */
+        0x66, 0xb8, 0x00, 0x90, 0x00, 0x00, /* mov eax,0x9000 */
+        0x0f, 0x22, 0xd8,             /* mov cr3,eax */
+        0x0f, 0x20, 0xc0,             /* mov eax,cr0 */
+        0x66, 0x0d, 0x01, 0x00, 0x00, 0x80, /* or eax,PG|PE */
+        0x0f, 0x22, 0xc0,             /* mov cr0,eax */
+        0xea, 0x00, 0x11, 0x08, 0x00, /* jmp 8:0x1100 */
+    };
+    static const uint8_t dispatch[] = {
+        0xfa, 0xb8, 0x10, 0x00,       /* cli; data selector16 */
+        0x8e, 0xd8, 0x8e, 0xd0, 0xbc, 0x00, 0x80,
+        0x8b, 0x1e, 0x00, 0x08, 0x3b, 0x1e, 0x02, 0x08, 0x74, 0xf6,
+        0xff, 0x16, 0x04, 0x08, 0xa3, 0x06, 0x08,
+        0x89, 0x1e, 0x02, 0x08, 0xeb, 0xe9,
+    };
+    static const uint8_t gdt[] = {
+        0,0,0,0,0,0,0,0,
+        0xff,0xff,0,0,0,0x9a,0x8f,0, /* 16bit code,4GiB limit */
+        0xff,0xff,0,0,0,0x92,0x8f,0,
+    };
+    static const uint8_t patch[] = {
+        0xc6,0x06,0x00,0x30,0x78, /* mov byte [0x3000],0x78 */
+        0xb8,0,0,0xc3,
+    };
+    unsigned before;
+
+    qtest_memset(f->qts, 0x9000, 0, 4096);
+    qtest_writel(f->qts, 0x9000, 0xa003);
+    for (unsigned i = 0; i < 1024; ++i) {
+        qtest_writel(f->qts, 0xa000 + i * 4, (i == 3 ? 0x2000 : i * 4096) | 3);
+    }
+    qtest_memwrite(f->qts, 0xb000, gdt, sizeof(gdt));
+    qtest_writew(f->qts, 0xc000, sizeof(gdt) - 1);
+    qtest_writel(f->qts, 0xc002, 0xb000);
+    qtest_memwrite(f->qts, 0x1000, enter_paging, sizeof(enter_paging));
+    qtest_memwrite(f->qts, 0x1100, dispatch, sizeof(dispatch));
+    qtest_memwrite(f->qts, 0x2ffe, "\xb8\x34", 2);
+    qtest_memwrite(f->qts, 0x2000, "\x12\xc3", 2);
+    qtest_memwrite(f->qts, 0x4100, patch, sizeof(patch));
+    run_function(f, 0x2ffe, 0x1234);
+    before = invalidations(f);
+    qtest_writeb(f->qts, 0x2000, 0x56);
+    g_assert_cmpuint(invalidations(f), >, before);
+    run_function(f, 0x2ffe, 0x5634);
+    before = invalidations(f);
+    run_function(f, 0x4100, 0);
+    g_assert_cmpuint(invalidations(f), >, before);
+    run_function(f, 0x2ffe, 0x7834);
+}
+
 static void concurrent_writes(Fixture *f, gconstpointer unused)
 {
     static const uint8_t code[] = {
@@ -257,6 +336,14 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     if (qtest_has_accel("tcg")) {
+        qtest_add("tcg/invalidate/aliased-pages", Fixture, "single",
+                  setup, aliased_pages, teardown);
+        qtest_add("tcg/invalidate/aliased-pages-mttcg", Fixture, "multi",
+                  setup, aliased_pages, teardown);
+        qtest_add("tcg/invalidate/guest-new-code", Fixture, "single",
+                  setup, guest_new_code, teardown);
+        qtest_add("tcg/invalidate/guest-new-code-mttcg", Fixture, "multi",
+                  setup, guest_new_code, teardown);
         qtest_add("tcg/invalidate/same-page", Fixture, "single",
                   setup, same_page, teardown);
         qtest_add("tcg/invalidate/multiple-pages", Fixture, "single",

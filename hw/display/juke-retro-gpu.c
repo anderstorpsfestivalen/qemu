@@ -18,10 +18,12 @@
 #include "standard-headers/juke/retro-gl.h"
 #ifdef CONFIG_JUKE_RETRO_GL
 #include "juke-retro-gl.h"
+#include "juke-retro-gl-platform.h"
 #endif
 #include "vga_int.h"
 #include "ui/juke-shmem.h"
 #include "trace.h"
+#include "juke-retro-diagnostics.h"
 
 #define TYPE_JUKE_RETRO_GPU "qemu-retro-gpu"
 OBJECT_DECLARE_SIMPLE_TYPE(JukeRetroGPU, JUKE_RETRO_GPU)
@@ -49,6 +51,8 @@ struct JukeRetroGPU {
     uint32_t cursor_status, cursor_completed, cursor_error;
     uint8_t commands[JRG_MAX_COMMANDS * JRG_COMMAND_BYTES];
     char *gpu_socket;
+    bool diagnostics_enabled;
+    JrgDiagnostics *diagnostics;
 #ifdef CONFIG_JUKE_RETRO_GL
     JrgGLEngine *gl;
     QEMUBH *gl_bh;
@@ -288,7 +292,7 @@ static bool jrg_result_ram(JukeRetroGPU *s, uint64_t address, uint32_t bytes)
     hwaddr translated, length = bytes;
     MemoryRegion *mr;
 
-    if (!bytes || bytes > JRG_GL_MAX_RESULT_BYTES ||
+    if (!bytes || bytes > JRG_GL_MAX_READBACK_BYTES ||
         address > UINT64_MAX - bytes) {
         return false;
     }
@@ -384,6 +388,7 @@ static void jrg_gl_completed_bh(void *opaque)
     }
     while (s->gl && jrg_gl_engine_completion(s->gl, &done)) {
         if (done.generation != s->generation) {
+            g_free(done.bulk_result);
             continue;
         }
         if (!done.reset) {
@@ -393,7 +398,7 @@ static void jrg_gl_completed_bh(void *opaque)
                     !jrg_result_ram(s, s->gl_active_result_address,
                                      done.result_bytes) ||
                     pci_dma_write(&s->parent_obj, s->gl_active_result_address,
-                                   done.result, done.result_bytes) !=
+                                   done.bulk_result ? done.bulk_result : done.result, done.result_bytes) !=
                     MEMTX_OK) {
                     done.error = JRG_GL_ERROR_DMA;
                 } else {
@@ -406,6 +411,7 @@ static void jrg_gl_completed_bh(void *opaque)
         if (!done.resources_live && !(s->gl_status & JRG_STATUS_BUSY)) {
             migrate_del_blocker(&s->gl_blocker);
         }
+        g_free(done.bulk_result);
     }
 }
 
@@ -478,7 +484,7 @@ static void jrg_gl_submit(JukeRetroGPU *s)
         uint64_t result_address = ((uint64_t)s->gl_result_addr_hi << 32) |
                                  s->gl_result_addr_lo;
         if (s->gl_result_capacity < required ||
-            s->gl_result_capacity > JRG_GL_MAX_RESULT_BYTES) {
+            s->gl_result_capacity > JRG_GL_MAX_READBACK_BYTES) {
             jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_BATCH);
             return;
         }
@@ -489,8 +495,15 @@ static void jrg_gl_submit(JukeRetroGPU *s)
         s->gl_active_result_address = result_address;
         s->gl_active_result_capacity = s->gl_result_capacity;
     }
+    if (s->diagnostics_enabled) {
+        s->diagnostics->batches++;
+        s->diagnostics->bytes += s->gl_bytes;
+    }
     for (size_t offset = 0; offset < s->gl_bytes;) {
         const uint8_t *r = data + offset;
+        if (s->diagnostics_enabled) {
+            jrg_diagnostic_record(s->diagnostics, r);
+        }
         if (cmd_word(r, JRG_GL_OFF_OP) == JRG_GL_DESKTOP &&
             (s->vga.vbe_regs[VBE_DISPI_INDEX_BPP] != 32 ||
              (s->status & JRG_STATUS_BUSY))) {
@@ -822,6 +835,9 @@ static void jrg_engine_reset(JukeRetroGPU *s)
 static uint64_t jrg_read(void *opaque, hwaddr addr, unsigned size)
 {
     JukeRetroGPU *s = opaque;
+    if (s->diagnostics_enabled && addr + JRG_REG_MAGIC < JRG_MMIO_SIZE) {
+        s->diagnostics->reads[(addr + JRG_REG_MAGIC) / 4]++;
+    }
 
     if (addr + JRG_REG_MAGIC >= JRG_CURSOR_REG_VERSION &&
         addr + JRG_REG_MAGIC <= JRG_CURSOR_REG_MAX_DIMENSION) {
@@ -842,7 +858,7 @@ static uint64_t jrg_read(void *opaque, hwaddr addr, unsigned size)
 #ifdef CONFIG_JUKE_RETRO_GL
                | (s->gpu_socket && *s->gpu_socket ?
                   JRG_CAP_GL_TRANSPORT | JRG_CAP_GL_FRONT_BUFFERS |
-                  JRG_CAP_GL_PRESENT_BOUNDS : 0)
+                  JRG_CAP_GL_PRESENT_BOUNDS | JRG_CAP_GL_BULK_READBACK : 0)
 #endif
                ;
     case JRG_REG_VRAM_SIZE: return s->vga.vram_size;
@@ -865,6 +881,9 @@ static uint64_t jrg_read(void *opaque, hwaddr addr, unsigned size)
 static void jrg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
     JukeRetroGPU *s = opaque;
+    if (s->diagnostics_enabled && addr + JRG_REG_MAGIC < JRG_MMIO_SIZE) {
+        s->diagnostics->writes[(addr + JRG_REG_MAGIC) / 4]++;
+    }
 
     if (addr + JRG_REG_MAGIC >= JRG_CURSOR_REG_VERSION &&
         addr + JRG_REG_MAGIC <= JRG_CURSOR_REG_MAX_DIMENSION) {
@@ -1125,6 +1144,99 @@ static void jrg_realize(PCIDevice *dev, Error **errp)
     pci_set_byte(dev->config + PCI_INTERRUPT_PIN, 1);
 }
 
+/* Diagnostics are host control state, deliberately not part of VM migration.
+ * Enabling starts a fresh bounded window; disabling freezes it for inspection. */
+static bool jrg_diagnostics_get(Object *obj, Error **errp)
+{
+    return JUKE_RETRO_GPU(obj)->diagnostics_enabled;
+}
+
+static void jrg_diagnostics_set(Object *obj, bool enabled, Error **errp)
+{
+    JukeRetroGPU *s = JUKE_RETRO_GPU(obj);
+    if (enabled) {
+        if (!s->diagnostics) {
+            s->diagnostics = g_new0(JrgDiagnostics, 1);
+        } else {
+            memset(s->diagnostics, 0, sizeof(*s->diagnostics));
+        }
+        s->diagnostics->start_us = g_get_monotonic_time();
+    } else if (s->diagnostics_enabled) {
+        s->diagnostics->elapsed_us = g_get_monotonic_time() - s->diagnostics->start_us;
+    }
+    s->diagnostics_enabled = enabled;
+}
+
+static char *jrg_diagnostics_stats(Object *obj, Error **errp)
+{
+    JukeRetroGPU *s = JUKE_RETRO_GPU(obj);
+    const JrgDiagnostics *d = s->diagnostics;
+    GString *out = g_string_new(NULL);
+    bool comma = false;
+    g_string_append_printf(out, "{\"schema\":1,\"enabled\":%s,\"elapsed_us\":%" PRIu64 ",\"mmio\":[",
+        s->diagnostics_enabled ? "true" : "false", d ? (s->diagnostics_enabled ?
+            (uint64_t)g_get_monotonic_time() - d->start_us : d->elapsed_us) : 0);
+    if (d) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(d->reads); i++) {
+            if (!d->reads[i] && !d->writes[i]) {
+                continue;
+            }
+            g_string_append_printf(out, "%s{\"offset\":%u,\"reads\":%" PRIu64 ",\"writes\":%" PRIu64 "}",
+                comma ? "," : "", i * 4, d->reads[i], d->writes[i]);
+            comma = true;
+        }
+    }
+    g_string_append_printf(out, "],\"gl\":{\"batches\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"records\":%" PRIu64 ",\"operations\":[",
+        d ? d->batches : 0, d ? d->bytes : 0, d ? d->records : 0);
+    comma = false;
+    if (d) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(d->operations); i++) {
+            if (d->operations[i]) {
+                g_string_append_printf(out, "%s{\"op\":%u,\"count\":%" PRIu64 "}", comma ? "," : "", i, d->operations[i]);
+                comma = true;
+            }
+        }
+    }
+    g_string_append(out, "],\"functions\":[");
+    comma = false;
+    if (d) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(d->functions); i++) {
+            if (d->functions[i]) {
+                g_string_append_printf(out, "%s{\"function\":%u,\"count\":%" PRIu64 "}", comma ? "," : "", i, d->functions[i]);
+                comma = true;
+            }
+        }
+    }
+    g_string_append(out, "],\"desktop\":[");
+    comma = false;
+    if (d) {
+        for (unsigned i = 0; i < G_N_ELEMENTS(d->desktop); i++) {
+            if (d->desktop[i]) {
+                g_string_append_printf(out, "%s{\"op\":%u,\"count\":%" PRIu64 ",\"rectangle_bytes\":%" PRIu64 "}",
+                    comma ? "," : "", i, d->desktop[i], d->desktop_bytes[i]);
+                comma = true;
+            }
+        }
+    }
+    g_string_append(out, "],\"queries\":[");
+    if (d) {
+        for (unsigned i = 0; i < d->query_count; i++) {
+            const JrgDiagnosticQuery *q = &d->queries[i];
+            g_string_append_printf(out, "%s{\"function\":%u,\"arg0\":%u,\"arg1\":%u,\"count\":%" PRIu64 "}",
+                i ? "," : "", q->function, q->arg0, q->arg1, q->count);
+        }
+    }
+    g_string_append_printf(out, "],\"query_overflow\":%" PRIu64 ",\"function_overflow\":%" PRIu64 "}}",
+        d ? d->query_overflow : 0, d ? d->function_overflow : 0);
+    return g_string_free(out, false);
+}
+
+static void jrg_instance_init(Object *obj)
+{
+    object_property_add_bool(obj, "diagnostic-counters", jrg_diagnostics_get, jrg_diagnostics_set);
+    object_property_add_str(obj, "diagnostic-stats", jrg_diagnostics_stats, NULL);
+}
+
 static const Property jrg_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", JukeRetroGPU, vga.vram_size_mb, 16),
     DEFINE_PROP_STRING("gpu-socket", JukeRetroGPU, gpu_socket),
@@ -1169,12 +1281,14 @@ static void jrg_finalize(Object *obj)
     if (s->work_bh) {
         qemu_bh_delete(s->work_bh);
     }
+    g_free(s->diagnostics);
 }
 
 static const TypeInfo jrg_info = {
     .name = TYPE_JUKE_RETRO_GPU,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(JukeRetroGPU),
+    .instance_init = jrg_instance_init,
     .instance_finalize = jrg_finalize,
     .class_init = jrg_class_init,
     .interfaces = (const InterfaceInfo[]) {

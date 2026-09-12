@@ -39,6 +39,7 @@
 #define runstate_is_running()  true
 #else
 #include "system-page-protection.h"
+#include "tb-code-bitmap.h"
 #include "system/runstate.h"
 #endif
 #include "trace.h"
@@ -191,6 +192,9 @@ struct PageDesc {
     QemuSpin lock;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb;
+    /* Protected by lock. Stale set bits are harmless; additions must be exact
+     * or conservative. Cleared only when the page's TB list becomes empty. */
+    uint64_t code_bitmap;
 };
 
 void page_table_config_init(void)
@@ -672,6 +676,7 @@ static void tb_remove_all_1(int level, void **lp)
         for (i = 0; i < V_L2_SIZE; ++i) {
             page_lock(&pd[i]);
             pd[i].first_tb = (uintptr_t)NULL;
+            pd[i].code_bitmap = 0;
             page_unlock(&pd[i]);
         }
     } else {
@@ -705,6 +710,24 @@ static void tb_page_add(PageDesc *p, TranslationBlock *tb, unsigned int n)
     tb->page_next[n] = p->first_tb;
     page_already_protected = p->first_tb != 0;
     p->first_tb = (uintptr_t)tb | n;
+    /* Match each physical page's contribution, including a TB whose second
+     * page is physically non-contiguous with the first. */
+    tb_page_addr_t start = tb_page_addr0(tb);
+    tb_page_addr_t last = start + tb->size - 1;
+    if (n == 0) {
+        tb_page_addr_t second = tb_page_addr1(tb);
+        /* Two virtual pages may alias this same physical page. tb_record()
+         * then adds only list entry0, which must cover both contributions. */
+        if (second != -1 && ((second ^ start) & TARGET_PAGE_MASK) == 0) {
+            p->code_bitmap |= tb_code_range_mask(TARGET_PAGE_BITS, second,
+                                                 second + (last & ~TARGET_PAGE_MASK));
+        }
+        last = MIN(last, start | ~TARGET_PAGE_MASK);
+    } else {
+        start = tb_page_addr1(tb);
+        last = start + (last & ~TARGET_PAGE_MASK);
+    }
+    p->code_bitmap |= tb_code_range_mask(TARGET_PAGE_BITS, start, last);
 
     /*
      * If some code is already present, then the pages are already
@@ -741,6 +764,9 @@ static void tb_page_remove(PageDesc *pd, TranslationBlock *tb)
     PAGE_FOR_EACH_TB(unused, unused, pd, tb1, n1) {
         if (tb1 == tb) {
             *pprev = tb1->page_next[n1];
+            if (!pd->first_tb) {
+                pd->code_bitmap = 0;
+            }
             return;
         }
         pprev = &tb1->page_next[n1];
@@ -1107,6 +1133,11 @@ static bool tb_overlaps_phys_range(const TranslationBlock *tb, int n,
 
     /* A TB can span two non-contiguous physical pages. */
     if (n == 0) {
+        tb_page_addr_t second = tb_page_addr1(tb);
+        if (second != -1 && ((second ^ tb_start) & TARGET_PAGE_MASK) == 0 &&
+            !(second + (tb_last & ~TARGET_PAGE_MASK) < start || second > last)) {
+            return true;
+        }
         tb_last = MIN(tb_last, tb_start | ~TARGET_PAGE_MASK);
     } else {
         tb_start = tb_page_addr1(tb);
@@ -1237,6 +1268,19 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
          */
         assert_no_pages_locked();
         page_lock(p);
+        if (!p->first_tb) {
+            tlb_unprotect_code(start);
+            page_unlock(p);
+            return;
+        }
+        /* Most writes on mixed code/data pages are far from any code. Avoid
+         * walking every TB for these writes, without relaxing page locking,
+         * code protection or the precise self-modifying-code fallback. */
+        if (!(p->code_bitmap &
+              tb_code_range_mask(TARGET_PAGE_BITS, start, last))) {
+            page_unlock(p);
+            return;
+        }
         PAGE_FOR_EACH_TB(start, last, p, tb, n) {
             if (tb_overlaps_phys_range(tb, n, start, last)) {
                 break;
