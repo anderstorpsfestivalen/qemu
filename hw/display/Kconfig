@@ -53,7 +53,7 @@ config VGA_ISA
     depends on ISA_BUS
     select VGA
 
-config JUKE_RETRO_GPU
+config DREAMGPU
     bool
     default y if PCI_DEVICES && PC_PCI
     depends on PCI

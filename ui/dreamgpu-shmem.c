@@ -1,8 +1,8 @@
 /*
- * Juke Shared Memory Display Backend
+ * DreamGPU Shared Memory Display Backend
  *
  * Leased framebuffer snapshots with socket notifications and input.
- * QEMU publishes immutable shared-memory slots; Juke leases them through upload.
+ * QEMU publishes immutable shared-memory slots; DreamGPU leases them through upload.
  * Input is consumed by the main-loop socket handler independently of refresh.
  *
  * Copyright (c) 2024 Anderstorpsfestivalen
@@ -16,7 +16,7 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "ui/console.h"
-#include "ui/juke-shmem.h"
+#include "ui/dreamgpu-shmem.h"
 #include "ui/surface.h"
 #include "ui/input.h"
 #include "qemu/bswap.h"
@@ -43,72 +43,72 @@
 #endif
 
 /* Input event types - must match Rust side */
-#define JUKE_INPUT_MOUSE_REL    1
-#define JUKE_INPUT_MOUSE_ABS    2
-#define JUKE_INPUT_MOUSE_BTN    3
-#define JUKE_INPUT_KEY          4
-#define JUKE_INPUT_REFRESH_INTERVAL_MS 1
-#define JUKE_INPUT_REFRESH_WINDOW_US 12000
+#define DREAMGPU_INPUT_MOUSE_REL    1
+#define DREAMGPU_INPUT_MOUSE_ABS    2
+#define DREAMGPU_INPUT_MOUSE_BTN    3
+#define DREAMGPU_INPUT_KEY          4
+#define DREAMGPU_INPUT_REFRESH_INTERVAL_MS 1
+#define DREAMGPU_INPUT_REFRESH_WINDOW_US 12000
 
 /* Protocol v5. Geometry is immutable for each mmap epoch. Published slots
  * are immutable until the consumer releases its lease. Pixel planes have
  * independently importable, page-aligned storage for no-copy GPU sampling. */
-#define JUKE_INPUT_RESET 5
-#define JUKE_INPUT_REFRESH 6
-#define JUKE_CURSOR_MAX_SIZE 64
-#define JUKE_CURSOR_MAX_PIXELS (JUKE_CURSOR_MAX_SIZE * JUKE_CURSOR_MAX_SIZE)
-#define JUKE_SHMEM_MAGIC 0x454B554A
-#define JUKE_SHMEM_VERSION 5
-#define JUKE_ROW_ALIGNMENT 256
-#define JUKE_PLANE_ALIGNMENT 65536
-#define JUKE_SLOT_COUNT 3
-#define JUKE_SLOT_FREE 0
-#define JUKE_SLOT_WRITING 1
-#define JUKE_SLOT_READY 2
-#define JUKE_SLOT_READING 3
+#define DREAMGPU_INPUT_RESET 5
+#define DREAMGPU_INPUT_REFRESH 6
+#define DREAMGPU_CURSOR_MAX_SIZE 64
+#define DREAMGPU_CURSOR_MAX_PIXELS (DREAMGPU_CURSOR_MAX_SIZE * DREAMGPU_CURSOR_MAX_SIZE)
+#define DREAMGPU_SHMEM_MAGIC 0x454B554A
+#define DREAMGPU_SHMEM_VERSION 5
+#define DREAMGPU_ROW_ALIGNMENT 256
+#define DREAMGPU_PLANE_ALIGNMENT 65536
+#define DREAMGPU_SLOT_COUNT 3
+#define DREAMGPU_SLOT_FREE 0
+#define DREAMGPU_SLOT_WRITING 1
+#define DREAMGPU_SLOT_READY 2
+#define DREAMGPU_SLOT_READING 3
 
-typedef struct JukeInputEvent {
+typedef struct DreamGpuInputEvent {
     uint8_t type, button, pressed, reserved;
     int32_t x, y;
     uint32_t padding;
     uint64_t id;
-} JukeInputEvent;
+} DreamGpuInputEvent;
 
-typedef struct JukeShmemHeader {
+typedef struct DreamGpuShmemHeader {
     uint32_t magic, version, width, height, stride, format;
     uint64_t frame_counter;
     uint32_t reserved[12]; /* retain geometry prefix for diagnostic clients */
     uint32_t slots[3];
     uint32_t padding;
-} JukeShmemHeader;
+} DreamGpuShmemHeader;
 
-typedef struct JukeFrameMeta {
+typedef struct DreamGpuFrameMeta {
     uint64_t generation, published_us, input_id;
     uint32_t cursor_version;
     int32_t cursor_x, cursor_y;
     uint32_t cursor_visible, cursor_width, cursor_height;
     int32_t cursor_hot_x, cursor_hot_y;
-    uint32_t cursor[JUKE_CURSOR_MAX_PIXELS];
-} JukeFrameMeta;
+    uint32_t cursor[DREAMGPU_CURSOR_MAX_PIXELS];
+} DreamGpuFrameMeta;
 
 /* Every socket message is 24 bytes, including SCM_RIGHTS epoch messages. */
-typedef struct JukeMessage {
+typedef struct DreamGpuMessage {
     uint8_t kind, padding[7];
     uint64_t id, timestamp_us;
-} JukeMessage;
+} DreamGpuMessage;
 
-G_STATIC_ASSERT(sizeof(JukeInputEvent) == 24);
-G_STATIC_ASSERT(sizeof(JukeMessage) == 24);
-G_STATIC_ASSERT(sizeof(JukeShmemHeader) == 96);
-G_STATIC_ASSERT(sizeof(JukeFrameMeta) == 16440);
-#define JUKE_PIXEL_BASE QEMU_ALIGN_UP(sizeof(JukeShmemHeader) + \
-    JUKE_SLOT_COUNT * sizeof(JukeFrameMeta), JUKE_PLANE_ALIGNMENT)
-G_STATIC_ASSERT(JUKE_PIXEL_BASE == 65536);
+G_STATIC_ASSERT(sizeof(DreamGpuInputEvent) == 24);
+G_STATIC_ASSERT(sizeof(DreamGpuMessage) == 24);
+G_STATIC_ASSERT(sizeof(DreamGpuShmemHeader) == 96);
+G_STATIC_ASSERT(sizeof(DreamGpuFrameMeta) == 16440);
+#define DREAMGPU_PIXEL_BASE QEMU_ALIGN_UP(sizeof(DreamGpuShmemHeader) + \
+    DREAMGPU_SLOT_COUNT * sizeof(DreamGpuFrameMeta), DREAMGPU_PLANE_ALIGNMENT)
+G_STATIC_ASSERT(DREAMGPU_PIXEL_BASE == 65536);
 
-typedef struct JukeShmemState {
+typedef struct DreamGpuShmemState {
     DisplayChangeListener dcl;
     DisplaySurface *surface;
-    JukeShmemHeader *shmem;
+    DreamGpuShmemHeader *shmem;
     size_t shmem_size;
     size_t plane_size;
     int shmem_fd;
@@ -118,28 +118,28 @@ typedef struct JukeShmemState {
     int32_t mouse_x, mouse_y;
     bool mouse_initialized;
     uint64_t generation, input_id, epoch;
-    JukeFrameMeta cursor;
-    uint8_t input_bytes[sizeof(JukeInputEvent)];
+    DreamGpuFrameMeta cursor;
+    uint8_t input_bytes[sizeof(DreamGpuInputEvent)];
     size_t input_used;
     bool held_keys[256], held_buttons[INPUT_BUTTON__MAX];
-    JukeMessage deferred_ack;
+    DreamGpuMessage deferred_ack;
     uint8_t *cursor_shmem;
     int cursor_fd;
     bool cursor_fd_sent, cursor_shape_dirty, cursor_notify_shape;
     bool cursor_position_dirty;
     uint64_t cursor_epoch, cursor_generation, cursor_position_sequence;
-    JukeNativeCursor native_cursor;
+    DreamGpuNativeCursor native_cursor;
     int normal_refresh_ms;
     uint64_t input_refresh_until_us;
-} JukeShmemState;
+} DreamGpuShmemState;
 
 /* The configured display has one default console. All access is under BQL. */
-static JukeShmemState *juke_active_display;
+static DreamGpuShmemState *dreamgpu_active_display;
 
-bool juke_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
+bool dreamgpu_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
                            uint64_t *generation)
 {
-    JukeShmemState *s = juke_active_display;
+    DreamGpuShmemState *s = dreamgpu_active_display;
 
     if (!s || s->dcl.con != con || !s->shmem) {
         return false;
@@ -151,20 +151,20 @@ bool juke_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
     return true;
 }
 
-static void juke_shmem_send_fd(JukeShmemState *s);
-static int juke_shmem_connect(JukeShmemState *s);
-static void juke_shmem_input_ready(void *opaque);
-static void juke_shmem_ack_ready(void *opaque);
-static void juke_shmem_cursor_publish(JukeShmemState *s);
+static void dreamgpu_shmem_send_fd(DreamGpuShmemState *s);
+static int dreamgpu_shmem_connect(DreamGpuShmemState *s);
+static void dreamgpu_shmem_input_ready(void *opaque);
+static void dreamgpu_shmem_ack_ready(void *opaque);
+static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s);
 
-static uint64_t juke_now_us(void)
+static uint64_t dreamgpu_now_us(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static void juke_shmem_release_input(JukeShmemState *s, bool all)
+static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all)
 {
     for (int i = 0; i < 256; i++) {
         if (s->held_keys[i] || (all && qemu_input_key_number_to_linux(i))) {
@@ -181,7 +181,7 @@ static void juke_shmem_release_input(JukeShmemState *s, bool all)
     qemu_input_event_sync();
 }
 
-static void juke_shmem_disconnect(JukeShmemState *s)
+static void dreamgpu_shmem_disconnect(DreamGpuShmemState *s)
 {
     if (s->client_fd >= 0) {
         qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
@@ -192,15 +192,15 @@ static void juke_shmem_disconnect(JukeShmemState *s)
     s->cursor_fd_sent = false;
     s->input_used = 0;
     s->deferred_ack.kind = 0;
-    juke_shmem_release_input(s, false);
+    dreamgpu_shmem_release_input(s, false);
 }
 
-static void juke_shmem_notify(JukeShmemState *s, uint8_t kind,
+static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind,
                               uint64_t id, uint64_t timestamp)
 {
-    JukeMessage msg = { .kind = kind, .id = id, .timestamp_us = timestamp };
+    DreamGpuMessage msg = { .kind = kind, .id = id, .timestamp_us = timestamp };
     /* Reserved byte carries key edge for causal probe pairing. */
-    if (kind == 'A') { msg.padding[0] = s->input_bytes[0] == JUKE_INPUT_KEY ? (s->input_bytes[2] ? 1 : 2) : 0; }
+    if (kind == 'A') { msg.padding[0] = s->input_bytes[0] == DREAMGPU_INPUT_KEY ? (s->input_bytes[2] ? 1 : 2) : 0; }
     if (s->client_fd < 0 || !s->fd_sent) {
         return;
     }
@@ -210,19 +210,19 @@ static void juke_shmem_notify(JukeShmemState *s, uint8_t kind,
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (kind == 'A' && (id & (1ULL << 63))) {
             s->deferred_ack = msg;
-            qemu_set_fd_handler(s->client_fd, juke_shmem_input_ready,
-                                juke_shmem_ack_ready, s);
+            qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready,
+                                dreamgpu_shmem_ack_ready, s);
         }
         return;
     }
     if (n != sizeof(msg)) {
-        juke_shmem_disconnect(s);
+        dreamgpu_shmem_disconnect(s);
     }
 }
 
-static void juke_shmem_ack_ready(void *opaque)
+static void dreamgpu_shmem_ack_ready(void *opaque)
 {
-    JukeShmemState *s = opaque;
+    DreamGpuShmemState *s = opaque;
 
     if (s->deferred_ack.kind) {
         ssize_t n = send(s->client_fd, &s->deferred_ack,
@@ -232,17 +232,17 @@ static void juke_shmem_ack_ready(void *opaque)
             return;
         }
         if (n != sizeof(s->deferred_ack)) {
-            juke_shmem_disconnect(s);
+            dreamgpu_shmem_disconnect(s);
             return;
         }
         s->deferred_ack.kind = 0;
     }
-    qemu_set_fd_handler(s->client_fd, juke_shmem_input_ready, NULL, s);
-    juke_shmem_cursor_publish(s);
+    qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready, NULL, s);
+    dreamgpu_shmem_cursor_publish(s);
 }
 
 /* Return 1 for sent, 0 for backpressure, -1 for a disconnected stream. */
-static int juke_shmem_cursor_send(JukeShmemState *s, const uint8_t *packet,
+static int dreamgpu_shmem_cursor_send(DreamGpuShmemState *s, const uint8_t *packet,
                                    int fd)
 {
     union {
@@ -250,7 +250,7 @@ static int juke_shmem_cursor_send(JukeShmemState *s, const uint8_t *packet,
         uint8_t bytes[CMSG_SPACE(sizeof(int))];
     } control = { 0 };
     struct iovec iov = { .iov_base = (void *)packet,
-                         .iov_len = JCUR_PACKET_BYTES };
+                         .iov_len = DG_CURSOR_TRANSPORT_PACKET_BYTES };
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
 
     if (fd >= 0) {
@@ -266,33 +266,33 @@ static int juke_shmem_cursor_send(JukeShmemState *s, const uint8_t *packet,
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
         return 0;
     }
-    if (n != JCUR_PACKET_BYTES) {
-        juke_shmem_disconnect(s);
+    if (n != DG_CURSOR_TRANSPORT_PACKET_BYTES) {
+        dreamgpu_shmem_disconnect(s);
         return -1;
     }
     return 1;
 }
 
-static void juke_shmem_cursor_new_mapping(JukeShmemState *s)
+static void dreamgpu_shmem_cursor_new_mapping(DreamGpuShmemState *s)
 {
     if (s->cursor_shmem) {
-        qemu_memfd_free(s->cursor_shmem, JCUR_MAPPING_BYTES, s->cursor_fd);
+        qemu_memfd_free(s->cursor_shmem, DG_CURSOR_TRANSPORT_MAPPING_BYTES, s->cursor_fd);
     }
-    s->cursor_shmem = qemu_memfd_alloc("juke-cursor", JCUR_MAPPING_BYTES, 0,
+    s->cursor_shmem = qemu_memfd_alloc("dreamgpu-cursor", DG_CURSOR_TRANSPORT_MAPPING_BYTES, 0,
                                        &s->cursor_fd, NULL);
     s->cursor_fd_sent = false;
     if (!s->cursor_shmem) {
         s->cursor_fd = -1;
-        error_report("juke-shmem: failed to allocate native cursor mapping");
+        error_report("dreamgpu-shmem: failed to allocate native cursor mapping");
         return;
     }
-    memset(s->cursor_shmem, 0, JCUR_MAPPING_BYTES);
-    stl_le_p(s->cursor_shmem + JCUR_HDR_MAGIC, JCUR_MAGIC);
-    stl_le_p(s->cursor_shmem + JCUR_HDR_VERSION, JCUR_VERSION);
-    stl_le_p(s->cursor_shmem + JCUR_HDR_MAX_DIMENSION,
-              JRG_CURSOR_MAX_DIMENSION);
-    stl_le_p(s->cursor_shmem + JCUR_HDR_SLOT_COUNT, JCUR_SLOT_COUNT);
-    stq_le_p(s->cursor_shmem + JCUR_HDR_EPOCH, ++s->cursor_epoch);
+    memset(s->cursor_shmem, 0, DG_CURSOR_TRANSPORT_MAPPING_BYTES);
+    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_MAGIC, DG_CURSOR_TRANSPORT_MAGIC);
+    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_VERSION, DG_CURSOR_TRANSPORT_VERSION);
+    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_MAX_DIMENSION,
+              DG_CURSOR_MAX_DIMENSION);
+    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_SLOT_COUNT, DG_CURSOR_TRANSPORT_SLOT_COUNT);
+    stq_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_EPOCH, ++s->cursor_epoch);
     s->cursor_generation = 0;
     s->cursor_position_sequence = 1;
     s->cursor_shape_dirty = s->native_cursor.width != 0;
@@ -300,9 +300,9 @@ static void juke_shmem_cursor_new_mapping(JukeShmemState *s)
     s->cursor_position_dirty = true;
 }
 
-static void juke_shmem_cursor_publish(JukeShmemState *s)
+static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s)
 {
-    uint8_t packet[JCUR_PACKET_BYTES] = { 0 };
+    uint8_t packet[DG_CURSOR_TRANSPORT_PACKET_BYTES] = { 0 };
     bool writable = false;
     int sent;
 
@@ -310,10 +310,10 @@ static void juke_shmem_cursor_publish(JukeShmemState *s)
         return;
     }
     if (!s->cursor_fd_sent) {
-        packet[0] = JCUR_MSG_MAPPING;
+        packet[0] = DG_CURSOR_TRANSPORT_MSG_MAPPING;
         stq_le_p(packet + 8, s->cursor_epoch);
-        stq_le_p(packet + 16, juke_now_us());
-        sent = juke_shmem_cursor_send(s, packet, s->cursor_fd);
+        stq_le_p(packet + 16, dreamgpu_now_us());
+        sent = dreamgpu_shmem_cursor_send(s, packet, s->cursor_fd);
         if (sent <= 0) {
             writable = sent == 0;
             goto out;
@@ -322,33 +322,33 @@ static void juke_shmem_cursor_publish(JukeShmemState *s)
     }
     if (s->cursor_shape_dirty) {
         bool published = false;
-        for (unsigned i = 0; i < JCUR_SLOT_COUNT; i++) {
+        for (unsigned i = 0; i < DG_CURSOR_TRANSPORT_SLOT_COUNT; i++) {
             uint32_t *state = (uint32_t *)(s->cursor_shmem +
-                                          JCUR_HDR_SLOTS + i * 4);
+                                          DG_CURSOR_TRANSPORT_HDR_SLOTS + i * 4);
             uint32_t old = qatomic_load_acquire(state);
-            if ((old == JCUR_FREE || old == JCUR_READY) &&
-                qatomic_cmpxchg(state, old, JCUR_WRITING) == old) {
-                const JukeNativeCursor *c = &s->native_cursor;
-                uint8_t *slot = s->cursor_shmem + JCUR_HEADER_BYTES +
-                                i * JCUR_SLOT_BYTES;
+            if ((old == DG_CURSOR_TRANSPORT_FREE || old == DG_CURSOR_TRANSPORT_READY) &&
+                qatomic_cmpxchg(state, old, DG_CURSOR_TRANSPORT_WRITING) == old) {
+                const DreamGpuNativeCursor *c = &s->native_cursor;
+                uint8_t *slot = s->cursor_shmem + DG_CURSOR_TRANSPORT_HEADER_BYTES +
+                                i * DG_CURSOR_TRANSPORT_SLOT_BYTES;
 
-                memset(slot, 0, JCUR_SLOT_BYTES);
-                stq_le_p(slot + JCUR_SLOT_GENERATION, ++s->cursor_generation);
-                stl_le_p(slot + JCUR_SLOT_WIDTH, c->width);
-                stl_le_p(slot + JCUR_SLOT_HEIGHT, c->height);
-                stl_le_p(slot + JCUR_SLOT_HOT_X, c->hot_x);
-                stl_le_p(slot + JCUR_SLOT_HOT_Y, c->hot_y);
-                stl_le_p(slot + JCUR_SLOT_FORMAT, c->format);
-                stq_le_p(slot + JCUR_SLOT_POSITION_SEQUENCE,
+                memset(slot, 0, DG_CURSOR_TRANSPORT_SLOT_BYTES);
+                stq_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_GENERATION, ++s->cursor_generation);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_WIDTH, c->width);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_HEIGHT, c->height);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_HOT_X, c->hot_x);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_HOT_Y, c->hot_y);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_FORMAT, c->format);
+                stq_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_POSITION_SEQUENCE,
                           s->cursor_position_sequence);
-                stl_le_p(slot + JCUR_SLOT_X, c->x);
-                stl_le_p(slot + JCUR_SLOT_Y, c->y);
-                stl_le_p(slot + JCUR_SLOT_FLAGS, c->flags);
-                memcpy(slot + JCUR_SLOT_PIXELS, c->pixels,
-                        c->width * c->height * JRG_CURSOR_PIXEL_BYTES);
-                qatomic_store_release(state, JCUR_READY);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_X, c->x);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_Y, c->y);
+                stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_FLAGS, c->flags);
+                memcpy(slot + DG_CURSOR_TRANSPORT_SLOT_PIXELS, c->pixels,
+                        c->width * c->height * DG_CURSOR_PIXEL_BYTES);
+                qatomic_store_release(state, DG_CURSOR_TRANSPORT_READY);
                 qatomic_store_release((uint64_t *)(s->cursor_shmem +
-                                      JCUR_HDR_GENERATION), s->cursor_generation);
+                                      DG_CURSOR_TRANSPORT_HDR_GENERATION), s->cursor_generation);
                 s->cursor_shape_dirty = false;
                 s->cursor_notify_shape = true;
                 published = true;
@@ -361,10 +361,10 @@ static void juke_shmem_cursor_publish(JukeShmemState *s)
         }
     }
     if (s->cursor_notify_shape) {
-        packet[0] = JCUR_MSG_SHAPE;
+        packet[0] = DG_CURSOR_TRANSPORT_MSG_SHAPE;
         stq_le_p(packet + 8, s->cursor_generation);
-        stq_le_p(packet + 16, juke_now_us());
-        sent = juke_shmem_cursor_send(s, packet, -1);
+        stq_le_p(packet + 16, dreamgpu_now_us());
+        sent = dreamgpu_shmem_cursor_send(s, packet, -1);
         if (sent <= 0) {
             writable = sent == 0;
             goto out;
@@ -372,12 +372,12 @@ static void juke_shmem_cursor_publish(JukeShmemState *s)
         s->cursor_notify_shape = false;
     }
     if (s->cursor_position_dirty) {
-        packet[0] = JCUR_MSG_POSITION;
-        packet[JCUR_PACKET_FLAGS] = s->native_cursor.flags;
-        stq_le_p(packet + JCUR_PACKET_SEQUENCE, s->cursor_position_sequence);
-        stl_le_p(packet + JCUR_PACKET_X, s->native_cursor.x);
-        stl_le_p(packet + JCUR_PACKET_Y, s->native_cursor.y);
-        sent = juke_shmem_cursor_send(s, packet, -1);
+        packet[0] = DG_CURSOR_TRANSPORT_MSG_POSITION;
+        packet[DG_CURSOR_TRANSPORT_PACKET_FLAGS] = s->native_cursor.flags;
+        stq_le_p(packet + DG_CURSOR_TRANSPORT_PACKET_SEQUENCE, s->cursor_position_sequence);
+        stl_le_p(packet + DG_CURSOR_TRANSPORT_PACKET_X, s->native_cursor.x);
+        stl_le_p(packet + DG_CURSOR_TRANSPORT_PACKET_Y, s->native_cursor.y);
+        sent = dreamgpu_shmem_cursor_send(s, packet, -1);
         if (sent <= 0) {
             writable = sent == 0;
             goto out;
@@ -386,15 +386,15 @@ static void juke_shmem_cursor_publish(JukeShmemState *s)
     }
 out:
     if (s->client_fd >= 0) {
-        qemu_set_fd_handler(s->client_fd, juke_shmem_input_ready,
-            writable || s->deferred_ack.kind ? juke_shmem_ack_ready : NULL, s);
+        qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready,
+            writable || s->deferred_ack.kind ? dreamgpu_shmem_ack_ready : NULL, s);
     }
 }
 
-void juke_shmem_native_cursor(QemuConsole *con, const JukeNativeCursor *cursor,
+void dreamgpu_shmem_native_cursor(QemuConsole *con, const DreamGpuNativeCursor *cursor,
                               bool shape)
 {
-    JukeShmemState *s = juke_active_display;
+    DreamGpuShmemState *s = dreamgpu_active_display;
 
     if (!s || s->dcl.con != con) {
         return;
@@ -406,7 +406,7 @@ void juke_shmem_native_cursor(QemuConsole *con, const JukeNativeCursor *cursor,
             s->cursor_notify_shape = false;
             if (s->cursor_shmem) {
                 /* A reset retires the old shape, including consumer copies. */
-                juke_shmem_cursor_new_mapping(s);
+                dreamgpu_shmem_cursor_new_mapping(s);
             }
         }
     } else {
@@ -416,20 +416,20 @@ void juke_shmem_native_cursor(QemuConsole *con, const JukeNativeCursor *cursor,
     }
     s->cursor_position_sequence++;
     s->cursor_position_dirty = true;
-    juke_shmem_cursor_publish(s);
+    dreamgpu_shmem_cursor_publish(s);
 }
 
-static JukeFrameMeta *juke_shmem_slot(JukeShmemState *s, int i)
+static DreamGpuFrameMeta *dreamgpu_shmem_slot(DreamGpuShmemState *s, int i)
 {
-    return (JukeFrameMeta *)(s->shmem + 1) + i;
+    return (DreamGpuFrameMeta *)(s->shmem + 1) + i;
 }
 
-static uint8_t *juke_shmem_pixels(JukeShmemState *s, int i)
+static uint8_t *dreamgpu_shmem_pixels(DreamGpuShmemState *s, int i)
 {
-    return (uint8_t *)s->shmem + JUKE_PIXEL_BASE + i * s->plane_size;
+    return (uint8_t *)s->shmem + DREAMGPU_PIXEL_BASE + i * s->plane_size;
 }
 
-static void juke_shmem_publish(JukeShmemState *s)
+static void dreamgpu_shmem_publish(DreamGpuShmemState *s)
 {
     if (s->cpu_anchor_pending) {
         /* Input can publish between refreshes. Refresh the VGA surface first,
@@ -442,14 +442,14 @@ static void juke_shmem_publish(JukeShmemState *s)
     }
     for (int i = 0; i < 3; i++) {
         uint32_t state = __atomic_load_n(&s->shmem->slots[i], __ATOMIC_ACQUIRE);
-        if ((state == JUKE_SLOT_FREE || state == JUKE_SLOT_READY) &&
+        if ((state == DREAMGPU_SLOT_FREE || state == DREAMGPU_SLOT_READY) &&
             __atomic_compare_exchange_n(&s->shmem->slots[i], &state,
-                JUKE_SLOT_WRITING, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-            JukeFrameMeta *frame = juke_shmem_slot(s, i);
+                DREAMGPU_SLOT_WRITING, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            DreamGpuFrameMeta *frame = dreamgpu_shmem_slot(s, i);
             *frame = s->cursor;
             frame->generation = ++s->generation;
             frame->input_id = s->input_id;
-            uint8_t *pixels = juke_shmem_pixels(s, i);
+            uint8_t *pixels = dreamgpu_shmem_pixels(s, i);
             const uint8_t *source = surface_data(s->surface);
             size_t row_bytes = (size_t)s->shmem->width * 4;
             size_t source_stride = surface_stride(s->surface);
@@ -461,47 +461,47 @@ static void juke_shmem_publish(JukeShmemState *s)
                            source + y * source_stride, row_bytes);
                 }
             }
-            frame->published_us = juke_now_us();
-            __atomic_store_n(&s->shmem->slots[i], JUKE_SLOT_READY, __ATOMIC_RELEASE);
+            frame->published_us = dreamgpu_now_us();
+            __atomic_store_n(&s->shmem->slots[i], DREAMGPU_SLOT_READY, __ATOMIC_RELEASE);
             __atomic_store_n(&s->shmem->frame_counter, s->generation, __ATOMIC_RELEASE);
             s->dirty = false;
-            juke_shmem_notify(s, 'F', s->generation, frame->published_us);
+            dreamgpu_shmem_notify(s, 'F', s->generation, frame->published_us);
             return;
         }
     }
     /* All slots are leased. Keep dirty and retry next display deadline. */
 }
 
-static void juke_shmem_process_event(JukeShmemState *s, JukeInputEvent *ev)
+static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEvent *ev)
 {
     bool guest_wants_abs = qemu_input_is_absolute(s->dcl.con);
-    if (ev->type == JUKE_INPUT_RESET || ev->type == JUKE_INPUT_REFRESH) {
-        if (ev->type == JUKE_INPUT_RESET) {
+    if (ev->type == DREAMGPU_INPUT_RESET || ev->type == DREAMGPU_INPUT_REFRESH) {
+        if (ev->type == DREAMGPU_INPUT_RESET) {
             /* Include untracked guest keys restored by a VM snapshot. */
-            juke_shmem_release_input(s, true);
+            dreamgpu_shmem_release_input(s, true);
         }
         s->dirty = true;
-        juke_shmem_publish(s);
-        juke_shmem_notify(s, 'A', ev->id, juke_now_us());
+        dreamgpu_shmem_publish(s);
+        dreamgpu_shmem_notify(s, 'A', ev->id, dreamgpu_now_us());
         return;
     }
     if (!s->shmem) {
         return;
     }
-    if (ev->type == JUKE_INPUT_KEY) {
+    if (ev->type == DREAMGPU_INPUT_KEY) {
         if (ev->x < 0 || ev->x >= 256) {
             return;
         }
         s->held_keys[ev->x] = ev->pressed;
     }
-    if (ev->type == JUKE_INPUT_MOUSE_BTN) {
+    if (ev->type == DREAMGPU_INPUT_MOUSE_BTN) {
         if (ev->button >= INPUT_BUTTON__MAX) {
             return;
         }
         s->held_buttons[ev->button] = ev->pressed;
     }
         switch (ev->type) {
-        case JUKE_INPUT_MOUSE_REL:
+        case DREAMGPU_INPUT_MOUSE_REL:
             /* Mark mouse as initialized on first movement - this prevents
              * gfx_switch from resetting position to center */
             s->mouse_initialized = true;
@@ -526,7 +526,7 @@ static void juke_shmem_process_event(JukeShmemState *s, JukeInputEvent *ev)
             }
             break;
 
-        case JUKE_INPUT_MOUSE_ABS:
+        case DREAMGPU_INPUT_MOUSE_ABS:
             if (guest_wants_abs) {
                 /* Clamp to framebuffer bounds before sending to guest */
                 int32_t abs_x = ev->x;
@@ -559,12 +559,12 @@ static void juke_shmem_process_event(JukeShmemState *s, JukeInputEvent *ev)
             }
             break;
 
-        case JUKE_INPUT_MOUSE_BTN:
+        case DREAMGPU_INPUT_MOUSE_BTN:
             /* Use NULL source like input-linux.c for PS/2 compatibility */
             qemu_input_queue_btn(NULL, ev->button, ev->pressed);
             break;
 
-        case JUKE_INPUT_KEY:
+        case DREAMGPU_INPUT_KEY:
             /* ev->x contains the scancode */
             qemu_input_event_send_key_number(s->dcl.con, ev->x, ev->pressed);
             break;
@@ -572,24 +572,24 @@ static void juke_shmem_process_event(JukeShmemState *s, JukeInputEvent *ev)
 
     qemu_input_event_sync();
     s->input_id = ev->id;
-    juke_shmem_notify(s, 'A', ev->id, juke_now_us());
-    if (ev->type >= JUKE_INPUT_MOUSE_REL &&
-        ev->type <= JUKE_INPUT_KEY) {
+    dreamgpu_shmem_notify(s, 'A', ev->id, dreamgpu_now_us());
+    if (ev->type >= DREAMGPU_INPUT_MOUSE_REL &&
+        ev->type <= DREAMGPU_INPUT_KEY) {
         /* Service guest display work promptly after interaction. This is a
          * bounded timer burst, not a polling loop; idle keeps monitor pacing. */
-        s->input_refresh_until_us = juke_now_us() + JUKE_INPUT_REFRESH_WINDOW_US;
-        qemu_console_listener_set_refresh(&s->dcl, JUKE_INPUT_REFRESH_INTERVAL_MS);
+        s->input_refresh_until_us = dreamgpu_now_us() + DREAMGPU_INPUT_REFRESH_WINDOW_US;
+        qemu_console_listener_set_refresh(&s->dcl, DREAMGPU_INPUT_REFRESH_INTERVAL_MS);
     }
 }
 
 /* Main-loop socket readiness wakes input independently of display refresh.
  * A bounded batch gives emulation and other devices a turn during floods. */
-static void juke_shmem_input_ready(void *opaque)
+static void dreamgpu_shmem_input_ready(void *opaque)
 {
-    JukeShmemState *s = opaque;
+    DreamGpuShmemState *s = opaque;
     for (int count = 0; count < 256; count++) {
         ssize_t n = recv(s->client_fd, s->input_bytes + s->input_used,
-                         sizeof(JukeInputEvent) - s->input_used, MSG_DONTWAIT);
+                         sizeof(DreamGpuInputEvent) - s->input_used, MSG_DONTWAIT);
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return;
         }
@@ -597,15 +597,15 @@ static void juke_shmem_input_ready(void *opaque)
             if (n < 0 && errno == EINTR) {
                 continue;
             }
-            juke_shmem_disconnect(s);
+            dreamgpu_shmem_disconnect(s);
             return;
         }
         s->input_used += n;
-        if (s->input_used == sizeof(JukeInputEvent)) {
-            JukeInputEvent ev;
+        if (s->input_used == sizeof(DreamGpuInputEvent)) {
+            DreamGpuInputEvent ev;
             memcpy(&ev, s->input_bytes, sizeof(ev));
             s->input_used = 0;
-            juke_shmem_process_event(s, &ev);
+            dreamgpu_shmem_process_event(s, &ev);
             if (s->client_fd < 0) {
                 return;
             }
@@ -613,10 +613,10 @@ static void juke_shmem_input_ready(void *opaque)
     }
 }
 
-static void juke_shmem_gfx_update(DisplayChangeListener *dcl,
+static void dreamgpu_shmem_gfx_update(DisplayChangeListener *dcl,
                                    int x, int y, int w, int h)
 {
-    JukeShmemState *s = container_of(dcl, JukeShmemState, dcl);
+    DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
     if (!s->shmem || !s->surface) {
         return;
@@ -626,10 +626,10 @@ static void juke_shmem_gfx_update(DisplayChangeListener *dcl,
     s->dirty = true;
 }
 
-static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
+static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl,
                                    DisplaySurface *new_surface)
 {
-    JukeShmemState *s = container_of(dcl, JukeShmemState, dcl);
+    DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
     s->surface = new_surface;
 
@@ -646,31 +646,31 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
     /* Reject unsupported surfaces and arithmetic overflow before allocating or
      * copying. Destination row padding is independent of the native surface. */
     if (w <= 0 || h <= 0 || source_stride < 0 ||
-        (size_t)w > (UINT32_MAX - (JUKE_ROW_ALIGNMENT - 1)) / 4 ||
+        (size_t)w > (UINT32_MAX - (DREAMGPU_ROW_ALIGNMENT - 1)) / 4 ||
         (size_t)source_stride < (size_t)w * 4 ||
         (format != PIXMAN_x8r8g8b8 && format != PIXMAN_a8r8g8b8)) {
         s->surface = NULL;
-        error_report("juke-shmem: unsupported display surface geometry/format");
+        error_report("dreamgpu-shmem: unsupported display surface geometry/format");
         return;
     }
-    stride = QEMU_ALIGN_UP((size_t)w * 4, JUKE_ROW_ALIGNMENT);
+    stride = QEMU_ALIGN_UP((size_t)w * 4, DREAMGPU_ROW_ALIGNMENT);
     if ((size_t)h > SIZE_MAX / stride ||
-        stride * h > SIZE_MAX - (JUKE_PLANE_ALIGNMENT - 1)) {
+        stride * h > SIZE_MAX - (DREAMGPU_PLANE_ALIGNMENT - 1)) {
         s->surface = NULL;
-        error_report("juke-shmem: display plane size overflow");
+        error_report("dreamgpu-shmem: display plane size overflow");
         return;
     }
     pixels_size = stride * h;
-    plane_size = QEMU_ALIGN_UP(pixels_size, JUKE_PLANE_ALIGNMENT);
-    if (plane_size > (SIZE_MAX - JUKE_PIXEL_BASE) / JUKE_SLOT_COUNT) {
+    plane_size = QEMU_ALIGN_UP(pixels_size, DREAMGPU_PLANE_ALIGNMENT);
+    if (plane_size > (SIZE_MAX - DREAMGPU_PIXEL_BASE) / DREAMGPU_SLOT_COUNT) {
         s->surface = NULL;
-        error_report("juke-shmem: display mapping size overflow");
+        error_report("dreamgpu-shmem: display mapping size overflow");
         return;
     }
-    needed = JUKE_PIXEL_BASE + JUKE_SLOT_COUNT * plane_size;
+    needed = DREAMGPU_PIXEL_BASE + DREAMGPU_SLOT_COUNT * plane_size;
     if (needed > PTRDIFF_MAX) {
         s->surface = NULL;
-        error_report("juke-shmem: display mapping exceeds addressable range");
+        error_report("dreamgpu-shmem: display mapping exceeds addressable range");
         return;
     }
 
@@ -681,18 +681,18 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
     }
     s->shmem_size = needed;
     s->plane_size = plane_size;
-    s->shmem = qemu_memfd_alloc("juke-fb", needed, 0, &s->shmem_fd, NULL);
+    s->shmem = qemu_memfd_alloc("dreamgpu-fb", needed, 0, &s->shmem_fd, NULL);
     s->fd_sent = false;
     if (!s->shmem) {
         s->shmem_fd = -1;
-        error_report("juke-shmem: failed to allocate shared memory");
+        error_report("dreamgpu-shmem: failed to allocate shared memory");
         return;
     }
     /* Initialize metadata, row padding and page padding before native textures
      * can import any plane. This is paid once per geometry epoch, not per frame. */
     memset(s->shmem, 0, needed);
-    s->shmem->magic = JUKE_SHMEM_MAGIC;
-    s->shmem->version = JUKE_SHMEM_VERSION;
+    s->shmem->magic = DREAMGPU_SHMEM_MAGIC;
+    s->shmem->version = DREAMGPU_SHMEM_VERSION;
     s->shmem->width = w;
     s->shmem->height = h;
     s->shmem->stride = stride;
@@ -717,51 +717,51 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
     }
 
     if (s->client_fd >= 0) {
-        juke_shmem_send_fd(s);
+        dreamgpu_shmem_send_fd(s);
     }
-    juke_shmem_publish(s);
+    dreamgpu_shmem_publish(s);
 }
 
-static void juke_shmem_refresh(DisplayChangeListener *dcl)
+static void dreamgpu_shmem_refresh(DisplayChangeListener *dcl)
 {
-    JukeShmemState *s = container_of(dcl, JukeShmemState, dcl);
+    DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
     if (s->input_refresh_until_us &&
-        juke_now_us() >= s->input_refresh_until_us) {
+        dreamgpu_now_us() >= s->input_refresh_until_us) {
         s->input_refresh_until_us = 0;
         qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
     }
 
     /* Try to (re)connect if not connected */
     if (s->client_fd < 0 && s->socket_path) {
-        juke_shmem_connect(s);
+        dreamgpu_shmem_connect(s);
     }
 
     /* Try to send fd if we have connection and shared memory */
     if (s->client_fd >= 0 && s->shmem_fd >= 0 && !s->fd_sent) {
-        juke_shmem_send_fd(s);
+        dreamgpu_shmem_send_fd(s);
     }
 
     qemu_console_hw_update(dcl->con);
-    juke_shmem_publish(s);
-    juke_shmem_cursor_publish(s);
+    dreamgpu_shmem_publish(s);
+    dreamgpu_shmem_cursor_publish(s);
 }
 
 /*
  * Handle cursor shape change from guest
  * Like Cocoa, we read from console cursor storage for reliability
  */
-static void juke_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
+static void dreamgpu_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
 {
-    JukeShmemState *s = container_of(dcl, JukeShmemState, dcl);
+    DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
     QEMUCursor *con_cursor = qemu_console_get_cursor(dcl->con);
-    s->cursor.cursor_width = con_cursor ? MIN(con_cursor->width, JUKE_CURSOR_MAX_SIZE) : 0;
-    s->cursor.cursor_height = con_cursor ? MIN(con_cursor->height, JUKE_CURSOR_MAX_SIZE) : 0;
+    s->cursor.cursor_width = con_cursor ? MIN(con_cursor->width, DREAMGPU_CURSOR_MAX_SIZE) : 0;
+    s->cursor.cursor_height = con_cursor ? MIN(con_cursor->height, DREAMGPU_CURSOR_MAX_SIZE) : 0;
     if (con_cursor) {
         s->cursor.cursor_hot_x = con_cursor->hot_x;
         s->cursor.cursor_hot_y = con_cursor->hot_y;
         for (uint32_t y = 0; y < s->cursor.cursor_height; y++) {
-            memcpy(&s->cursor.cursor[y * JUKE_CURSOR_MAX_SIZE],
+            memcpy(&s->cursor.cursor[y * DREAMGPU_CURSOR_MAX_SIZE],
                    &con_cursor->data[y * con_cursor->width],
                    s->cursor.cursor_width * sizeof(uint32_t));
         }
@@ -770,26 +770,26 @@ static void juke_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cur
     s->dirty = true;
 }
 
-static void juke_shmem_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
+static void dreamgpu_shmem_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
 {
-    JukeShmemState *s = container_of(dcl, JukeShmemState, dcl);
+    DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
     s->cursor.cursor_x = x;
     s->cursor.cursor_y = y;
     s->cursor.cursor_visible = on;
     s->dirty = true;
 }
 
-static const DisplayChangeListenerOps juke_shmem_ops = {
-    .dpy_name          = "juke-shmem",
-    .dpy_gfx_update    = juke_shmem_gfx_update,
-    .dpy_gfx_switch    = juke_shmem_gfx_switch,
-    .dpy_refresh       = juke_shmem_refresh,
-    .dpy_cursor_define = juke_shmem_cursor_define,
-    .dpy_mouse_set     = juke_shmem_mouse_set,
+static const DisplayChangeListenerOps dreamgpu_shmem_ops = {
+    .dpy_name          = "dreamgpu-shmem",
+    .dpy_gfx_update    = dreamgpu_shmem_gfx_update,
+    .dpy_gfx_switch    = dreamgpu_shmem_gfx_switch,
+    .dpy_refresh       = dreamgpu_shmem_refresh,
+    .dpy_cursor_define = dreamgpu_shmem_cursor_define,
+    .dpy_mouse_set     = dreamgpu_shmem_mouse_set,
 };
 
 /* Send shared memory fd to client via SCM_RIGHTS */
-static void juke_shmem_send_fd(JukeShmemState *s)
+static void dreamgpu_shmem_send_fd(DreamGpuShmemState *s)
 {
     if (s->client_fd < 0 || s->shmem_fd < 0 || s->fd_sent) {
         return;
@@ -797,7 +797,7 @@ static void juke_shmem_send_fd(JukeShmemState *s)
 
     struct msghdr msg = {0};
     struct iovec iov[1];
-    JukeMessage buf = { .kind = 'D' };
+    DreamGpuMessage buf = { .kind = 'D' };
 
     /* Ancillary data buffer for fd */
     char cmsgbuf[CMSG_SPACE(sizeof(int))];
@@ -820,14 +820,14 @@ static void juke_shmem_send_fd(JukeShmemState *s)
         return; /* retry on next refresh */
     }
     if (sent != sizeof(buf)) {
-        juke_shmem_disconnect(s);
+        dreamgpu_shmem_disconnect(s);
     } else {
         s->fd_sent = true;
     }
 }
 
-/* Connect to Juke's socket and send fd (silent on failure for retry) */
-static int juke_shmem_connect(JukeShmemState *s)
+/* Connect to DreamGPU's socket and send fd (silent on failure for retry) */
+static int dreamgpu_shmem_connect(DreamGpuShmemState *s)
 {
     if (!s->socket_path) {
         return -1;
@@ -836,7 +836,7 @@ static int juke_shmem_connect(JukeShmemState *s)
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
         /* Socket creation failure is unusual, worth reporting */
-        error_report("juke-shmem: socket failed: %s", strerror(errno));
+        error_report("dreamgpu-shmem: socket failed: %s", strerror(errno));
         return -1;
     }
 
@@ -851,28 +851,28 @@ static int juke_shmem_connect(JukeShmemState *s)
     }
 
     /* Connection successful! */
-    error_report("juke-shmem: connected to %s", s->socket_path);
+    error_report("dreamgpu-shmem: connected to %s", s->socket_path);
     s->client_fd = fd;
     s->fd_sent = false;
     if (!qemu_set_blocking(fd, false, NULL)) {
-        juke_shmem_disconnect(s);
+        dreamgpu_shmem_disconnect(s);
         return -1;
     }
 #ifdef SO_NOSIGPIPE
     int no_sigpipe = 1;
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
 #endif
-    qemu_set_fd_handler(fd, juke_shmem_input_ready, NULL, s);
+    qemu_set_fd_handler(fd, dreamgpu_shmem_input_ready, NULL, s);
 
     /* A disconnected consumer can leave every slot leased forever. Allocate a
      * fresh epoch instead of resetting slot ownership in memory that surviving
      * render leases may still read. This also publishes the current surface to
      * the new consumer without waiting for guest damage. */
     if (s->surface) {
-        juke_shmem_gfx_switch(&s->dcl, s->surface);
+        dreamgpu_shmem_gfx_switch(&s->dcl, s->surface);
     }
-    juke_shmem_cursor_new_mapping(s);
-    juke_shmem_cursor_publish(s);
+    dreamgpu_shmem_cursor_new_mapping(s);
+    dreamgpu_shmem_cursor_publish(s);
 
     return 0;
 }
@@ -884,7 +884,7 @@ static int juke_shmem_connect(JukeShmemState *s)
  * macOS: Use CVDisplayLink to detect actual monitor refresh rate
  * Linux: Use libdrm to query the active display mode refresh rate
  */
-static void juke_shmem_setup_refresh(JukeShmemState *s)
+static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s)
 {
     int interval_ms = 0;
 
@@ -951,12 +951,12 @@ static void juke_shmem_setup_refresh(JukeShmemState *s)
 #endif
 
     if (interval_ms > 0 && interval_ms < 100) {
-        error_report("juke-shmem: using monitor refresh rate: %dms (~%dHz)",
+        error_report("dreamgpu-shmem: using monitor refresh rate: %dms (~%dHz)",
                     interval_ms, 1000 / interval_ms);
         s->normal_refresh_ms = interval_ms;
     } else {
         /* Fallback: 8ms (~120Hz) - fast enough for any common display */
-        error_report("juke-shmem: using fallback refresh rate: 8ms (~120Hz)");
+        error_report("dreamgpu-shmem: using fallback refresh rate: 8ms (~120Hz)");
         s->normal_refresh_ms = 8;
     }
     qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
@@ -964,37 +964,37 @@ static void juke_shmem_setup_refresh(JukeShmemState *s)
 
 }
 
-static void juke_shmem_init(DisplayState *ds, DisplayOptions *opts)
+static void dreamgpu_shmem_init(DisplayState *ds, DisplayOptions *opts)
 {
-    JukeShmemState *s = g_new0(JukeShmemState, 1);
+    DreamGpuShmemState *s = g_new0(DreamGpuShmemState, 1);
 
     s->dcl.con = qemu_console_lookup_default();
-    juke_active_display = s;
-    s->dcl.ops = &juke_shmem_ops;
+    dreamgpu_active_display = s;
+    s->dcl.ops = &dreamgpu_shmem_ops;
     s->shmem_fd = -1;
     s->cursor_fd = -1;
     s->client_fd = -1;
 
-    if (opts->u.juke_shmem.socket) {
-        s->socket_path = g_strdup(opts->u.juke_shmem.socket);
-        /* Connect to Juke's socket - may fail if Juke hasn't created it yet */
-        juke_shmem_connect(s);
+    if (opts->u.dreamgpu_shmem.socket) {
+        s->socket_path = g_strdup(opts->u.dreamgpu_shmem.socket);
+        /* Connect to DreamGPU's socket - may fail if DreamGPU hasn't created it yet */
+        dreamgpu_shmem_connect(s);
     }
 
-    qemu_console_register_listener(s->dcl.con, &s->dcl, &juke_shmem_ops);
+    qemu_console_register_listener(s->dcl.con, &s->dcl, &dreamgpu_shmem_ops);
 
     /* Set refresh rate to match monitor (critical for performance!) */
-    juke_shmem_setup_refresh(s);
+    dreamgpu_shmem_setup_refresh(s);
 }
 
-static QemuDisplay qemu_display_juke_shmem = {
-    .type = DISPLAY_TYPE_JUKE_SHMEM,
-    .init = juke_shmem_init,
+static QemuDisplay qemu_display_dreamgpu_shmem = {
+    .type = DISPLAY_TYPE_DREAMGPU_SHMEM,
+    .init = dreamgpu_shmem_init,
 };
 
-static void register_juke_shmem(void)
+static void register_dreamgpu_shmem(void)
 {
-    qemu_display_register(&qemu_display_juke_shmem);
+    qemu_display_register(&qemu_display_dreamgpu_shmem);
 }
 
-type_init(register_juke_shmem);
+type_init(register_dreamgpu_shmem);

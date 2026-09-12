@@ -15,10 +15,10 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
-#include "standard-headers/juke/retro-gl.h"
-#include "standard-headers/juke/gpu-transport.h"
-#include "juke-retro-gl.h"
-#include "juke-retro-gl-platform.h"
+#include "standard-headers/dreamgpu/gl.h"
+#include "standard-headers/dreamgpu/transport.h"
+#include "dreamgpu-gl.h"
+#include "dreamgpu-gl-platform.h"
 #include "trace.h"
 
 #ifdef CONFIG_DARWIN
@@ -26,46 +26,46 @@
 #include <servers/bootstrap.h>
 #endif
 
-typedef DreamGpuContext JrgContext;
-typedef DreamGpuDrawable JrgDrawable;
+typedef DreamGpuContext DgContext;
+typedef DreamGpuDrawable DgDrawable;
 
 typedef enum SlotState { SLOT_FREE, SLOT_RENDERING, SLOT_PENDING,
                          SLOT_PUBLISHED } SlotState;
 
-typedef struct JrgSlot {
-    JrgGLImage *image;
+typedef struct DgSlot {
+    DgGLImage *image;
     SlotState state;
     bool sending, release_pending;
     uint64_t generation;
-    uint8_t packet[JGPU_PACKET_BYTES];
-} JrgSlot;
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
+} DgSlot;
 
 /* Frames and desktop commands share one publication order. Only frame jobs
  * wait for a GPU fence; the render thread can continue filling the next frame. */
-typedef struct JrgOutput {
-    JrgSlot *slot;
-    uint8_t packet[JGPU_PACKET_BYTES];
-} JrgOutput;
+typedef struct DgOutput {
+    DgSlot *slot;
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
+} DgOutput;
 
-#define JRG_MAX_PENDING_DESKTOP 64
+#define DG_MAX_PENDING_DESKTOP 64
 
-typedef struct JrgCpuSlot {
+typedef struct DgCpuSlot {
     uint8_t *pixels;
     size_t bytes;
     int fd;
     uint32_t width, height, stride;
     bool published;
     uint64_t epoch, sequence;
-} JrgCpuSlot;
+} DgCpuSlot;
 
 static void completion_free(void *opaque)
 {
-    JrgGLCompletion *done = opaque;
+    DgGLCompletion *done = opaque;
     g_free(done->bulk_result);
     g_free(done);
 }
 
-typedef struct JrgBatch {
+typedef struct DgBatch {
     uint8_t *data;
     size_t bytes;
     uint32_t sequence, generation;
@@ -73,11 +73,11 @@ typedef struct JrgBatch {
     uint64_t trace_queued_us;
     uint32_t primary_width, primary_height;
     uint32_t result_bytes, result_type;
-    uint8_t result[JRG_GL_MAX_RESULT_BYTES];
+    uint8_t result[DG_GL_MAX_RESULT_BYTES];
     uint8_t *bulk_result; /* Lazy bounded allocation; ownership follows completion. */
-} JrgBatch;
+} DgBatch;
 
-struct JrgGLEngine {
+struct DgGLEngine {
     QemuMutex lock, send_lock;
     QemuCond cond;
     QemuThread render_thread, completion_thread, release_thread;
@@ -91,29 +91,29 @@ struct JrgGLEngine {
     mach_port_t remote;
 #endif
     uint8_t uuid[16];
-    JrgGLPlatform *platform;
-    JrgBatch *batch;
+    DgGLPlatform *platform;
+    DgBatch *batch;
     GQueue completions;
     GQueue pending_output;
     uint32_t pending_count, pending_desktop;
     uint64_t desktop_epoch, desktop_sequence;
     uint32_t desktop_width, desktop_height;
     bool desktop_active, desktop_coherent;
-    JrgGLFrameRef last_present;
-    JrgCpuSlot cpu_slots[JGPU_MAX_CPU_SLOTS];
-    JrgGLTransfer transfer;
+    DgGLFrameRef last_present;
+    DgCpuSlot cpu_slots[DG_TRANSPORT_MAX_CPU_SLOTS];
+    DgGLTransfer transfer;
     bool transfer_pending, transfer_claimed;
     uint32_t transfer_error;
     uint64_t cpu_epoch, cpu_generation;
     bool reply_pending, reply_ready;
     uint64_t reply_epoch, reply_sequence, reply_token;
-    uint8_t reply_packet[JGPU_PACKET_BYTES];
+    uint8_t reply_packet[DG_TRANSPORT_PACKET_BYTES];
     int reply_fd;
     DreamGpuResources resources;
-    JrgSlot slots[JRG_GL_MAX_DRAWABLES * JRG_GL_EXPORT_SLOTS];
-    JrgContext *current_context;
-    JrgDrawable *current_drawable;
-    JrgGLNotify notify;
+    DgSlot slots[DG_GL_MAX_DRAWABLES * DG_GL_EXPORT_SLOTS];
+    DgContext *current_context;
+    DgDrawable *current_drawable;
+    DgGLNotify notify;
     void *opaque;
 };
 
@@ -134,8 +134,8 @@ static uint32_t validate_desktop(const uint8_t *r, uint32_t primary_width,
 static void trace_rejection(const uint8_t *r, uint32_t size, uint32_t sequence,
                             bool execution, uint32_t error)
 {
-    uint32_t op = word(r, JRG_GL_OFF_OP);
-    uint32_t args = op == JRG_GL_DATA_CALL ? JRG_GL_DATA_ARGS : 36;
+    uint32_t op = word(r, DG_GL_OFF_OP);
+    uint32_t args = op == DG_GL_DATA_CALL ? DG_GL_DATA_ARGS : 36;
     char tail[96];
     /* QEMU trace events allow at most ten arguments. Keep the original fields
      * and format only bounded numeric tail words, only on rejected records. */
@@ -144,7 +144,7 @@ static void trace_rejection(const uint8_t *r, uint32_t size, uint32_t sequence,
         size >= args + 24 ? word(r, args + 20) : 0,
         size >= args + 28 ? word(r, args + 24) : 0,
         size >= args + 32 ? word(r, args + 28) : 0);
-    trace_juke_retro_gl_reject(sequence, execution, op,
+    trace_dreamgpu_gl_reject(sequence, execution, op,
         size >= 36 ? word(r, 32) : 0,
         size >= args + 4 ? word(r, args) : 0,
         size >= args + 8 ? word(r, args + 4) : 0,
@@ -152,7 +152,7 @@ static void trace_rejection(const uint8_t *r, uint32_t size, uint32_t sequence,
         size >= args + 16 ? word(r, args + 12) : 0, error, tail);
 }
 
-uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
+uint32_t dg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                          uint32_t primary_width, uint32_t primary_height,
                          uint32_t vram_size, uint32_t *records)
 {
@@ -161,77 +161,77 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
     uint64_t desktop_work = 0;
 
     *records = 0;
-    if (!bytes || bytes > JRG_GL_MAX_BYTES || (bytes & 3)) {
-        return JRG_GL_ERROR_BATCH;
+    if (!bytes || bytes > DG_GL_MAX_BYTES || (bytes & 3)) {
+        return DG_GL_ERROR_BATCH;
     }
     while (offset < bytes) {
         const uint8_t *r = data + offset;
-        uint32_t op, size, flags, expected = JRG_GL_HEADER_BYTES;
+        uint32_t op, size, flags, expected = DG_GL_HEADER_BYTES;
 
-        if (bytes - offset < JRG_GL_HEADER_BYTES ||
-            ++count > JRG_GL_MAX_RECORDS) {
-            return JRG_GL_ERROR_BATCH;
+        if (bytes - offset < DG_GL_HEADER_BYTES ||
+            ++count > DG_GL_MAX_RECORDS) {
+            return DG_GL_ERROR_BATCH;
         }
-        op = word(r, JRG_GL_OFF_OP);
-        size = word(r, JRG_GL_OFF_SIZE);
-        flags = word(r, JRG_GL_OFF_FLAGS);
-        if (size < JRG_GL_HEADER_BYTES || size > bytes - offset || (size & 3) ||
-            !word(r, JRG_GL_OFF_CLIENT) || word(r, JRG_GL_OFF_RESERVED) ||
-            (flags && (op != JRG_GL_PRESENT ||
-                       (flags & ~(JRG_GL_PRESENT_EXCLUSIVE |
-                                  JRG_GL_PRESENT_RETAIN |
-                                  JRG_GL_PRESENT_FRONT_ONLY |
-                                  JRG_GL_PRESENT_NO_EXPORT |
-                                  JRG_GL_PRESENT_BOUNDED)) ||
-                       ((flags & JRG_GL_PRESENT_NO_EXPORT) &&
-                        (flags & ~JRG_GL_PRESENT_BOUNDED) !=
-                         JRG_GL_PRESENT_NO_EXPORT) ||
-                       ((flags & JRG_GL_PRESENT_EXCLUSIVE) &&
-                        (flags & JRG_GL_PRESENT_RETAIN))))) {
-            return JRG_GL_ERROR_BATCH;
+        op = word(r, DG_GL_OFF_OP);
+        size = word(r, DG_GL_OFF_SIZE);
+        flags = word(r, DG_GL_OFF_FLAGS);
+        if (size < DG_GL_HEADER_BYTES || size > bytes - offset || (size & 3) ||
+            !word(r, DG_GL_OFF_CLIENT) || word(r, DG_GL_OFF_RESERVED) ||
+            (flags && (op != DG_GL_PRESENT ||
+                       (flags & ~(DG_GL_PRESENT_EXCLUSIVE |
+                                  DG_GL_PRESENT_RETAIN |
+                                  DG_GL_PRESENT_FRONT_ONLY |
+                                  DG_GL_PRESENT_NO_EXPORT |
+                                  DG_GL_PRESENT_BOUNDED)) ||
+                       ((flags & DG_GL_PRESENT_NO_EXPORT) &&
+                        (flags & ~DG_GL_PRESENT_BOUNDED) !=
+                         DG_GL_PRESENT_NO_EXPORT) ||
+                       ((flags & DG_GL_PRESENT_EXCLUSIVE) &&
+                        (flags & DG_GL_PRESENT_RETAIN))))) {
+            return DG_GL_ERROR_BATCH;
         }
-        if (word(r, JRG_GL_OFF_GENERATION) != generation) {
-            return JRG_GL_ERROR_GENERATION;
+        if (word(r, DG_GL_OFF_GENERATION) != generation) {
+            return DG_GL_ERROR_GENERATION;
         }
         switch (op) {
-        case JRG_GL_CREATE_CONTEXT:
+        case DG_GL_CREATE_CONTEXT:
             expected += 4;
             break;
-        case JRG_GL_CREATE_DRAWABLE:
+        case DG_GL_CREATE_DRAWABLE:
             expected += 8;
             break;
-        case JRG_GL_CALL:
+        case DG_GL_CALL:
             if (size < expected + 4) {
-                return JRG_GL_ERROR_BATCH;
+                return DG_GL_ERROR_BATCH;
             }
-            uint32_t words = jrg_gl_function_words(word(r, expected));
-            if (words == UINT32_MAX || (words & JRG_GL_FUNCTION_KIND_MASK)) {
-                trace_rejection(r, size, 0, false, JRG_GL_ERROR_UNSUPPORTED);
-                return JRG_GL_ERROR_UNSUPPORTED;
+            uint32_t words = dg_gl_function_words(word(r, expected));
+            if (words == UINT32_MAX || (words & DG_GL_FUNCTION_KIND_MASK)) {
+                trace_rejection(r, size, 0, false, DG_GL_ERROR_UNSUPPORTED);
+                return DG_GL_ERROR_UNSUPPORTED;
             }
             expected += 4 + words * 4;
             break;
-        case JRG_GL_DATA_CALL: {
-            if (size < JRG_GL_DATA_ARGS) {
-                return JRG_GL_ERROR_BATCH;
+        case DG_GL_DATA_CALL: {
+            if (size < DG_GL_DATA_ARGS) {
+                return DG_GL_ERROR_BATCH;
             }
-            uint32_t fn = word(r, JRG_GL_DATA_FUNCTION);
-            uint32_t count = jrg_gl_function_words(fn);
-            uint32_t bytes = word(r, JRG_GL_DATA_BYTES);
+            uint32_t fn = word(r, DG_GL_DATA_FUNCTION);
+            uint32_t count = dg_gl_function_words(fn);
+            uint32_t bytes = word(r, DG_GL_DATA_BYTES);
             if (count == UINT32_MAX ||
-                (count & JRG_GL_FUNCTION_KIND_MASK) !=
-                JRG_GL_FUNCTION_INLINE_DATA) {
-                trace_rejection(r, size, 0, false, JRG_GL_ERROR_UNSUPPORTED);
-                return JRG_GL_ERROR_UNSUPPORTED;
+                (count & DG_GL_FUNCTION_KIND_MASK) !=
+                DG_GL_FUNCTION_INLINE_DATA) {
+                trace_rejection(r, size, 0, false, DG_GL_ERROR_UNSUPPORTED);
+                return DG_GL_ERROR_UNSUPPORTED;
             }
-            count &= ~JRG_GL_FUNCTION_INLINE_DATA;
-            if (bytes > JRG_GL_MAX_BYTES ||
-                size != JRG_GL_DATA_ARGS + count * 4 +
+            count &= ~DG_GL_FUNCTION_INLINE_DATA;
+            if (bytes > DG_GL_MAX_BYTES ||
+                size != DG_GL_DATA_ARGS + count * 4 +
                         QEMU_ALIGN_UP(bytes, 4)) {
-                return JRG_GL_ERROR_BATCH;
+                return DG_GL_ERROR_BATCH;
             }
-            uint32_t error = jrg_gl_data_validate(fn, r + JRG_GL_DATA_ARGS,
-                                                  r + JRG_GL_DATA_ARGS +
+            uint32_t error = dg_gl_data_validate(fn, r + DG_GL_DATA_ARGS,
+                                                  r + DG_GL_DATA_ARGS +
                                                   count * 4,
                                                   bytes);
             if (error) {
@@ -239,30 +239,30 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                 return error;
             }
             for (unsigned i = bytes; i < QEMU_ALIGN_UP(bytes, 4); i++) {
-                if (r[JRG_GL_DATA_ARGS + count * 4 + i]) {
-                    return JRG_GL_ERROR_BATCH;
+                if (r[DG_GL_DATA_ARGS + count * 4 + i]) {
+                    return DG_GL_ERROR_BATCH;
                 }
             }
             expected = size;
             break;
         }
-        case JRG_GL_QUERY:
-            if (size != JRG_GL_QUERY_BYTES || bytes != JRG_GL_QUERY_BYTES) {
-                return JRG_GL_ERROR_BATCH;
+        case DG_GL_QUERY:
+            if (size != DG_GL_QUERY_BYTES || bytes != DG_GL_QUERY_BYTES) {
+                return DG_GL_ERROR_BATCH;
             }
-            uint32_t query_error = jrg_gl_query_validate(word(r, 32), r + 36);
+            uint32_t query_error = dg_gl_query_validate(word(r, 32), r + 36);
             if (query_error) {
                 trace_rejection(r, size, 0, false, query_error);
                 return query_error;
             }
-            expected = JRG_GL_QUERY_BYTES;
+            expected = DG_GL_QUERY_BYTES;
             break;
-        case JRG_GL_DESKTOP:
-            expected += JRG_DESKTOP_BYTES;
-            if (size != expected || ++desktop_count > JRG_DESKTOP_MAX_RECORDS) {
-                return JRG_GL_ERROR_BATCH;
+        case DG_GL_DESKTOP:
+            expected += DG_DESKTOP_BYTES;
+            if (size != expected || ++desktop_count > DG_DESKTOP_MAX_RECORDS) {
+                return DG_GL_ERROR_BATCH;
             }
-            uint32_t error = validate_desktop(r + JRG_GL_HEADER_BYTES,
+            uint32_t error = validate_desktop(r + DG_GL_HEADER_BYTES,
                                              primary_width, primary_height,
                                              vram_size, &desktop_work);
             if (error) {
@@ -270,46 +270,46 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                 return error;
             }
             break;
-        case JRG_GL_DESTROY_CONTEXT:
-        case JRG_GL_DESTROY_DRAWABLE:
-        case JRG_GL_MAKE_CURRENT:
-        case JRG_GL_CLOSE_CLIENT:
+        case DG_GL_DESTROY_CONTEXT:
+        case DG_GL_DESTROY_DRAWABLE:
+        case DG_GL_MAKE_CURRENT:
+        case DG_GL_CLOSE_CLIENT:
             break;
-        case JRG_GL_PRESENT:
-            if (flags & JRG_GL_PRESENT_BOUNDED) {
+        case DG_GL_PRESENT:
+            if (flags & DG_GL_PRESENT_BOUNDED) {
                 expected += 8;
                 if (size != expected) {
-                    return JRG_GL_ERROR_BATCH;
+                    return DG_GL_ERROR_BATCH;
                 }
                 if (!word(r, 32) || !word(r, 36) ||
-                    word(r, 32) > JRG_GL_MAX_DIMENSION ||
-                    word(r, 36) > JRG_GL_MAX_DIMENSION) {
-                    return JRG_GL_ERROR_DRAWABLE;
+                    word(r, 32) > DG_GL_MAX_DIMENSION ||
+                    word(r, 36) > DG_GL_MAX_DIMENSION) {
+                    return DG_GL_ERROR_DRAWABLE;
                 }
             }
             break;
         default:
-            return JRG_GL_ERROR_UNSUPPORTED;
+            return DG_GL_ERROR_UNSUPPORTED;
         }
         if (size != expected) {
-            return JRG_GL_ERROR_BATCH;
+            return DG_GL_ERROR_BATCH;
         }
-        if (op == JRG_GL_CALL) {
-            uint32_t error = jrg_gl_call_validate(word(r, 32), r + 36);
+        if (op == DG_GL_CALL) {
+            uint32_t error = dg_gl_call_validate(word(r, 32), r + 36);
             if (error) {
                 trace_rejection(r, size, 0, false, error);
                 return error;
             }
         }
-        if (op == JRG_GL_CREATE_DRAWABLE &&
+        if (op == DG_GL_CREATE_DRAWABLE &&
             (!word(r, 32) || !word(r, 36) ||
-             word(r, 32) > JRG_GL_MAX_DIMENSION ||
-             word(r, 36) > JRG_GL_MAX_DIMENSION)) {
-            return JRG_GL_ERROR_DRAWABLE;
+             word(r, 32) > DG_GL_MAX_DIMENSION ||
+             word(r, 36) > DG_GL_MAX_DIMENSION)) {
+            return DG_GL_ERROR_DRAWABLE;
         }
-        if ((flags & JRG_GL_PRESENT_EXCLUSIVE) &&
+        if ((flags & DG_GL_PRESENT_EXCLUSIVE) &&
             (!primary_width || !primary_height)) {
-            return JRG_GL_ERROR_DRAWABLE;
+            return DG_GL_ERROR_DRAWABLE;
         }
         offset += size;
     }
@@ -324,12 +324,12 @@ static bool receive_record_fd(int fd, uint8_t *data, int *received_fd)
     bool valid = true;
 
     *received_fd = -1;
-    while (n < JGPU_PACKET_BYTES) {
+    while (n < DG_TRANSPORT_PACKET_BYTES) {
         union {
             struct cmsghdr align;
             char bytes[CMSG_SPACE(4 * sizeof(int))];
         } control;
-        struct iovec iov = { data + n, JGPU_PACKET_BYTES - n };
+        struct iovec iov = { data + n, DG_TRANSPORT_PACKET_BYTES - n };
         struct msghdr msg = {
             .msg_iov = &iov, .msg_iovlen = 1,
             .msg_control = control.bytes, .msg_controllen = sizeof(control),
@@ -367,10 +367,10 @@ static bool receive_record_fd(int fd, uint8_t *data, int *received_fd)
         }
         n += got;
     }
-    valid &= n == JGPU_PACKET_BYTES &&
-             word(data, JGPU_OFF_MAGIC) == JGPU_MAGIC &&
-             word(data, JGPU_OFF_VERSION) == JGPU_VERSION &&
-             word(data, JGPU_OFF_SIZE) == JGPU_PACKET_BYTES;
+    valid &= n == DG_TRANSPORT_PACKET_BYTES &&
+             word(data, DG_TRANSPORT_OFF_MAGIC) == DG_TRANSPORT_MAGIC &&
+             word(data, DG_TRANSPORT_OFF_VERSION) == DG_TRANSPORT_VERSION &&
+             word(data, DG_TRANSPORT_OFF_SIZE) == DG_TRANSPORT_PACKET_BYTES;
     if (!valid && *received_fd >= 0) {
         close(*received_fd);
         *received_fd = -1;
@@ -390,14 +390,14 @@ static bool receive_record(int fd, uint8_t *data)
     return valid;
 }
 
-static bool send_record(JrgGLEngine *e, const uint8_t *packet,
+static bool send_record(DgGLEngine *e, const uint8_t *packet,
                          const int *fds, unsigned count)
 {
     union {
         struct cmsghdr align;
         char bytes[CMSG_SPACE(2 * sizeof(int))];
     } control = { 0 };
-    struct iovec iov = { (void *)packet, JGPU_PACKET_BYTES };
+    struct iovec iov = { (void *)packet, DG_TRANSPORT_PACKET_BYTES };
     struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
     ssize_t sent;
     bool ok = true;
@@ -418,8 +418,8 @@ static bool send_record(JrgGLEngine *e, const uint8_t *packet,
     if (sent <= 0) {
         ok = false;
     }
-    while (ok && sent < JGPU_PACKET_BYTES) {
-        ssize_t n = send(e->socket, packet + sent, JGPU_PACKET_BYTES - sent,
+    while (ok && sent < DG_TRANSPORT_PACKET_BYTES) {
+        ssize_t n = send(e->socket, packet + sent, DG_TRANSPORT_PACKET_BYTES - sent,
                           MSG_NOSIGNAL);
         if (n < 0 && errno == EINTR) {
             continue;
@@ -436,18 +436,18 @@ static bool send_record(JrgGLEngine *e, const uint8_t *packet,
 
 static void packet_init(uint8_t *packet, uint32_t kind)
 {
-    memset(packet, 0, JGPU_PACKET_BYTES);
-    stl_le_p(packet + JGPU_OFF_MAGIC, JGPU_MAGIC);
-    stl_le_p(packet + JGPU_OFF_VERSION, JGPU_VERSION);
-    stl_le_p(packet + JGPU_OFF_KIND, kind);
-    stl_le_p(packet + JGPU_OFF_SIZE, JGPU_PACKET_BYTES);
+    memset(packet, 0, DG_TRANSPORT_PACKET_BYTES);
+    stl_le_p(packet + DG_TRANSPORT_OFF_MAGIC, DG_TRANSPORT_MAGIC);
+    stl_le_p(packet + DG_TRANSPORT_OFF_VERSION, DG_TRANSPORT_VERSION);
+    stl_le_p(packet + DG_TRANSPORT_OFF_KIND, kind);
+    stl_le_p(packet + DG_TRANSPORT_OFF_SIZE, DG_TRANSPORT_PACKET_BYTES);
 }
 
-static bool connect_consumer(JrgGLEngine *e, Error **errp)
+static bool connect_consumer(DgGLEngine *e, Error **errp)
 {
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
     struct timeval timeout = { .tv_sec = 2 };
-    uint8_t hello[JGPU_PACKET_BYTES];
+    uint8_t hello[DG_TRANSPORT_PACKET_BYTES];
 
     if (!e->socket_path || strlen(e->socket_path) >= sizeof(addr.sun_path)) {
         error_setg(errp, "A valid gpu-socket path is required for GL export");
@@ -469,51 +469,51 @@ static bool connect_consumer(JrgGLEngine *e, Error **errp)
     setsockopt(e->socket, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
 #endif
     if (!receive_record(e->socket, hello) ||
-        word(hello, JGPU_OFF_KIND) != JGPU_KIND_HELLO) {
+        word(hello, DG_TRANSPORT_OFF_KIND) != DG_TRANSPORT_KIND_HELLO) {
         error_setg(errp, "Invalid GPU consumer handshake");
         return false;
     }
     timeout.tv_sec = 0;
     setsockopt(e->socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 #ifdef CONFIG_DARWIN
-    const char *service = (const char *)hello + JGPU_HELLO_MACH_SERVICE;
-    if (word(hello, JGPU_HELLO_PLATFORM) != JGPU_PLATFORM_MACOS ||
-        !memchr(service, 0, JGPU_HELLO_MACH_SERVICE_LEN) ||
+    const char *service = (const char *)hello + DG_TRANSPORT_HELLO_MACH_SERVICE;
+    if (word(hello, DG_TRANSPORT_HELLO_PLATFORM) != DG_TRANSPORT_PLATFORM_MACOS ||
+        !memchr(service, 0, DG_TRANSPORT_HELLO_MACH_SERVICE_LEN) ||
         bootstrap_look_up(bootstrap_port, service, &e->remote) !=
         KERN_SUCCESS) {
         error_setg(errp, "Looking up GPU consumer Mach service failed");
         return false;
     }
-    e->platform = jrg_gl_platform_new(NULL, errp);
+    e->platform = dg_gl_platform_new(NULL, errp);
 #else
-    const char *node = (const char *)hello + JGPU_HELLO_RENDER_NODE;
-    if (word(hello, JGPU_HELLO_PLATFORM) != JGPU_PLATFORM_LINUX ||
-        !memchr(node, 0, JGPU_HELLO_RENDER_NODE_LEN) || !node[0]) {
+    const char *node = (const char *)hello + DG_TRANSPORT_HELLO_RENDER_NODE;
+    if (word(hello, DG_TRANSPORT_HELLO_PLATFORM) != DG_TRANSPORT_PLATFORM_LINUX ||
+        !memchr(node, 0, DG_TRANSPORT_HELLO_RENDER_NODE_LEN) || !node[0]) {
         error_setg(errp, "GPU consumer must identify its DRM render node");
         return false;
     }
-    memcpy(e->uuid, hello + JGPU_OFF_DEVICE_UUID, sizeof(e->uuid));
-    e->platform = jrg_gl_platform_new(node, errp);
+    memcpy(e->uuid, hello + DG_TRANSPORT_OFF_DEVICE_UUID, sizeof(e->uuid));
+    e->platform = dg_gl_platform_new(node, errp);
 #endif
     return e->platform != NULL;
 }
 
 static void *release_worker(void *opaque)
 {
-    JrgGLEngine *e = opaque;
-    uint8_t packet[JGPU_PACKET_BYTES];
+    DgGLEngine *e = opaque;
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
     int received_fd;
 
     while (receive_record_fd(e->socket, packet, &received_fd)) {
-        uint32_t kind = word(packet, JGPU_OFF_KIND);
-        uint32_t slot = word(packet, JGPU_OFF_SLOT);
-        uint64_t epoch = ldq_le_p(packet + JGPU_OFF_EPOCH);
-        uint64_t sequence = ldq_le_p(packet + JGPU_OFF_GENERATION);
+        uint32_t kind = word(packet, DG_TRANSPORT_OFF_KIND);
+        uint32_t slot = word(packet, DG_TRANSPORT_OFF_SLOT);
+        uint64_t epoch = ldq_le_p(packet + DG_TRANSPORT_OFF_EPOCH);
+        uint64_t sequence = ldq_le_p(packet + DG_TRANSPORT_OFF_GENERATION);
         bool valid = true;
 
         qemu_mutex_lock(&e->lock);
-        if (kind == JGPU_KIND_DESKTOP_REPLY) {
-            uint64_t token = ldq_le_p(packet + JGPU_DESKTOP_OFF_TOKEN);
+        if (kind == DG_TRANSPORT_KIND_DESKTOP_REPLY) {
+            uint64_t token = ldq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_TOKEN);
             if (!e->reply_pending && epoch == e->reply_epoch &&
                 sequence == e->reply_sequence && token == e->reply_token) {
                 /* A reset can cancel a readback already executing remotely. */
@@ -528,18 +528,18 @@ static void *release_worker(void *opaque)
                 received_fd = -1;
                 e->reply_ready = true;
             }
-        } else if (kind != JGPU_KIND_RELEASE || received_fd >= 0) {
+        } else if (kind != DG_TRANSPORT_KIND_RELEASE || received_fd >= 0) {
             valid = false;
-        } else if (slot >= JGPU_CPU_SLOT_BASE &&
-                   slot < JGPU_CPU_SLOT_BASE + JGPU_MAX_CPU_SLOTS) {
-            JrgCpuSlot *s = &e->cpu_slots[slot - JGPU_CPU_SLOT_BASE];
+        } else if (slot >= DG_TRANSPORT_CPU_SLOT_BASE &&
+                   slot < DG_TRANSPORT_CPU_SLOT_BASE + DG_TRANSPORT_MAX_CPU_SLOTS) {
+            DgCpuSlot *s = &e->cpu_slots[slot - DG_TRANSPORT_CPU_SLOT_BASE];
             if (s->published && s->epoch == epoch && s->sequence == sequence) {
                 s->published = false;
             }
         } else if (slot < G_N_ELEMENTS(e->slots)) {
-            JrgSlot *s = &e->slots[slot];
+            DgSlot *s = &e->slots[slot];
             if (s->state == SLOT_PUBLISHED &&
-                epoch == ldq_le_p(s->packet + JGPU_OFF_EPOCH) &&
+                epoch == ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH) &&
                 sequence == s->generation) {
                 if (s->sending) {
                     s->release_pending = true;
@@ -566,16 +566,16 @@ static void *release_worker(void *opaque)
     return NULL;
 }
 
-static bool send_frame(JrgGLEngine *e, JrgSlot *s)
+static bool send_frame(DgGLEngine *e, DgSlot *s)
 {
 #ifdef CONFIG_DARWIN
     struct {
         mach_msg_header_t header;
         mach_msg_body_t body;
         mach_msg_port_descriptor_t surface;
-        uint8_t packet[JGPU_PACKET_BYTES];
+        uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
     } msg = { 0 };
-    mach_port_t port = jrg_gl_image_port(s->image);
+    mach_port_t port = dg_gl_image_port(s->image);
     kern_return_t ret;
 
     if (!MACH_PORT_VALID(port)) {
@@ -585,7 +585,7 @@ static bool send_frame(JrgGLEngine *e, JrgSlot *s)
                            MACH_MSGH_BITS_COMPLEX;
     msg.header.msgh_size = sizeof(msg);
     msg.header.msgh_remote_port = e->remote;
-    msg.header.msgh_id = JGPU_MAGIC;
+    msg.header.msgh_id = DG_TRANSPORT_MAGIC;
     msg.body.msgh_descriptor_count = 1;
     msg.surface.name = port;
     msg.surface.disposition = MACH_MSG_TYPE_COPY_SEND;
@@ -596,19 +596,19 @@ static bool send_frame(JrgGLEngine *e, JrgSlot *s)
     mach_port_deallocate(mach_task_self(), port);
     return ret == KERN_SUCCESS;
 #else
-    int fds[2] = { jrg_gl_image_fd(s->image),
-                   jrg_gl_image_fence_fd(s->image) };
+    int fds[2] = { dg_gl_image_fd(s->image),
+                   dg_gl_image_fence_fd(s->image) };
     return send_record(e, s->packet, fds, fds[1] >= 0 ? 2 : 1);
 #endif
 }
 
 static void *completion_worker(void *opaque)
 {
-    JrgGLEngine *e = opaque;
+    DgGLEngine *e = opaque;
 
     qemu_mutex_lock(&e->lock);
     for (;;) {
-        JrgSlot *s;
+        DgSlot *s;
         Error *err = NULL;
 
         while (g_queue_is_empty(&e->pending_output) && !e->stopping) {
@@ -617,7 +617,7 @@ static void *completion_worker(void *opaque)
         if (g_queue_is_empty(&e->pending_output)) {
             break;
         }
-        JrgOutput *output = g_queue_pop_head(&e->pending_output);
+        DgOutput *output = g_queue_pop_head(&e->pending_output);
         s = output->slot;
         if (!s) {
             bool publish = !e->failed && !e->stopping && !e->reset;
@@ -634,7 +634,7 @@ static void *completion_worker(void *opaque)
             continue;
         }
         qemu_mutex_unlock(&e->lock);
-        bool ready = jrg_gl_image_ready(s->image, &err);
+        bool ready = dg_gl_image_ready(s->image, &err);
         qemu_mutex_lock(&e->lock);
         /* A fast consumer may release during send_frame; publish first. */
         s->state = SLOT_PUBLISHED;
@@ -657,9 +657,9 @@ static void *completion_worker(void *opaque)
             }
         }
         if (sent) {
-            unsigned index = (s - e->slots) / JRG_GL_EXPORT_SLOTS;
-            JrgDrawable *d = &e->resources.drawables[index];
-            d->published_epoch = ldq_le_p(s->packet + JGPU_OFF_EPOCH);
+            unsigned index = (s - e->slots) / DG_GL_EXPORT_SLOTS;
+            DgDrawable *d = &e->resources.drawables[index];
+            d->published_epoch = ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH);
             d->published_generation = s->generation;
         }
         g_free(output);
@@ -670,17 +670,17 @@ static void *completion_worker(void *opaque)
     return NULL;
 }
 
-static bool make_current(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
+static bool make_current(DgGLEngine *e, DgContext *c, DgDrawable *d,
                           Error **errp)
 {
     if (e->current_context == c && e->current_drawable == d) {
         return true;
     }
     if (e->current_context && e->current_drawable &&
-        !jrg_gl_context_in_begin(e->current_context->native)) {
-        jrg_gl_flush_drawable(e->current_drawable->native);
+        !dg_gl_context_in_begin(e->current_context->native)) {
+        dg_gl_flush_drawable(e->current_drawable->native);
     }
-    if (!jrg_gl_make_current(c->native, d->native, errp)) {
+    if (!dg_gl_make_current(c->native, d->native, errp)) {
         return false;
     }
     e->current_context = c;
@@ -688,7 +688,7 @@ static bool make_current(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
     return true;
 }
 
-static void drain_output(JrgGLEngine *e)
+static void drain_output(DgGLEngine *e)
 {
     qemu_mutex_lock(&e->lock);
     while (e->pending_count) {
@@ -699,21 +699,21 @@ static void drain_output(JrgGLEngine *e)
 
 /* Count queued and in-flight packets so a stalled consumer cannot grow the
  * queue without bound. Blocking here applies only at the fixed backlog limit. */
-static uint32_t queue_desktop(JrgGLEngine *e, const uint8_t *packet)
+static uint32_t queue_desktop(DgGLEngine *e, const uint8_t *packet)
 {
-    JrgOutput *output = g_new0(JrgOutput, 1);
+    DgOutput *output = g_new0(DgOutput, 1);
     uint32_t error = 0;
 
-    memcpy(output->packet, packet, JGPU_PACKET_BYTES);
+    memcpy(output->packet, packet, DG_TRANSPORT_PACKET_BYTES);
     qemu_mutex_lock(&e->lock);
-    while (e->pending_desktop == JRG_MAX_PENDING_DESKTOP &&
+    while (e->pending_desktop == DG_MAX_PENDING_DESKTOP &&
            !e->stopping && !e->reset && !e->failed) {
         qemu_cond_wait(&e->cond, &e->lock);
     }
     if (e->reset) {
-        error = JRG_GL_ERROR_GENERATION;
+        error = DG_GL_ERROR_GENERATION;
     } else if (e->stopping || e->failed) {
-        error = JRG_GL_ERROR_TRANSPORT;
+        error = DG_GL_ERROR_TRANSPORT;
     } else {
         g_queue_push_tail(&e->pending_output, output);
         e->pending_count++;
@@ -727,18 +727,18 @@ static uint32_t queue_desktop(JrgGLEngine *e, const uint8_t *packet)
     return error;
 }
 
-static void drop_drawable_resource(JrgGLEngine *e, JrgDrawable *d)
+static void drop_drawable_resource(DgGLEngine *e, DgDrawable *d)
 {
-    uint8_t packet[JGPU_PACKET_BYTES];
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
 
     if (!d->published_generation) {
         return;
     }
-    packet_init(packet, JGPU_KIND_RESOURCE_DROP);
-    stl_le_p(packet + JGPU_OFF_CLIENT, d->client);
-    stl_le_p(packet + JGPU_OFF_DRAWABLE, d->id);
-    stq_le_p(packet + JGPU_OFF_EPOCH, d->published_epoch);
-    stq_le_p(packet + JGPU_OFF_GENERATION, d->published_generation);
+    packet_init(packet, DG_TRANSPORT_KIND_RESOURCE_DROP);
+    stl_le_p(packet + DG_TRANSPORT_OFF_CLIENT, d->client);
+    stl_le_p(packet + DG_TRANSPORT_OFF_DRAWABLE, d->id);
+    stq_le_p(packet + DG_TRANSPORT_OFF_EPOCH, d->published_epoch);
+    stq_le_p(packet + DG_TRANSPORT_OFF_GENERATION, d->published_generation);
     qemu_mutex_lock(&e->lock);
     bool publish = !e->stopping && !e->failed;
     qemu_mutex_unlock(&e->lock);
@@ -749,7 +749,7 @@ static void drop_drawable_resource(JrgGLEngine *e, JrgDrawable *d)
     }
 }
 
-static void delete_drawable(JrgGLEngine *e, JrgDrawable *d)
+static void delete_drawable(DgGLEngine *e, DgDrawable *d)
 {
     unsigned index = d - e->resources.drawables;
 
@@ -759,40 +759,40 @@ static void delete_drawable(JrgGLEngine *e, JrgDrawable *d)
     }
     e->current_context = NULL;
     e->current_drawable = NULL;
-    for (unsigned i = 0; i < JRG_GL_EXPORT_SLOTS; i++) {
-        JrgSlot *s = &e->slots[index * JRG_GL_EXPORT_SLOTS + i];
+    for (unsigned i = 0; i < DG_GL_EXPORT_SLOTS; i++) {
+        DgSlot *s = &e->slots[index * DG_GL_EXPORT_SLOTS + i];
         qemu_mutex_lock(&e->lock);
         while (s->state == SLOT_PUBLISHED && !e->stopping && !e->failed) {
             qemu_cond_wait(&e->cond, &e->lock);
         }
         qemu_mutex_unlock(&e->lock);
         /* Exported handles retain backing storage independently of this VM. */
-        jrg_gl_image_free(e->platform, s->image);
+        dg_gl_image_free(e->platform, s->image);
         qemu_mutex_lock(&e->lock);
         s->image = NULL;
         s->state = SLOT_FREE;
         qemu_mutex_unlock(&e->lock);
     }
-    jrg_gl_drawable_free(e->platform, d->native);
+    dg_gl_drawable_free(e->platform, d->native);
 }
 
-static void close_client(JrgGLEngine *e, uint32_t client);
+static void close_client(DgGLEngine *e, uint32_t client);
 
-static uint32_t present(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
+static uint32_t present(DgGLEngine *e, DgContext *c, DgDrawable *d,
                          uint32_t flags, Error **errp)
 {
-    unsigned first = (d - e->resources.drawables) * JRG_GL_EXPORT_SLOTS;
-    JrgSlot *s = NULL;
+    unsigned first = (d - e->resources.drawables) * DG_GL_EXPORT_SLOTS;
+    DgSlot *s = NULL;
     uint32_t stride, offset;
     uint64_t modifier;
 
-    if (flags & JRG_GL_PRESENT_NO_EXPORT) {
-        jrg_gl_exchange(c->native, d->native);
+    if (flags & DG_GL_PRESENT_NO_EXPORT) {
+        dg_gl_exchange(c->native, d->native);
         return 0;
     }
     qemu_mutex_lock(&e->lock);
     while (!e->stopping && !e->reset && !e->failed) {
-        for (unsigned i = 0; i < JRG_GL_EXPORT_SLOTS; i++) {
+        for (unsigned i = 0; i < DG_GL_EXPORT_SLOTS; i++) {
             if (e->slots[first + i].state == SLOT_FREE) {
                 s = &e->slots[first + i];
                 s->state = SLOT_RENDERING;
@@ -807,53 +807,53 @@ static uint32_t present(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
     }
     qemu_mutex_unlock(&e->lock);
     if (!s) {
-        return JRG_GL_ERROR_TRANSPORT;
+        return DG_GL_ERROR_TRANSPORT;
     }
     if (!s->image) {
-        s->image = jrg_gl_image_new(e->platform, d->width, d->height, errp);
+        s->image = dg_gl_image_new(e->platform, d->width, d->height, errp);
     }
-    if (!s->image || !jrg_gl_export(c->native, d->native, s->image,
-                                    !(flags & JRG_GL_PRESENT_FRONT_ONLY),
+    if (!s->image || !dg_gl_export(c->native, d->native, s->image,
+                                    !(flags & DG_GL_PRESENT_FRONT_ONLY),
                                     errp)) {
         qemu_mutex_lock(&e->lock);
         s->state = SLOT_FREE;
         qemu_mutex_unlock(&e->lock);
-        return JRG_GL_ERROR_HOST;
+        return DG_GL_ERROR_HOST;
     }
-    jrg_gl_image_metadata(s->image, &stride, &offset, &modifier);
-    if (flags & JRG_GL_PRESENT_EXCLUSIVE) {
+    dg_gl_image_metadata(s->image, &stride, &offset, &modifier);
+    if (flags & DG_GL_PRESENT_EXCLUSIVE) {
         e->exclusive = true;
     }
-    packet_init(s->packet, flags & JRG_GL_PRESENT_EXCLUSIVE ?
-                 JGPU_KIND_FRAME : JGPU_KIND_DRAWABLE);
-    uint32_t wire_flags = JGPU_FLAG_TOP_LEFT;
-    if (flags & JRG_GL_PRESENT_RETAIN) {
-        wire_flags |= JGPU_FLAG_RETAIN_FOR_DESKTOP;
+    packet_init(s->packet, flags & DG_GL_PRESENT_EXCLUSIVE ?
+                 DG_TRANSPORT_KIND_FRAME : DG_TRANSPORT_KIND_DRAWABLE);
+    uint32_t wire_flags = DG_TRANSPORT_FLAG_TOP_LEFT;
+    if (flags & DG_GL_PRESENT_RETAIN) {
+        wire_flags |= DG_TRANSPORT_FLAG_RETAIN_FOR_DESKTOP;
     }
-    if (jrg_gl_image_fence_fd(s->image) >= 0) {
-        wire_flags |= JGPU_FLAG_READY_FENCE;
+    if (dg_gl_image_fence_fd(s->image) >= 0) {
+        wire_flags |= DG_TRANSPORT_FLAG_READY_FENCE;
     }
-    stl_le_p(s->packet + JGPU_OFF_FLAGS, wire_flags);
-    stl_le_p(s->packet + JGPU_OFF_WIDTH, d->width);
-    stl_le_p(s->packet + JGPU_OFF_HEIGHT, d->height);
-    stl_le_p(s->packet + JGPU_OFF_STRIDE, stride);
-    stl_le_p(s->packet + JGPU_OFF_OFFSET, offset);
-    stl_le_p(s->packet + JGPU_OFF_FOURCC, JGPU_FORMAT_ARGB8888);
-    stl_le_p(s->packet + JGPU_OFF_SLOT, s - e->slots);
-    stl_le_p(s->packet + JGPU_OFF_CLIENT, d->client);
-    stl_le_p(s->packet + JGPU_OFF_DRAWABLE, d->id);
-    stq_le_p(s->packet + JGPU_OFF_EPOCH, d->epoch);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_FLAGS, wire_flags);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_WIDTH, d->width);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_HEIGHT, d->height);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_STRIDE, stride);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_OFFSET, offset);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_FOURCC, DG_TRANSPORT_FORMAT_ARGB8888);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_SLOT, s - e->slots);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_CLIENT, d->client);
+    stl_le_p(s->packet + DG_TRANSPORT_OFF_DRAWABLE, d->id);
+    stq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH, d->epoch);
     s->generation = ++d->generation;
-    stq_le_p(s->packet + JGPU_OFF_GENERATION, s->generation);
-    stq_le_p(s->packet + JGPU_OFF_MODIFIER, modifier);
-    memcpy(s->packet + JGPU_OFF_DEVICE_UUID, e->uuid, sizeof(e->uuid));
+    stq_le_p(s->packet + DG_TRANSPORT_OFF_GENERATION, s->generation);
+    stq_le_p(s->packet + DG_TRANSPORT_OFF_MODIFIER, modifier);
+    memcpy(s->packet + DG_TRANSPORT_OFF_DEVICE_UUID, e->uuid, sizeof(e->uuid));
     qemu_mutex_lock(&e->lock);
-    e->last_present = (JrgGLFrameRef) {
+    e->last_present = (DgGLFrameRef) {
         .slot = s - e->slots, .client = d->client, .drawable = d->id,
         .epoch = d->epoch, .generation = s->generation,
     };
     s->state = SLOT_PENDING;
-    JrgOutput *output = g_new0(JrgOutput, 1);
+    DgOutput *output = g_new0(DgOutput, 1);
     output->slot = s;
     g_queue_push_tail(&e->pending_output, output);
     e->pending_count++;
@@ -862,18 +862,18 @@ static uint32_t present(JrgGLEngine *e, JrgContext *c, JrgDrawable *d,
     return 0;
 }
 
-static uint32_t transfer_pixels(JrgGLEngine *e, const uint8_t *r,
+static uint32_t transfer_pixels(DgGLEngine *e, const uint8_t *r,
                                  uint8_t *pixels, uint32_t stride,
-                                 const JrgBatch *batch, bool writeback,
+                                 const DgBatch *batch, bool writeback,
                                  bool return_cpu)
 {
     qemu_mutex_lock(&e->lock);
-    e->transfer = (JrgGLTransfer) {
+    e->transfer = (DgGLTransfer) {
         .pixels = pixels, .stride = stride,
-        .width = word(r, JRG_DESKTOP_WIDTH),
-        .height = word(r, JRG_DESKTOP_HEIGHT),
-        .offset = word(r, JRG_DESKTOP_SLOT_OR_OFFSET),
-        .vram_stride = word(r, JRG_DESKTOP_VRAM_STRIDE),
+        .width = word(r, DG_DESKTOP_WIDTH),
+        .height = word(r, DG_DESKTOP_HEIGHT),
+        .offset = word(r, DG_DESKTOP_SLOT_OR_OFFSET),
+        .vram_stride = word(r, DG_DESKTOP_VRAM_STRIDE),
         .generation = batch->generation,
         .writeback = writeback, .return_cpu = return_cpu,
     };
@@ -890,14 +890,14 @@ static uint32_t transfer_pixels(JrgGLEngine *e, const uint8_t *r,
     while (e->transfer_pending && !e->stopping) {
         qemu_cond_wait(&e->cond, &e->lock);
     }
-    uint32_t error = e->stopping ? JRG_GL_ERROR_GENERATION : e->transfer_error;
+    uint32_t error = e->stopping ? DG_GL_ERROR_GENERATION : e->transfer_error;
     qemu_mutex_unlock(&e->lock);
     return error;
 }
 
-static JrgCpuSlot *cpu_slot(JrgGLEngine *e, size_t bytes, Error **errp)
+static DgCpuSlot *cpu_slot(DgGLEngine *e, size_t bytes, Error **errp)
 {
-    JrgCpuSlot *slot = NULL;
+    DgCpuSlot *slot = NULL;
 
     qemu_mutex_lock(&e->lock);
     while (!e->stopping && !e->reset && !e->failed) {
@@ -925,7 +925,7 @@ static JrgCpuSlot *cpu_slot(JrgGLEngine *e, size_t bytes, Error **errp)
         }
         slot->bytes = bytes;
         slot->fd = -1;
-        slot->pixels = qemu_memfd_alloc("juke-desktop", bytes, 0, &slot->fd,
+        slot->pixels = qemu_memfd_alloc("dreamgpu-desktop", bytes, 0, &slot->fd,
                                         errp);
         if (slot->pixels) {
             memset(slot->pixels, 0, bytes);
@@ -940,24 +940,24 @@ static JrgCpuSlot *cpu_slot(JrgGLEngine *e, size_t bytes, Error **errp)
     return slot;
 }
 
-static uint32_t capture_desktop(JrgGLEngine *e, const uint8_t *r,
-                                 const JrgBatch *batch, uint32_t subtype,
+static uint32_t capture_desktop(DgGLEngine *e, const uint8_t *r,
+                                 const DgBatch *batch, uint32_t subtype,
                                  Error **errp)
 {
-    uint32_t w = word(r, JRG_DESKTOP_WIDTH);
-    uint32_t h = word(r, JRG_DESKTOP_HEIGHT);
+    uint32_t w = word(r, DG_DESKTOP_WIDTH);
+    uint32_t h = word(r, DG_DESKTOP_HEIGHT);
     uint32_t stride = QEMU_ALIGN_UP(w * 4, 256);
     size_t bytes = QEMU_ALIGN_UP((size_t)stride * h, 65536);
-    uint8_t packet[JGPU_PACKET_BYTES];
-    JrgCpuSlot *s;
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
+    DgCpuSlot *s;
     uint32_t error;
 
-    if (bytes > JGPU_MAX_CPU_BYTES) {
-        return JRG_GL_ERROR_LIMIT;
+    if (bytes > DG_TRANSPORT_MAX_CPU_BYTES) {
+        return DG_GL_ERROR_LIMIT;
     }
     s = cpu_slot(e, bytes, errp);
     if (!s) {
-        return JRG_GL_ERROR_TRANSPORT;
+        return DG_GL_ERROR_TRANSPORT;
     }
     if (s->width != w || s->height != h || s->stride != stride) {
         memset(s->pixels, 0, bytes);
@@ -966,27 +966,27 @@ static uint32_t capture_desktop(JrgGLEngine *e, const uint8_t *r,
         s->stride = stride;
     }
     error = transfer_pixels(e, r, s->pixels, stride, batch, false,
-                              subtype == JGPU_CPU_RETURN);
+                              subtype == DG_TRANSPORT_CPU_RETURN);
     if (!error) {
-        packet_init(packet, JGPU_KIND_CPU_DESKTOP);
-        stl_le_p(packet + JGPU_CPU_OFF_SUBTYPE, subtype);
-        stl_le_p(packet + JGPU_OFF_WIDTH, w);
-        stl_le_p(packet + JGPU_OFF_HEIGHT, h);
-        stl_le_p(packet + JGPU_OFF_STRIDE, stride);
-        stl_le_p(packet + JGPU_OFF_FOURCC, JGPU_FORMAT_ARGB8888);
-        stl_le_p(packet + JGPU_OFF_SLOT,
-                 JGPU_CPU_SLOT_BASE + (s - e->cpu_slots));
-        stq_le_p(packet + JGPU_OFF_EPOCH, s->epoch);
-        stq_le_p(packet + JGPU_OFF_GENERATION, s->sequence);
-        stq_le_p(packet + JGPU_CPU_OFF_ALLOCATION, bytes);
-        stl_le_p(packet + JGPU_CPU_OFF_DST_X, word(r, JRG_DESKTOP_DST_X));
-        stl_le_p(packet + JGPU_CPU_OFF_DST_Y, word(r, JRG_DESKTOP_DST_Y));
-        if (subtype == JGPU_CPU_RETURN) {
-            stq_le_p(packet + JGPU_CPU_OFF_LEGACY_EPOCH, e->cpu_epoch);
-            stq_le_p(packet + JGPU_CPU_OFF_LEGACY_FRAME, e->cpu_generation);
+        packet_init(packet, DG_TRANSPORT_KIND_CPU_DESKTOP);
+        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_SUBTYPE, subtype);
+        stl_le_p(packet + DG_TRANSPORT_OFF_WIDTH, w);
+        stl_le_p(packet + DG_TRANSPORT_OFF_HEIGHT, h);
+        stl_le_p(packet + DG_TRANSPORT_OFF_STRIDE, stride);
+        stl_le_p(packet + DG_TRANSPORT_OFF_FOURCC, DG_TRANSPORT_FORMAT_ARGB8888);
+        stl_le_p(packet + DG_TRANSPORT_OFF_SLOT,
+                 DG_TRANSPORT_CPU_SLOT_BASE + (s - e->cpu_slots));
+        stq_le_p(packet + DG_TRANSPORT_OFF_EPOCH, s->epoch);
+        stq_le_p(packet + DG_TRANSPORT_OFF_GENERATION, s->sequence);
+        stq_le_p(packet + DG_TRANSPORT_CPU_OFF_ALLOCATION, bytes);
+        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_DST_X, word(r, DG_DESKTOP_DST_X));
+        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_DST_Y, word(r, DG_DESKTOP_DST_Y));
+        if (subtype == DG_TRANSPORT_CPU_RETURN) {
+            stq_le_p(packet + DG_TRANSPORT_CPU_OFF_LEGACY_EPOCH, e->cpu_epoch);
+            stq_le_p(packet + DG_TRANSPORT_CPU_OFF_LEGACY_FRAME, e->cpu_generation);
         }
         if (!send_record(e, packet, &s->fd, 1)) {
-            error = JRG_GL_ERROR_TRANSPORT;
+            error = DG_GL_ERROR_TRANSPORT;
         }
     }
     if (error) {
@@ -997,12 +997,12 @@ static uint32_t capture_desktop(JrgGLEngine *e, const uint8_t *r,
     return error;
 }
 
-static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
-                                  const JrgBatch *batch, uint8_t *packet)
+static uint32_t readback_desktop(DgGLEngine *e, const uint8_t *r,
+                                  const DgBatch *batch, uint8_t *packet)
 {
     uint32_t error = 0;
-    uint32_t w = word(r, JRG_DESKTOP_WIDTH);
-    uint32_t h = word(r, JRG_DESKTOP_HEIGHT);
+    uint32_t w = word(r, DG_DESKTOP_WIDTH);
+    uint32_t h = word(r, DG_DESKTOP_HEIGHT);
     uint64_t token = e->desktop_sequence;
     int fd = -1;
     struct stat statbuf;
@@ -1010,7 +1010,7 @@ static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
     uint64_t bytes = 0;
     uint32_t stride = 0;
 
-    stq_le_p(packet + JGPU_DESKTOP_OFF_TOKEN, token);
+    stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_TOKEN, token);
     qemu_mutex_lock(&e->lock);
     e->reply_pending = true;
     e->reply_ready = false;
@@ -1019,7 +1019,7 @@ static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
     e->reply_token = token;
     qemu_mutex_unlock(&e->lock);
     if (!send_record(e, packet, NULL, 0)) {
-        error = JRG_GL_ERROR_TRANSPORT;
+        error = DG_GL_ERROR_TRANSPORT;
     }
     qemu_mutex_lock(&e->lock);
     int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
@@ -1033,22 +1033,22 @@ static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
                             DIV_ROUND_UP(remaining, G_TIME_SPAN_MILLISECOND));
     }
     if (e->stopping || e->reset) {
-        error = JRG_GL_ERROR_GENERATION;
+        error = DG_GL_ERROR_GENERATION;
     } else if (!error && (!e->reply_ready || e->failed)) {
-        error = JRG_GL_ERROR_TRANSPORT;
+        error = DG_GL_ERROR_TRANSPORT;
     }
     fd = e->reply_fd;
     e->reply_fd = -1;
     if (!error) {
-        bytes = ldq_le_p(e->reply_packet + JGPU_CPU_OFF_ALLOCATION);
-        stride = word(e->reply_packet, JGPU_OFF_STRIDE);
+        bytes = ldq_le_p(e->reply_packet + DG_TRANSPORT_CPU_OFF_ALLOCATION);
+        stride = word(e->reply_packet, DG_TRANSPORT_OFF_STRIDE);
         if (word(e->reply_packet, 16) || fd < 0 ||
-            word(e->reply_packet, JGPU_OFF_WIDTH) != w ||
-            word(e->reply_packet, JGPU_OFF_HEIGHT) != h ||
+            word(e->reply_packet, DG_TRANSPORT_OFF_WIDTH) != w ||
+            word(e->reply_packet, DG_TRANSPORT_OFF_HEIGHT) != h ||
             stride != w * 4 || bytes != (uint64_t)stride * h ||
-            bytes > JGPU_MAX_CPU_BYTES || fstat(fd, &statbuf) ||
+            bytes > DG_TRANSPORT_MAX_CPU_BYTES || fstat(fd, &statbuf) ||
             statbuf.st_size < 0 || (uint64_t)statbuf.st_size < bytes) {
-            error = JRG_GL_ERROR_DESKTOP;
+            error = DG_GL_ERROR_DESKTOP;
         }
     }
     e->reply_pending = false;
@@ -1057,7 +1057,7 @@ static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
     if (!error) {
         pixels = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
         if (pixels == MAP_FAILED) {
-            error = JRG_GL_ERROR_HOST;
+            error = DG_GL_ERROR_HOST;
         } else {
             error = transfer_pixels(e, r, pixels, stride, batch, true, false);
         }
@@ -1071,23 +1071,23 @@ static uint32_t readback_desktop(JrgGLEngine *e, const uint8_t *r,
     return error;
 }
 
-static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
-                                  const JrgBatch *batch, Error **errp)
+static uint32_t execute_desktop(DgGLEngine *e, const uint8_t *record,
+                                  const DgBatch *batch, Error **errp)
 {
-    const uint8_t *r = record + JRG_GL_HEADER_BYTES;
-    uint32_t op = word(r, JRG_DESKTOP_OP);
-    uint32_t client = word(record, JRG_GL_OFF_CLIENT);
-    uint32_t drawable = word(record, JRG_GL_OFF_DRAWABLE);
-    uint32_t w = word(r, JRG_DESKTOP_WIDTH);
-    uint32_t h = word(r, JRG_DESKTOP_HEIGHT);
+    const uint8_t *r = record + DG_GL_HEADER_BYTES;
+    uint32_t op = word(r, DG_DESKTOP_OP);
+    uint32_t client = word(record, DG_GL_OFF_CLIENT);
+    uint32_t drawable = word(record, DG_GL_OFF_DRAWABLE);
+    uint32_t w = word(r, DG_DESKTOP_WIDTH);
+    uint32_t h = word(r, DG_DESKTOP_HEIGHT);
     uint32_t wire_op = 0, error = 0;
-    uint8_t packet[JGPU_PACKET_BYTES];
+    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
 
-    bool detached = op == JRG_DESKTOP_DISCARD;
+    bool detached = op == DG_DESKTOP_DISCARD;
 
-    if (op == JRG_DESKTOP_SEED) {
+    if (op == DG_DESKTOP_SEED) {
         if (e->desktop_active) {
-            return JRG_GL_ERROR_DESKTOP;
+            return DG_GL_ERROR_DESKTOP;
         }
         ++e->desktop_epoch;
         e->desktop_sequence = 0;
@@ -1096,7 +1096,7 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
     } else if (!detached && (!e->desktop_active ||
                batch->primary_width != e->desktop_width ||
                batch->primary_height != e->desktop_height)) {
-        return JRG_GL_ERROR_DESKTOP;
+        return DG_GL_ERROR_DESKTOP;
     }
     /* Releasing an occluded retained image does not acquire or mutate the
      * desktop. Keep it ordered in the output FIFO, outside desktop epochs. */
@@ -1104,23 +1104,23 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
         ++e->desktop_sequence;
     }
     switch (op) {
-    case JRG_DESKTOP_SEED:
-    case JRG_DESKTOP_PATCH:
-    case JRG_DESKTOP_RETURN:
-        if (op == JRG_DESKTOP_RETURN && !e->desktop_coherent) {
+    case DG_DESKTOP_SEED:
+    case DG_DESKTOP_PATCH:
+    case DG_DESKTOP_RETURN:
+        if (op == DG_DESKTOP_RETURN && !e->desktop_coherent) {
             --e->desktop_sequence;
-            return JRG_GL_ERROR_DESKTOP;
+            return DG_GL_ERROR_DESKTOP;
         }
         /* CPU patches and returns must follow every queued GPU operation. */
         drain_output(e);
         error = capture_desktop(e, r, batch,
-                                  op == JRG_DESKTOP_SEED ? JGPU_CPU_SEED :
-                                  op == JRG_DESKTOP_PATCH ? JGPU_CPU_PATCH :
-                                  JGPU_CPU_RETURN, errp);
-        if (!error && op == JRG_DESKTOP_SEED) {
+                                  op == DG_DESKTOP_SEED ? DG_TRANSPORT_CPU_SEED :
+                                  op == DG_DESKTOP_PATCH ? DG_TRANSPORT_CPU_PATCH :
+                                  DG_TRANSPORT_CPU_RETURN, errp);
+        if (!error && op == DG_DESKTOP_SEED) {
             e->desktop_active = e->desktop_coherent = true;
         }
-        if (!error && op == JRG_DESKTOP_RETURN) {
+        if (!error && op == DG_DESKTOP_RETURN) {
             e->exclusive = false;
             e->desktop_active = e->desktop_coherent = false;
         }
@@ -1128,76 +1128,76 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
             --e->desktop_sequence;
         }
         return error;
-    case JRG_DESKTOP_FILL:
-        wire_op = JGPU_DESKTOP_FILL;
+    case DG_DESKTOP_FILL:
+        wire_op = DG_TRANSPORT_DESKTOP_FILL;
         break;
-    case JRG_DESKTOP_COPY:
-        wire_op = JGPU_DESKTOP_COPY;
+    case DG_DESKTOP_COPY:
+        wire_op = DG_TRANSPORT_DESKTOP_COPY;
         break;
-    case JRG_DESKTOP_READBACK:
-        wire_op = JGPU_DESKTOP_READBACK;
+    case DG_DESKTOP_READBACK:
+        wire_op = DG_TRANSPORT_DESKTOP_READBACK;
         break;
-    case JRG_DESKTOP_BLIT:
-    case JRG_DESKTOP_DISCARD: {
-        uint32_t index = word(r, JRG_DESKTOP_SLOT_OR_OFFSET);
-        uint64_t epoch = ldq_le_p(r + JRG_DESKTOP_IMAGE_EPOCH);
-        uint64_t frame = ldq_le_p(r + JRG_DESKTOP_IMAGE_FRAME);
-        JrgSlot *s = &e->slots[index];
+    case DG_DESKTOP_BLIT:
+    case DG_DESKTOP_DISCARD: {
+        uint32_t index = word(r, DG_DESKTOP_SLOT_OR_OFFSET);
+        uint64_t epoch = ldq_le_p(r + DG_DESKTOP_IMAGE_EPOCH);
+        uint64_t frame = ldq_le_p(r + DG_DESKTOP_IMAGE_FRAME);
+        DgSlot *s = &e->slots[index];
         qemu_mutex_lock(&e->lock);
         /* The matching frame is already ahead of this command in the output
          * FIFO. Retained storage stays alive until the desktop consumer's
          * final blit/discard; no GPU-fence wait belongs on this thread. */
         bool valid = (s->state == SLOT_PENDING || s->state == SLOT_PUBLISHED) &&
-            word(s->packet, JGPU_OFF_CLIENT) == client &&
-            word(s->packet, JGPU_OFF_DRAWABLE) == drawable &&
-            ldq_le_p(s->packet + JGPU_OFF_EPOCH) == epoch &&
+            word(s->packet, DG_TRANSPORT_OFF_CLIENT) == client &&
+            word(s->packet, DG_TRANSPORT_OFF_DRAWABLE) == drawable &&
+            ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH) == epoch &&
             s->generation == frame &&
-            (word(s->packet, JGPU_OFF_FLAGS) & JGPU_FLAG_RETAIN_FOR_DESKTOP);
-        if (op == JRG_DESKTOP_BLIT) {
-            valid &= dreamgpu_desktop_rect(word(r, JRG_DESKTOP_SRC_X),
-                                    word(r, JRG_DESKTOP_SRC_Y), w, h,
-                                    word(s->packet, JGPU_OFF_WIDTH),
-                                    word(s->packet, JGPU_OFF_HEIGHT));
+            (word(s->packet, DG_TRANSPORT_OFF_FLAGS) & DG_TRANSPORT_FLAG_RETAIN_FOR_DESKTOP);
+        if (op == DG_DESKTOP_BLIT) {
+            valid &= dreamgpu_desktop_rect(word(r, DG_DESKTOP_SRC_X),
+                                    word(r, DG_DESKTOP_SRC_Y), w, h,
+                                    word(s->packet, DG_TRANSPORT_OFF_WIDTH),
+                                    word(s->packet, DG_TRANSPORT_OFF_HEIGHT));
         }
         qemu_mutex_unlock(&e->lock);
         if (!valid) {
             if (!detached) {
                 --e->desktop_sequence;
             }
-            return JRG_GL_ERROR_DESKTOP;
+            return DG_GL_ERROR_DESKTOP;
         }
-        wire_op = op == JRG_DESKTOP_BLIT ? JGPU_DESKTOP_BLIT :
-                                          JGPU_DESKTOP_DISCARD;
+        wire_op = op == DG_DESKTOP_BLIT ? DG_TRANSPORT_DESKTOP_BLIT :
+                                          DG_TRANSPORT_DESKTOP_DISCARD;
         break;
     }
     }
-    packet_init(packet, JGPU_KIND_DESKTOP_OP);
-    stl_le_p(packet + JGPU_DESKTOP_OFF_OPCODE, wire_op);
-    stl_le_p(packet + JGPU_DESKTOP_OFF_DST_X, word(r, JRG_DESKTOP_DST_X));
-    stl_le_p(packet + JGPU_DESKTOP_OFF_DST_Y, word(r, JRG_DESKTOP_DST_Y));
-    stl_le_p(packet + JGPU_DESKTOP_OFF_WIDTH, w);
-    stl_le_p(packet + JGPU_DESKTOP_OFF_HEIGHT, h);
-    stq_le_p(packet + JGPU_OFF_EPOCH, detached ? 0 : e->desktop_epoch);
-    stq_le_p(packet + JGPU_OFF_GENERATION, detached ? 0 : e->desktop_sequence);
-    if (op == JRG_DESKTOP_FILL) {
-        stl_le_p(packet + JGPU_DESKTOP_OFF_COLOR, word(r, JRG_DESKTOP_SRC_X));
-    } else if (op == JRG_DESKTOP_COPY || op == JRG_DESKTOP_BLIT ||
-               op == JRG_DESKTOP_DISCARD) {
-        stl_le_p(packet + JGPU_DESKTOP_OFF_SRC_X, word(r, JRG_DESKTOP_SRC_X));
-        stl_le_p(packet + JGPU_DESKTOP_OFF_SRC_Y, word(r, JRG_DESKTOP_SRC_Y));
+    packet_init(packet, DG_TRANSPORT_KIND_DESKTOP_OP);
+    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_OPCODE, wire_op);
+    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_DST_X, word(r, DG_DESKTOP_DST_X));
+    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_DST_Y, word(r, DG_DESKTOP_DST_Y));
+    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_WIDTH, w);
+    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_HEIGHT, h);
+    stq_le_p(packet + DG_TRANSPORT_OFF_EPOCH, detached ? 0 : e->desktop_epoch);
+    stq_le_p(packet + DG_TRANSPORT_OFF_GENERATION, detached ? 0 : e->desktop_sequence);
+    if (op == DG_DESKTOP_FILL) {
+        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_COLOR, word(r, DG_DESKTOP_SRC_X));
+    } else if (op == DG_DESKTOP_COPY || op == DG_DESKTOP_BLIT ||
+               op == DG_DESKTOP_DISCARD) {
+        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_SRC_X, word(r, DG_DESKTOP_SRC_X));
+        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_SRC_Y, word(r, DG_DESKTOP_SRC_Y));
     }
-    if (op == JRG_DESKTOP_BLIT || op == JRG_DESKTOP_DISCARD) {
-        stl_le_p(packet + JGPU_OFF_CLIENT, client);
-        stl_le_p(packet + JGPU_OFF_DRAWABLE, drawable);
-        stl_le_p(packet + JGPU_DESKTOP_OFF_GPU_SLOT,
-                 word(r, JRG_DESKTOP_SLOT_OR_OFFSET));
-        stq_le_p(packet + JGPU_DESKTOP_OFF_GPU_EPOCH,
-                 ldq_le_p(r + JRG_DESKTOP_IMAGE_EPOCH));
-        stq_le_p(packet + JGPU_DESKTOP_OFF_GPU_FRAME,
-                 ldq_le_p(r + JRG_DESKTOP_IMAGE_FRAME));
-        stl_le_p(packet + JGPU_DESKTOP_OFF_FLAGS, word(r, JRG_DESKTOP_FLAGS));
+    if (op == DG_DESKTOP_BLIT || op == DG_DESKTOP_DISCARD) {
+        stl_le_p(packet + DG_TRANSPORT_OFF_CLIENT, client);
+        stl_le_p(packet + DG_TRANSPORT_OFF_DRAWABLE, drawable);
+        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_SLOT,
+                 word(r, DG_DESKTOP_SLOT_OR_OFFSET));
+        stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_EPOCH,
+                 ldq_le_p(r + DG_DESKTOP_IMAGE_EPOCH));
+        stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_FRAME,
+                 ldq_le_p(r + DG_DESKTOP_IMAGE_FRAME));
+        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_FLAGS, word(r, DG_DESKTOP_FLAGS));
     }
-    if (op == JRG_DESKTOP_READBACK) {
+    if (op == DG_DESKTOP_READBACK) {
         drain_output(e);
         error = readback_desktop(e, r, batch, packet);
         if (!error && w == e->desktop_width && h == e->desktop_height) {
@@ -1205,11 +1205,11 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
         }
     } else {
         error = queue_desktop(e, packet);
-        if (op != JRG_DESKTOP_DISCARD) {
+        if (op != DG_DESKTOP_DISCARD) {
             e->desktop_coherent = false;
         }
     }
-    if (error && error != JRG_GL_ERROR_GENERATION) {
+    if (error && error != DG_GL_ERROR_GENERATION) {
         qemu_mutex_lock(&e->lock);
         e->failed = true;
         qemu_cond_broadcast(&e->cond);
@@ -1218,7 +1218,7 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
     return error;
 }
 
-bool jrg_gl_engine_transfer(JrgGLEngine *e, JrgGLTransfer *transfer)
+bool dg_gl_engine_transfer(DgGLEngine *e, DgGLTransfer *transfer)
 {
     bool available;
 
@@ -1232,7 +1232,7 @@ bool jrg_gl_engine_transfer(JrgGLEngine *e, JrgGLTransfer *transfer)
     return available;
 }
 
-void jrg_gl_engine_transfer_done(JrgGLEngine *e, uint32_t error,
+void dg_gl_engine_transfer_done(DgGLEngine *e, uint32_t error,
                                  uint64_t cpu_epoch, uint64_t cpu_generation)
 {
     qemu_mutex_lock(&e->lock);
@@ -1248,28 +1248,28 @@ void jrg_gl_engine_transfer_done(JrgGLEngine *e, uint32_t error,
 
 /* Native API callbacks deliberately contain no command routing or resource
  * admission policy; the Rust dispatcher owns those decisions and registry. */
-typedef struct JrgDispatch {
-    JrgGLEngine *engine;
-    JrgBatch *batch;
+typedef struct DgDispatch {
+    DgGLEngine *engine;
+    DgBatch *batch;
     Error **errp;
-} JrgDispatch;
+} DgDispatch;
 
 static void *host_context_new(void *opaque, void *share)
 {
-    JrgDispatch *d = opaque;
-    return jrg_gl_context_new(d->engine->platform, share, d->errp);
+    DgDispatch *d = opaque;
+    return dg_gl_context_new(d->engine->platform, share, d->errp);
 }
 
 static void *host_drawable_new(void *opaque, uint32_t width, uint32_t height)
 {
-    JrgDispatch *d = opaque;
-    JrgGLEngine *e = d->engine;
+    DgDispatch *d = opaque;
+    DgGLEngine *e = d->engine;
     drain_output(e);
     if (e->current_context && e->current_drawable &&
-        !jrg_gl_context_in_begin(e->current_context->native)) {
-        jrg_gl_flush_drawable(e->current_drawable->native);
+        !dg_gl_context_in_begin(e->current_context->native)) {
+        dg_gl_flush_drawable(e->current_drawable->native);
     }
-    void *native = jrg_gl_drawable_new(e->platform, width, height, d->errp);
+    void *native = dg_gl_drawable_new(e->platform, width, height, d->errp);
     e->current_context = NULL;
     e->current_drawable = NULL;
     return native;
@@ -1277,27 +1277,27 @@ static void *host_drawable_new(void *opaque, uint32_t width, uint32_t height)
 
 static void host_context_free(void *opaque, uint32_t index)
 {
-    JrgDispatch *d = opaque;
-    JrgGLEngine *e = d->engine;
-    JrgContext *c = &e->resources.contexts[index];
+    DgDispatch *d = opaque;
+    DgGLEngine *e = d->engine;
+    DgContext *c = &e->resources.contexts[index];
     drain_output(e);
     if (e->current_context == c && e->current_drawable &&
-        !jrg_gl_context_in_begin(c->native)) {
-        jrg_gl_flush_drawable(e->current_drawable->native);
+        !dg_gl_context_in_begin(c->native)) {
+        dg_gl_flush_drawable(e->current_drawable->native);
     }
-    jrg_gl_context_free(c->native);
+    dg_gl_context_free(c->native);
     e->current_context = NULL;
 }
 
 static void host_drawable_free(void *opaque, uint32_t index)
 {
-    JrgDispatch *d = opaque;
+    DgDispatch *d = opaque;
     delete_drawable(d->engine, &d->engine->resources.drawables[index]);
 }
 
 static void host_close_begin(void *opaque)
 {
-    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
+    DgGLEngine *e = ((DgDispatch *)opaque)->engine;
     drain_output(e);
     e->current_context = NULL;
     e->current_drawable = NULL;
@@ -1305,55 +1305,55 @@ static void host_close_begin(void *opaque)
 
 static uint32_t host_in_begin(void *opaque, uint32_t index)
 {
-    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
-    return jrg_gl_context_in_begin(e->resources.contexts[index].native);
+    DgGLEngine *e = ((DgDispatch *)opaque)->engine;
+    return dg_gl_context_in_begin(e->resources.contexts[index].native);
 }
 
 static uint32_t host_make_current(void *opaque, uint32_t ci, uint32_t di)
 {
-    JrgDispatch *d = opaque;
+    DgDispatch *d = opaque;
     return make_current(d->engine, &d->engine->resources.contexts[ci],
                         &d->engine->resources.drawables[di], d->errp) ?
-           0 : JRG_GL_ERROR_HOST;
+           0 : DG_GL_ERROR_HOST;
 }
 
 static uint32_t host_call(void *opaque, uint32_t ci, uint32_t fn,
                            const uint8_t *args)
 {
-    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
-    return jrg_gl_call(e->resources.contexts[ci].native, fn, args);
+    DgGLEngine *e = ((DgDispatch *)opaque)->engine;
+    return dg_gl_call(e->resources.contexts[ci].native, fn, args);
 }
 
 static uint32_t host_data(void *opaque, uint32_t ci, uint32_t fn,
                            const uint8_t *args, const uint8_t *data,
                            uint32_t bytes)
 {
-    JrgGLEngine *e = ((JrgDispatch *)opaque)->engine;
-    return jrg_gl_data_call(e->resources.contexts[ci].native, fn, args,
+    DgGLEngine *e = ((DgDispatch *)opaque)->engine;
+    return dg_gl_data_call(e->resources.contexts[ci].native, fn, args,
                             data, bytes);
 }
 
 static uint32_t host_words(void *opaque, uint32_t fn)
 {
-    return jrg_gl_function_words(fn);
+    return dg_gl_function_words(fn);
 }
 
 static uint32_t host_query(void *opaque, uint32_t ci, uint32_t fn,
                             const uint8_t *args)
 {
-    JrgDispatch *d = opaque;
-    JrgBatch *batch = d->batch;
-    uint32_t required = jrg_gl_query_result_bytes(fn, args);
-    if (required > JRG_GL_MAX_READBACK_BYTES) {
-        return JRG_GL_ERROR_LIMIT;
+    DgDispatch *d = opaque;
+    DgBatch *batch = d->batch;
+    uint32_t required = dg_gl_query_result_bytes(fn, args);
+    if (required > DG_GL_MAX_READBACK_BYTES) {
+        return DG_GL_ERROR_LIMIT;
     }
     if (required > sizeof(batch->result)) {
         batch->bulk_result = g_try_malloc(required);
         if (!batch->bulk_result) {
-            return JRG_GL_ERROR_LIMIT;
+            return DG_GL_ERROR_LIMIT;
         }
     }
-    return jrg_gl_query(d->engine->resources.contexts[ci].native, fn, args,
+    return dg_gl_query(d->engine->resources.contexts[ci].native, fn, args,
                         batch->bulk_result ? batch->bulk_result : batch->result,
                         &batch->result_bytes, &batch->result_type);
 }
@@ -1361,18 +1361,18 @@ static uint32_t host_query(void *opaque, uint32_t ci, uint32_t fn,
 static uint32_t host_present(void *opaque, uint32_t ci, uint32_t di,
                               uint32_t flags)
 {
-    JrgDispatch *d = opaque;
+    DgDispatch *d = opaque;
     return present(d->engine, &d->engine->resources.contexts[ci],
                    &d->engine->resources.drawables[di], flags, d->errp);
 }
 
 static uint32_t host_desktop(void *opaque, const uint8_t *record)
 {
-    JrgDispatch *d = opaque;
+    DgDispatch *d = opaque;
     return execute_desktop(d->engine, record, d->batch, d->errp);
 }
 
-static DreamGpuPlatform host_platform(JrgDispatch *dispatch)
+static DreamGpuPlatform host_platform(DgDispatch *dispatch)
 {
     return (DreamGpuPlatform) {
         .opaque = dispatch, .context_new = host_context_new,
@@ -1384,25 +1384,25 @@ static DreamGpuPlatform host_platform(JrgDispatch *dispatch)
     };
 }
 
-static void close_client(JrgGLEngine *e, uint32_t client)
+static void close_client(DgGLEngine *e, uint32_t client)
 {
-    JrgDispatch dispatch = { .engine = e };
+    DgDispatch dispatch = { .engine = e };
     DreamGpuPlatform platform = host_platform(&dispatch);
     dreamgpu_gl_close_client(&e->resources, &platform, client);
 }
 
-static uint32_t execute_record(JrgGLEngine *e, const uint8_t *record,
-                                JrgBatch *batch,
+static uint32_t execute_record(DgGLEngine *e, const uint8_t *record,
+                                DgBatch *batch,
                                 const DreamGpuPlatform *platform)
 {
     return dreamgpu_gl_execute(&e->resources, platform, record,
-                               word(record, JRG_GL_OFF_SIZE),
+                               word(record, DG_GL_OFF_SIZE),
                                batch->primary_width, batch->primary_height);
 }
 
 static void *render_worker(void *opaque)
 {
-    JrgGLEngine *e = opaque;
+    DgGLEngine *e = opaque;
     Error *err = NULL;
 
     if (!connect_consumer(e, &err)) {
@@ -1418,15 +1418,15 @@ static void *render_worker(void *opaque)
             return NULL;
         }
         qemu_mutex_unlock(&e->lock);
-        qemu_thread_create(&e->release_thread, "juke-gl-release",
+        qemu_thread_create(&e->release_thread, "dreamgpu-gl-release",
                             release_worker, e, QEMU_THREAD_JOINABLE);
-        qemu_thread_create(&e->completion_thread, "juke-gl-fence",
+        qemu_thread_create(&e->completion_thread, "dreamgpu-gl-fence",
                             completion_worker, e, QEMU_THREAD_JOINABLE);
         e->threads_started = true;
     }
     qemu_mutex_lock(&e->lock);
     while (!e->stopping) {
-        JrgBatch *batch;
+        DgBatch *batch;
         uint32_t result = 0;
 
         while (!e->batch && !e->reset && !e->stopping) {
@@ -1443,11 +1443,11 @@ static void *render_worker(void *opaque)
                     drop_drawable_resource(e, &e->resources.drawables[i]);
                 }
             }
-            uint8_t reset_packet[JGPU_PACKET_BYTES];
-            packet_init(reset_packet, JGPU_KIND_RESET);
-            stq_le_p(reset_packet + JGPU_CPU_OFF_LEGACY_EPOCH,
+            uint8_t reset_packet[DG_TRANSPORT_PACKET_BYTES];
+            packet_init(reset_packet, DG_TRANSPORT_KIND_RESET);
+            stq_le_p(reset_packet + DG_TRANSPORT_CPU_OFF_LEGACY_EPOCH,
                      e->reset_cpu_epoch);
-            stq_le_p(reset_packet + JGPU_CPU_OFF_LEGACY_FRAME,
+            stq_le_p(reset_packet + DG_TRANSPORT_CPU_OFF_LEGACY_FRAME,
                      e->reset_cpu_generation);
             if (!send_record(e, reset_packet, NULL, 0)) {
                 qemu_mutex_lock(&e->lock);
@@ -1460,7 +1460,7 @@ static void *render_worker(void *opaque)
             e->exclusive = false;
             e->desktop_active = e->desktop_coherent = false;
             memset(&e->last_present, 0, sizeof(e->last_present));
-            JrgGLCompletion *reset_done = g_new0(JrgGLCompletion, 1);
+            DgGLCompletion *reset_done = g_new0(DgGLCompletion, 1);
             reset_done->generation = e->reset_generation;
             reset_done->reset = true;
             g_queue_push_tail(&e->completions, reset_done);
@@ -1473,41 +1473,41 @@ static void *render_worker(void *opaque)
         if (!batch) {
             continue;
         }
-        result = e->failed ? JRG_GL_ERROR_TRANSPORT : 0;
+        result = e->failed ? DG_GL_ERROR_TRANSPORT : 0;
         qemu_mutex_unlock(&e->lock);
         uint64_t trace_start_us = batch->trace_queued_us ?
                                  g_get_monotonic_time() : 0;
-        JrgDispatch dispatch = { e, batch, &err };
+        DgDispatch dispatch = { e, batch, &err };
         DreamGpuPlatform platform = host_platform(&dispatch);
         for (size_t offset = 0; !result && offset < batch->bytes;) {
             qemu_mutex_lock(&e->lock);
             bool cancelled = e->reset || e->stopping;
             qemu_mutex_unlock(&e->lock);
             if (cancelled) {
-                result = JRG_GL_ERROR_GENERATION;
+                result = DG_GL_ERROR_GENERATION;
                 break;
             }
             err = NULL;
             result = execute_record(e, batch->data + offset, batch, &platform);
             if (result) {
                 trace_rejection(batch->data + offset,
-                    word(batch->data + offset, JRG_GL_OFF_SIZE),
+                    word(batch->data + offset, DG_GL_OFF_SIZE),
                     batch->sequence, true, result);
             }
             if (err) {
                 error_report_err(err);
             }
-            offset += word(batch->data + offset, JRG_GL_OFF_SIZE);
+            offset += word(batch->data + offset, DG_GL_OFF_SIZE);
         }
         if (trace_start_us) {
-            trace_juke_retro_gl_work(batch->sequence, batch->records,
+            trace_dreamgpu_gl_work(batch->sequence, batch->records,
                                     batch->bytes,
                                     trace_start_us - batch->trace_queued_us,
                                     g_get_monotonic_time() - trace_start_us,
                                     result);
         }
-        JrgGLCompletion *done = g_new(JrgGLCompletion, 1);
-        *done = (JrgGLCompletion) { .sequence = batch->sequence,
+        DgGLCompletion *done = g_new(DgGLCompletion, 1);
+        *done = (DgGLCompletion) { .sequence = batch->sequence,
                                     .generation = batch->generation,
                                     .error = result,
                                     .resources_live = e->exclusive ||
@@ -1542,14 +1542,14 @@ static void *render_worker(void *opaque)
         qemu_mutex_lock(&e->lock);
     }
     qemu_mutex_unlock(&e->lock);
-    jrg_gl_clear_current(e->platform);
+    dg_gl_clear_current(e->platform);
     return NULL;
 }
 
-JrgGLEngine *jrg_gl_engine_new(const char *socket_path, JrgGLNotify notify,
+DgGLEngine *dg_gl_engine_new(const char *socket_path, DgGLNotify notify,
                               void *opaque)
 {
-    JrgGLEngine *e = g_new0(JrgGLEngine, 1);
+    DgGLEngine *e = g_new0(DgGLEngine, 1);
 
     qemu_mutex_init(&e->lock);
     qemu_mutex_init(&e->send_lock);
@@ -1564,12 +1564,12 @@ JrgGLEngine *jrg_gl_engine_new(const char *socket_path, JrgGLNotify notify,
     }
     e->notify = notify;
     e->opaque = opaque;
-    qemu_thread_create(&e->render_thread, "juke-gl", render_worker, e,
+    qemu_thread_create(&e->render_thread, "dreamgpu-gl", render_worker, e,
                         QEMU_THREAD_JOINABLE);
     return e;
 }
 
-void jrg_gl_engine_free(JrgGLEngine *e)
+void dg_gl_engine_free(DgGLEngine *e)
 {
     if (!e) {
         return;
@@ -1587,7 +1587,7 @@ void jrg_gl_engine_free(JrgGLEngine *e)
         qemu_thread_join(&e->release_thread);
     }
     close_client(e, 0);
-    jrg_gl_platform_free(e->platform);
+    dg_gl_platform_free(e->platform);
     if (e->batch) {
         g_free(e->batch->data);
         g_free(e->batch);
@@ -1602,7 +1602,7 @@ void jrg_gl_engine_free(JrgGLEngine *e)
         close(e->socket);
     }
     for (unsigned i = 0; i < G_N_ELEMENTS(e->cpu_slots); i++) {
-        JrgCpuSlot *s = &e->cpu_slots[i];
+        DgCpuSlot *s = &e->cpu_slots[i];
         if (s->pixels) {
             qemu_memfd_free(s->pixels, s->bytes, s->fd);
         }
@@ -1617,7 +1617,7 @@ void jrg_gl_engine_free(JrgGLEngine *e)
     g_free(e);
 }
 
-bool jrg_gl_engine_submit(JrgGLEngine *e, uint8_t *data, size_t bytes,
+bool dg_gl_engine_submit(DgGLEngine *e, uint8_t *data, size_t bytes,
                            uint32_t sequence, uint32_t generation,
                            uint32_t primary_width, uint32_t primary_height,
                            uint32_t records)
@@ -1627,13 +1627,13 @@ bool jrg_gl_engine_submit(JrgGLEngine *e, uint8_t *data, size_t bytes,
         qemu_mutex_unlock(&e->lock);
         return false;
     }
-    e->batch = g_new0(JrgBatch, 1);
-    *e->batch = (JrgBatch) { .data = data, .bytes = bytes,
+    e->batch = g_new0(DgBatch, 1);
+    *e->batch = (DgBatch) { .data = data, .bytes = bytes,
                             .sequence = sequence, .generation = generation,
                             .records = records,
                             .trace_queued_us =
                                 trace_event_get_state_backends(
-                                    TRACE_JUKE_RETRO_GL_WORK) ?
+                                    TRACE_DREAMGPU_GL_WORK) ?
                                     g_get_monotonic_time() : 0,
                             .primary_width = primary_width,
                             .primary_height = primary_height };
@@ -1642,7 +1642,7 @@ bool jrg_gl_engine_submit(JrgGLEngine *e, uint8_t *data, size_t bytes,
     return true;
 }
 
-void jrg_gl_engine_reset(JrgGLEngine *e, uint32_t generation,
+void dg_gl_engine_reset(DgGLEngine *e, uint32_t generation,
                           uint64_t cpu_epoch, uint64_t cpu_generation)
 {
     qemu_mutex_lock(&e->lock);
@@ -1659,9 +1659,9 @@ void jrg_gl_engine_reset(JrgGLEngine *e, uint32_t generation,
     qemu_mutex_unlock(&e->lock);
 }
 
-bool jrg_gl_engine_completion(JrgGLEngine *e, JrgGLCompletion *completion)
+bool dg_gl_engine_completion(DgGLEngine *e, DgGLCompletion *completion)
 {
-    JrgGLCompletion *done;
+    DgGLCompletion *done;
 
     qemu_mutex_lock(&e->lock);
     done = g_queue_pop_head(&e->completions);

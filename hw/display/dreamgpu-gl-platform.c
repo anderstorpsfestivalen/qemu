@@ -5,10 +5,10 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
-#include "standard-headers/juke/retro-gl-funcs.h"
-#include "standard-headers/juke/retro-gl.h"
-#include "standard-headers/juke/gpu-transport.h"
-#include "juke-retro-gl-platform.h"
+#include "standard-headers/dreamgpu/gl-funcs.h"
+#include "standard-headers/dreamgpu/gl.h"
+#include "standard-headers/dreamgpu/transport.h"
+#include "dreamgpu-gl-platform.h"
 
 #ifdef CONFIG_DARWIN
 #define GL_SILENCE_DEPRECATION
@@ -17,17 +17,17 @@
 #include <OpenGL/glext.h>
 #include <OpenGL/CGLIOSurface.h>
 #include <IOSurface/IOSurface.h>
-#define jrgGenFramebuffers glGenFramebuffersEXT
-#define jrgDeleteFramebuffers glDeleteFramebuffersEXT
-#define jrgBindFramebuffer glBindFramebufferEXT
-#define jrgFramebufferTexture2D glFramebufferTexture2DEXT
-#define jrgCheckFramebufferStatus glCheckFramebufferStatusEXT
-#define jrgBlitFramebuffer glBlitFramebufferEXT
-#define jrgGenRenderbuffers glGenRenderbuffersEXT
-#define jrgDeleteRenderbuffers glDeleteRenderbuffersEXT
-#define jrgBindRenderbuffer glBindRenderbufferEXT
-#define jrgRenderbufferStorage glRenderbufferStorageEXT
-#define jrgFramebufferRenderbuffer glFramebufferRenderbufferEXT
+#define dgGenFramebuffers glGenFramebuffersEXT
+#define dgDeleteFramebuffers glDeleteFramebuffersEXT
+#define dgBindFramebuffer glBindFramebufferEXT
+#define dgFramebufferTexture2D glFramebufferTexture2DEXT
+#define dgCheckFramebufferStatus glCheckFramebufferStatusEXT
+#define dgBlitFramebuffer glBlitFramebufferEXT
+#define dgGenRenderbuffers glGenRenderbuffersEXT
+#define dgDeleteRenderbuffers glDeleteRenderbuffersEXT
+#define dgBindRenderbuffer glBindRenderbufferEXT
+#define dgRenderbufferStorage glRenderbufferStorageEXT
+#define dgFramebufferRenderbuffer glFramebufferRenderbufferEXT
 #else
 #include <epoxy/gl.h>
 #include <epoxy/egl.h>
@@ -36,33 +36,33 @@
 #ifndef EGL_DRM_RENDER_NODE_FILE_EXT
 #define EGL_DRM_RENDER_NODE_FILE_EXT 0x3377
 #endif
-#define jrgGenFramebuffers glGenFramebuffers
-#define jrgDeleteFramebuffers glDeleteFramebuffers
-#define jrgBindFramebuffer glBindFramebuffer
-#define jrgFramebufferTexture2D glFramebufferTexture2D
-#define jrgCheckFramebufferStatus glCheckFramebufferStatus
-#define jrgBlitFramebuffer glBlitFramebuffer
-#define jrgGenRenderbuffers glGenRenderbuffers
-#define jrgDeleteRenderbuffers glDeleteRenderbuffers
-#define jrgBindRenderbuffer glBindRenderbuffer
-#define jrgRenderbufferStorage glRenderbufferStorage
-#define jrgFramebufferRenderbuffer glFramebufferRenderbuffer
+#define dgGenFramebuffers glGenFramebuffers
+#define dgDeleteFramebuffers glDeleteFramebuffers
+#define dgBindFramebuffer glBindFramebuffer
+#define dgFramebufferTexture2D glFramebufferTexture2D
+#define dgCheckFramebufferStatus glCheckFramebufferStatus
+#define dgBlitFramebuffer glBlitFramebuffer
+#define dgGenRenderbuffers glGenRenderbuffers
+#define dgDeleteRenderbuffers glDeleteRenderbuffers
+#define dgBindRenderbuffer glBindRenderbuffer
+#define dgRenderbufferStorage glRenderbufferStorage
+#define dgFramebufferRenderbuffer glFramebufferRenderbuffer
 #endif
 
 #include "dreamgpu-host.h"
 #include "gl-api.h"
 
-typedef DreamGpuTexture JrgTexture;
+typedef DreamGpuTexture DgTexture;
 
-typedef DreamGpuTextureNamespace JrgTextureNamespace;
+typedef DreamGpuTextureNamespace DgTextureNamespace;
 
-struct JrgGLPlatform {
+struct DgGLPlatform {
     DreamGpuGlApi gl_api;
     uint64_t next_context_serial;
     uint64_t texture_bytes;
     uint32_t texture_count;
     /* One bounded CPU cache for genuine texture reads, never presentation. */
-    JrgTexture *read_texture;
+    DgTexture *read_texture;
     uint64_t read_version;
     uint32_t read_level, read_bytes;
     uint8_t *read_pixels;
@@ -79,16 +79,16 @@ struct JrgGLPlatform {
 #endif
 };
 
-#define JRG_ATTRIB_STACK 16
+#define DG_ATTRIB_STACK 16
 typedef struct {
     GLbitfield mask;
     GLboolean color_sum;
     GLenum draw_buffer, read_buffer;
-    JrgTexture *texture, *texture_1d;
-} JrgAttrib;
+    DgTexture *texture, *texture_1d;
+} DgAttrib;
 
-struct JrgGLContext {
-    JrgGLPlatform *platform;
+struct DgGLContext {
+    DgGLPlatform *platform;
     uint64_t serial;
 #ifdef CONFIG_DARWIN
     CGLContextObj render, completion;
@@ -99,29 +99,29 @@ struct JrgGLContext {
     GLuint framebuffer;
     bool initialized;
     uint32_t in_begin;
-    JrgGLDrawable *drawable;
-    JrgTextureNamespace *textures;
-    JrgTexture *default_texture, *bound_texture;
-    JrgTexture *default_texture_1d, *bound_texture_1d;
+    DgGLDrawable *drawable;
+    DgTextureNamespace *textures;
+    DgTexture *default_texture, *bound_texture;
+    DgTexture *default_texture_1d, *bound_texture_1d;
     uint32_t guest_errors;
     GLenum draw_buffer, read_buffer;
     unsigned attrib_depth;
-    JrgAttrib attrib[JRG_ATTRIB_STACK];
+    DgAttrib attrib[DG_ATTRIB_STACK];
 };
 
-struct JrgGLDrawable {
+struct DgGLDrawable {
     uint32_t width, height;
     GLuint color, front, depth;
     GLsync last_write;
 };
 
-struct JrgGLImage {
+struct DgGLImage {
     uint32_t width, height, stride, offset;
     uint64_t modifier;
 #ifdef CONFIG_DARWIN
     IOSurfaceRef surface;
     GLsync fence;
-    JrgGLContext *context;
+    DgGLContext *context;
 #else
     struct gbm_bo *bo;
     EGLImageKHR image;
@@ -129,8 +129,8 @@ struct JrgGLImage {
 #endif
 };
 
-static void texture_unref(JrgGLPlatform *p, JrgTexture *texture);
-static void texture_namespace_unref(JrgGLPlatform *p, JrgTextureNamespace *ns);
+static void texture_unref(DgGLPlatform *p, DgTexture *texture);
+static void texture_namespace_unref(DgGLPlatform *p, DgTextureNamespace *ns);
 /* Pure command vocabulary and validation are owned by the Rust core. */
 static unsigned texture_params(uint32_t target, uint32_t pname)
 { return dreamgpu_gl_texture_params(target, pname); }
@@ -148,16 +148,16 @@ static const char *query_string(uint32_t name)
 { return dreamgpu_gl_query_string(name); }
 static unsigned query_shape(uint32_t fn, const uint8_t *args, uint32_t *type)
 { return dreamgpu_gl_query_shape(fn, args, type); }
-uint32_t jrg_gl_call_validate(uint32_t fn, const uint8_t *args)
+uint32_t dg_gl_call_validate(uint32_t fn, const uint8_t *args)
 { return dreamgpu_gl_call_validate(fn, args); }
-uint32_t jrg_gl_data_validate(uint32_t fn, const uint8_t *args,
+uint32_t dg_gl_data_validate(uint32_t fn, const uint8_t *args,
                               const uint8_t *data, uint32_t bytes)
 { return dreamgpu_gl_data_validate(fn, args, data, bytes); }
-uint32_t jrg_gl_query_validate(uint32_t fn, const uint8_t *args)
+uint32_t dg_gl_query_validate(uint32_t fn, const uint8_t *args)
 { return dreamgpu_gl_query_validate(fn, args); }
-uint32_t jrg_gl_query_result_bytes(uint32_t fn, const uint8_t *args)
+uint32_t dg_gl_query_result_bytes(uint32_t fn, const uint8_t *args)
 { return dreamgpu_gl_query_result_bytes(fn, args); }
-uint32_t jrg_gl_function_words(uint32_t fn)
+uint32_t dg_gl_function_words(uint32_t fn)
 { return dreamgpu_gl_function_words(fn); }
 
 static GLfloat gl_arg_float(const uint8_t *p);
@@ -216,9 +216,9 @@ static void vector_call(uint32_t fn, const uint32_t *a, const uint8_t *data)
     }
 }
 
-JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
+DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
 {
-    JrgGLPlatform *p = g_new0(JrgGLPlatform, 1);
+    DgGLPlatform *p = g_new0(DgGLPlatform, 1);
 #ifdef CONFIG_DARWIN
     CGLPixelFormatAttribute attrs[] = {
         kCGLPFAAccelerated, kCGLPFAColorSize, 24, kCGLPFAAlphaSize, 8,
@@ -235,7 +235,7 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
     err = CGLCreateContext(p->format, NULL, &p->root);
     if (err != kCGLNoError) {
         error_setg(errp, "CGL internal share group: %s", CGLErrorString(err));
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
 #else
@@ -254,7 +254,7 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
     if (p->render_fd < 0 || !p->gbm) {
         error_setg_errno(errp, errno, "Opening GPU render node %s",
                          render_node);
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
     EGLDeviceEXT devices[32];
@@ -262,7 +262,7 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
 
     if (!eglQueryDevicesEXT(G_N_ELEMENTS(devices), devices, &device_count)) {
         error_setg(errp, "EGL device enumeration failed");
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
     for (int i = 0; i < device_count; i++) {
@@ -280,13 +280,13 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
         !eglChooseConfig(p->display, attrs, &p->config, 1, &count) || !count) {
         error_setg(errp, "EGL offscreen initialization failed: 0x%x",
                     eglGetError());
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
     if (!epoxy_has_egl_extension(p->display, "EGL_EXT_image_dma_buf_import") ||
         !epoxy_has_egl_extension(p->display, "EGL_ANDROID_native_fence_sync")) {
         error_setg(errp, "EGL DMA-BUF import and native fences are required");
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
     /*
@@ -298,13 +298,13 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
         eglGetProcAddress("eglDestroyImageKHR");
     if (!p->destroy_image) {
         error_setg(errp, "EGL image destruction is required");
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
     p->root = eglCreateContext(p->display, p->config, EGL_NO_CONTEXT, NULL);
     if (p->root == EGL_NO_CONTEXT) {
         error_setg(errp, "EGL internal share group: 0x%x", eglGetError());
-        jrg_gl_platform_free(p);
+        dg_gl_platform_free(p);
         return NULL;
     }
 #endif
@@ -312,7 +312,7 @@ JrgGLPlatform *jrg_gl_platform_new(const char *render_node, Error **errp)
     return p;
 }
 
-void jrg_gl_platform_free(JrgGLPlatform *p)
+void dg_gl_platform_free(DgGLPlatform *p)
 {
     if (!p) {
         return;
@@ -342,7 +342,7 @@ void jrg_gl_platform_free(JrgGLPlatform *p)
     g_free(p);
 }
 
-void jrg_gl_clear_current(JrgGLPlatform *p)
+void dg_gl_clear_current(DgGLPlatform *p)
 {
     if (!p) {
         return;
@@ -354,10 +354,10 @@ void jrg_gl_clear_current(JrgGLPlatform *p)
 #endif
 }
 
-JrgGLContext *jrg_gl_context_new(JrgGLPlatform *p, JrgGLContext *share,
+DgGLContext *dg_gl_context_new(DgGLPlatform *p, DgGLContext *share,
                                 Error **errp)
 {
-    JrgGLContext *c = g_new0(JrgGLContext, 1);
+    DgGLContext *c = g_new0(DgGLContext, 1);
 
     if (p->next_context_serial == UINT64_MAX) {
         error_setg(errp, "Native context identity exhausted");
@@ -367,7 +367,7 @@ JrgGLContext *jrg_gl_context_new(JrgGLPlatform *p, JrgGLContext *share,
     c->serial = ++p->next_context_serial;
     c->platform = p;
     c->draw_buffer = c->read_buffer = GL_BACK;
-    if (p->texture_count > JRG_GL_MAX_TEXTURES - 2) {
+    if (p->texture_count > DG_GL_MAX_TEXTURES - 2) {
         error_setg(errp, "Native texture object limit reached");
         g_free(c);
         return NULL;
@@ -384,24 +384,24 @@ JrgGLContext *jrg_gl_context_new(JrgGLPlatform *p, JrgGLContext *share,
     }
     if (err != kCGLNoError) {
         error_setg(errp, "CGL context: %s", CGLErrorString(err));
-        jrg_gl_context_free(c);
+        dg_gl_context_free(c);
         return NULL;
     }
 #else
     c->render = eglCreateContext(p->display, p->config, p->root, NULL);
     if (c->render == EGL_NO_CONTEXT) {
         error_setg(errp, "EGL context: 0x%x", eglGetError());
-        jrg_gl_context_free(c);
+        dg_gl_context_free(c);
         return NULL;
     }
 #endif
-    c->textures = share ? share->textures : g_new0(JrgTextureNamespace, 1);
+    c->textures = share ? share->textures : g_new0(DgTextureNamespace, 1);
     c->textures->refs++;
-    c->default_texture = g_new0(JrgTexture, 1);
+    c->default_texture = g_new0(DgTexture, 1);
     c->default_texture->refs = 2; /* context ownership plus current binding */
     c->default_texture->target = GL_TEXTURE_2D;
     c->bound_texture = c->default_texture;
-    c->default_texture_1d = g_new0(JrgTexture, 1);
+    c->default_texture_1d = g_new0(DgTexture, 1);
     c->default_texture_1d->refs = 2;
     c->default_texture_1d->target = GL_TEXTURE_1D;
     c->bound_texture_1d = c->default_texture_1d;
@@ -409,7 +409,7 @@ JrgGLContext *jrg_gl_context_new(JrgGLPlatform *p, JrgGLContext *share,
     return c;
 }
 
-void jrg_gl_context_free(JrgGLContext *c)
+void dg_gl_context_free(DgGLContext *c)
 {
     if (!c || !g_atomic_ref_count_dec(&c->refs)) {
         return;
@@ -431,7 +431,7 @@ void jrg_gl_context_free(JrgGLContext *c)
     texture_namespace_unref(c->platform, c->textures);
     if (c->framebuffer) {
         CGLSetCurrentContext(c->render);
-        jrgDeleteFramebuffers(1, &c->framebuffer);
+        dgDeleteFramebuffers(1, &c->framebuffer);
     }
     CGLSetCurrentContext(previous == c->render || previous == c->completion ?
                          NULL : previous);
@@ -461,7 +461,7 @@ void jrg_gl_context_free(JrgGLContext *c)
     if (c->framebuffer) {
         eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         c->render);
-        jrgDeleteFramebuffers(1, &c->framebuffer);
+        dgDeleteFramebuffers(1, &c->framebuffer);
     }
     eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                     previous == c->render ? EGL_NO_CONTEXT : previous);
@@ -472,10 +472,10 @@ void jrg_gl_context_free(JrgGLContext *c)
     g_free(c);
 }
 
-JrgGLDrawable *jrg_gl_drawable_new(JrgGLPlatform *p, uint32_t width,
+DgGLDrawable *dg_gl_drawable_new(DgGLPlatform *p, uint32_t width,
                                   uint32_t height, Error **errp)
 {
-    JrgGLDrawable *d = g_new0(JrgGLDrawable, 1);
+    DgGLDrawable *d = g_new0(DgGLDrawable, 1);
 
     d->width = width;
     d->height = height;
@@ -499,29 +499,29 @@ JrgGLDrawable *jrg_gl_drawable_new(JrgGLPlatform *p, uint32_t width,
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
                      GL_UNSIGNED_BYTE, NULL);
     }
-    jrgGenRenderbuffers(1, &d->depth);
-    jrgBindRenderbuffer(GL_RENDERBUFFER, d->depth);
-    jrgRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+    dgGenRenderbuffers(1, &d->depth);
+    dgBindRenderbuffer(GL_RENDERBUFFER, d->depth);
+    dgRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
     if (glGetError() != GL_NO_ERROR) {
         error_setg(errp, "Allocating internal drawable color/depth failed");
-        jrg_gl_drawable_free(p, d);
+        dg_gl_drawable_free(p, d);
         return NULL;
     }
     GLuint framebuffer;
-    jrgGenFramebuffers(1, &framebuffer);
-    jrgBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+    dgGenFramebuffers(1, &framebuffer);
+    dgBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                             GL_TEXTURE_2D, d->color, 0);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
                             GL_TEXTURE_2D, d->front, 0);
-    jrgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+    dgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
                                GL_RENDERBUFFER, d->depth);
-    jrgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+    dgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
                                GL_RENDERBUFFER, d->depth);
-    if (jrgCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        jrgDeleteFramebuffers(1, &framebuffer);
+    if (dgCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        dgDeleteFramebuffers(1, &framebuffer);
         error_setg(errp, "Initializing drawable framebuffer failed");
-        jrg_gl_drawable_free(p, d);
+        dg_gl_drawable_free(p, d);
         return NULL;
     }
     glClearColor(0, 0, 0, 0);
@@ -530,13 +530,13 @@ JrgGLDrawable *jrg_gl_drawable_new(JrgGLPlatform *p, uint32_t width,
     const GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
     glDrawBuffers(2, buffers);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
-    jrgBindFramebuffer(GL_FRAMEBUFFER, 0);
-    jrgDeleteFramebuffers(1, &framebuffer);
-    jrg_gl_flush_drawable(d);
+    dgBindFramebuffer(GL_FRAMEBUFFER, 0);
+    dgDeleteFramebuffers(1, &framebuffer);
+    dg_gl_flush_drawable(d);
     return d;
 }
 
-void jrg_gl_flush_drawable(JrgGLDrawable *d)
+void dg_gl_flush_drawable(DgGLDrawable *d)
 {
     if (d->last_write) {
         glDeleteSync(d->last_write);
@@ -545,7 +545,7 @@ void jrg_gl_flush_drawable(JrgGLDrawable *d)
     glFlush();
 }
 
-void jrg_gl_drawable_free(JrgGLPlatform *p, JrgGLDrawable *d)
+void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d)
 {
     if (!d) {
         return;
@@ -556,7 +556,7 @@ void jrg_gl_drawable_free(JrgGLPlatform *p, JrgGLDrawable *d)
     eglMakeCurrent(p->display, EGL_NO_SURFACE, EGL_NO_SURFACE, p->root);
 #endif
     if (d->depth) {
-        jrgDeleteRenderbuffers(1, &d->depth);
+        dgDeleteRenderbuffers(1, &d->depth);
     }
     if (d->last_write) {
         glDeleteSync(d->last_write);
@@ -567,7 +567,7 @@ void jrg_gl_drawable_free(JrgGLPlatform *p, JrgGLDrawable *d)
     if (d->front) {
         glDeleteTextures(1, &d->front);
     }
-    jrg_gl_clear_current(p);
+    dg_gl_clear_current(p);
     g_free(d);
 }
 
@@ -577,7 +577,7 @@ static GLenum read_attachment(GLenum buffer)
            GL_COLOR_ATTACHMENT0 : GL_COLOR_ATTACHMENT1;
 }
 
-static void select_buffers(JrgGLContext *c)
+static void select_buffers(DgGLContext *c)
 {
     if (c->draw_buffer == GL_FRONT_AND_BACK || c->draw_buffer == GL_LEFT) {
         const GLenum buffers[2] = {
@@ -591,7 +591,7 @@ static void select_buffers(JrgGLContext *c)
     glReadBuffer(read_attachment(c->read_buffer));
 }
 
-void jrg_gl_exchange(JrgGLContext *c, JrgGLDrawable *d)
+void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d)
 {
     GLuint back = d->color;
     d->color = d->front;
@@ -600,15 +600,15 @@ void jrg_gl_exchange(JrgGLContext *c, JrgGLDrawable *d)
      * Logical exchange changes names, never pixel storage. Other contexts
      * reattach the current pair when the worker next makes them current.
      */
-    jrgBindFramebuffer(GL_FRAMEBUFFER, c->framebuffer);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+    dgBindFramebuffer(GL_FRAMEBUFFER, c->framebuffer);
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                             GL_TEXTURE_2D, d->color, 0);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
                             GL_TEXTURE_2D, d->front, 0);
     select_buffers(c);
 }
 
-bool jrg_gl_make_current(JrgGLContext *c, JrgGLDrawable *d, Error **errp)
+bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp)
 {
 #ifdef CONFIG_DARWIN
     CGLError err = CGLSetCurrentContext(c->render);
@@ -636,19 +636,19 @@ bool jrg_gl_make_current(JrgGLContext *c, JrgGLDrawable *d, Error **errp)
         d->last_write = NULL;
     }
     if (!c->framebuffer) {
-        jrgGenFramebuffers(1, &c->framebuffer);
+        dgGenFramebuffers(1, &c->framebuffer);
     }
-    jrgBindFramebuffer(GL_FRAMEBUFFER, c->framebuffer);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+    dgBindFramebuffer(GL_FRAMEBUFFER, c->framebuffer);
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                             GL_TEXTURE_2D, d->color, 0);
-    jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+    dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
                             GL_TEXTURE_2D, d->front, 0);
-    jrgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+    dgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
                                GL_RENDERBUFFER, d->depth);
-    jrgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
+    dgFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT,
                                GL_RENDERBUFFER, d->depth);
     select_buffers(c);
-    if (jrgCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    if (dgCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         error_setg(errp, "Internal drawable framebuffer is incomplete");
         return false;
     }
@@ -672,7 +672,7 @@ static void host_texture_free(void *opaque, void *object)
 
 static void host_texture_forget_read(void *opaque, DreamGpuTexture *texture)
 {
-    JrgGLPlatform *p = opaque;
+    DgGLPlatform *p = opaque;
     if (p->read_texture == texture) {
         g_clear_pointer(&p->read_pixels, g_free);
         p->read_texture = NULL;
@@ -680,7 +680,7 @@ static void host_texture_forget_read(void *opaque, DreamGpuTexture *texture)
     }
 }
 
-static DreamGpuTextureMemory texture_memory(JrgGLPlatform *p)
+static DreamGpuTextureMemory texture_memory(DgGLPlatform *p)
 {
     return (DreamGpuTextureMemory) {
         .api = &p->gl_api, .bytes = &p->texture_bytes, .count = &p->texture_count,
@@ -689,19 +689,19 @@ static DreamGpuTextureMemory texture_memory(JrgGLPlatform *p)
     };
 }
 
-static void texture_unref(JrgGLPlatform *p, JrgTexture *texture)
+static void texture_unref(DgGLPlatform *p, DgTexture *texture)
 {
     DreamGpuTextureMemory memory = texture_memory(p);
     dreamgpu_texture_unref(&memory, texture);
 }
 
-static void texture_namespace_unref(JrgGLPlatform *p, JrgTextureNamespace *ns)
+static void texture_namespace_unref(DgGLPlatform *p, DgTextureNamespace *ns)
 {
     DreamGpuTextureMemory memory = texture_memory(p);
     dreamgpu_texture_namespace_unref(&memory, ns);
 }
 
-static void store_guest_error(JrgGLContext *c, GLenum error)
+static void store_guest_error(DgGLContext *c, GLenum error)
 {
     if (error != GL_NO_ERROR) {
         unsigned bit = error - GL_INVALID_ENUM;
@@ -709,7 +709,7 @@ static void store_guest_error(JrgGLContext *c, GLenum error)
     }
 }
 
-static void remember_guest_error(JrgGLContext *c)
+static void remember_guest_error(DgGLContext *c)
 {
     /* GL defines separate error flags; preserve each while doing host work. */
     for (unsigned i = 0; i < 8; i++) {
@@ -721,22 +721,22 @@ static void remember_guest_error(JrgGLContext *c)
     }
 }
 
-static void texture_wait(JrgGLContext *c, JrgTexture *texture)
+static void texture_wait(DgGLContext *c, DgTexture *texture)
 {
     dreamgpu_texture_wait(&c->platform->gl_api, texture, c->serial);
 }
 
-static void texture_written(JrgGLContext *c, JrgTexture *texture)
+static void texture_written(DgGLContext *c, DgTexture *texture)
 {
     dreamgpu_texture_written(&c->platform->gl_api, texture, c->serial);
 }
 
-static JrgTexture *bound_texture(JrgGLContext *c, GLenum target)
+static DgTexture *bound_texture(DgGLContext *c, GLenum target)
 {
     return target == GL_TEXTURE_1D ? c->bound_texture_1d : c->bound_texture;
 }
 
-static uint32_t bind_texture(JrgGLContext *c, GLenum target,
+static uint32_t bind_texture(DgGLContext *c, GLenum target,
                              uint32_t guest_name)
 {
     DreamGpuTextureMemory memory = texture_memory(c->platform);
@@ -746,7 +746,7 @@ static uint32_t bind_texture(JrgGLContext *c, GLenum target,
                                  c->serial, &c->guest_errors);
 }
 
-static void delete_textures(JrgGLContext *c, const uint8_t *data,
+static void delete_textures(DgGLContext *c, const uint8_t *data,
                              uint32_t count)
 {
     DreamGpuTextureMemory memory = texture_memory(c->platform);
@@ -755,13 +755,13 @@ static void delete_textures(JrgGLContext *c, const uint8_t *data,
                              &c->bound_texture, &c->bound_texture_1d);
 }
 
-static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
+static uint32_t copy_texture(DgGLContext *c, uint32_t fn, const uint8_t *args)
 {
-    JrgTexture *t = c->bound_texture;
-    JrgGLDrawable *d = c->drawable;
+    DgTexture *t = c->bound_texture;
+    DgGLDrawable *d = c->drawable;
     bool image = fn == FEnum_glCopyTexImage2D;
     uint32_t a[8];
-    uint32_t error = jrg_gl_call_validate(fn, args);
+    uint32_t error = dg_gl_call_validate(fn, args);
 
     if (error) {
         return error;
@@ -785,11 +785,11 @@ static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
         (!image && (a[2] > t->widths[level] || a[3] > t->heights[level] ||
                     w > t->widths[level] - a[2] ||
                     h > t->heights[level] - a[3]))) {
-        return JRG_GL_ERROR_TEXTURE;
+        return DG_GL_ERROR_TEXTURE;
     }
     if (image && c->platform->texture_bytes - t->levels[level] + allocation >
-                 JRG_GL_MAX_TEXTURE_BYTES) {
-        return JRG_GL_ERROR_LIMIT;
+                 DG_GL_MAX_TEXTURE_BYTES) {
+        return DG_GL_ERROR_LIMIT;
     }
     texture_wait(c, t);
     remember_guest_error(c);
@@ -801,7 +801,7 @@ static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
     GLenum gl_error = glGetError();
     if (gl_error != GL_NO_ERROR) {
         store_guest_error(c, gl_error);
-        return JRG_GL_ERROR_TEXTURE;
+        return DG_GL_ERROR_TEXTURE;
     }
     texture_written(c, t);
     if (image) {
@@ -815,13 +815,13 @@ static uint32_t copy_texture(JrgGLContext *c, uint32_t fn, const uint8_t *args)
     return 0;
 }
 
-static uint32_t draw_arrays(JrgGLContext *c, uint32_t fn, const uint32_t *a,
+static uint32_t draw_arrays(DgGLContext *c, uint32_t fn, const uint32_t *a,
                              const uint8_t *data, uint32_t bytes)
 {
     bool elements = fn == FEnum_glDrawElements;
     uint32_t vertices = a[elements ? 3 : 2];
     uint32_t attributes = a[elements ? 4 : 3];
-    unsigned stride = JRG_GL_VERTEX_SIZE(attributes);
+    unsigned stride = DG_GL_VERTEX_SIZE(attributes);
     const uint8_t *indices = data + vertices * stride;
     g_autofree uint8_t *native = NULL;
 
@@ -830,7 +830,7 @@ static uint32_t draw_arrays(JrgGLContext *c, uint32_t fn, const uint32_t *a,
     }
     if ((c->bound_texture->undefined_levels && glIsEnabled(GL_TEXTURE_2D)) ||
         (c->bound_texture_1d->undefined_levels && glIsEnabled(GL_TEXTURE_1D))) {
-        return JRG_GL_ERROR_TEXTURE;
+        return DG_GL_ERROR_TEXTURE;
     }
     if (HOST_BIG_ENDIAN) {
         native = g_memdup2(data, bytes);
@@ -867,7 +867,7 @@ static uint32_t draw_arrays(JrgGLContext *c, uint32_t fn, const uint32_t *a,
 }
 
 /* Initialize allocation-only images without exposing recycled texture bytes. */
-static GLenum zero_texture(JrgTexture *t, uint32_t level, uint32_t w,
+static GLenum zero_texture(DgTexture *t, uint32_t level, uint32_t w,
                            uint32_t h)
 {
     GLenum error = GL_NO_ERROR;
@@ -892,15 +892,15 @@ static GLenum zero_texture(JrgTexture *t, uint32_t level, uint32_t w,
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
         glGetFloatv(GL_COLOR_CLEAR_VALUE, color);
         glGetBooleanv(GL_COLOR_WRITEMASK, mask);
-        jrgGenFramebuffers(1, &framebuffer);
+        dgGenFramebuffers(1, &framebuffer);
         if (!framebuffer) {
             error = glGetError();
             return error ? error : GL_OUT_OF_MEMORY;
         }
-        jrgBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-        jrgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        dgBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+        dgFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                 GL_TEXTURE_2D, t->name, level);
-        if (jrgCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+        if (dgCheckFramebufferStatus(GL_FRAMEBUFFER) ==
             GL_FRAMEBUFFER_COMPLETE) {
             glDisable(GL_SCISSOR_TEST);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -909,15 +909,15 @@ static GLenum zero_texture(JrgTexture *t, uint32_t level, uint32_t w,
             cleared = true;
         }
         error = glGetError();
-        jrgBindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
-        jrgBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
+        dgBindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+        dgBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
         glClearColor(color[0], color[1], color[2], color[3]);
         glColorMask(mask[0], mask[1], mask[2], mask[3]);
         if (scissor) {
             glEnable(GL_SCISSOR_TEST);
         }
         if (framebuffer) {
-            jrgDeleteFramebuffers(1, &framebuffer);
+            dgDeleteFramebuffers(1, &framebuffer);
         }
     }
     if (error || cleared) {
@@ -952,15 +952,15 @@ static uint32_t host_zero_texture(void *opaque, DreamGpuTexture *texture,
     return zero_texture(texture, level, width, height);
 }
 
-uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
+uint32_t dg_gl_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args,
                           const uint8_t *data, uint32_t bytes)
 {
     uint32_t a[8] = { 0 };
-    uint32_t words = jrg_gl_function_words(fn) & ~JRG_GL_FUNCTION_INLINE_DATA;
-    JrgTexture *texture = c->bound_texture;
+    uint32_t words = dg_gl_function_words(fn) & ~DG_GL_FUNCTION_INLINE_DATA;
+    DgTexture *texture = c->bound_texture;
 
     if (c->in_begin && fn != FEnum_glMaterialfv) {
-        return JRG_GL_ERROR_CONTEXT;
+        return DG_GL_ERROR_CONTEXT;
     }
     for (unsigned i = 0; i < words; i++) {
         a[i] = ldl_le_p(args + i * 4);
@@ -978,7 +978,7 @@ uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
             GLenum error = glGetError();
             if (error != GL_NO_ERROR) {
                 store_guest_error(c, error);
-                return JRG_GL_ERROR_TEXTURE;
+                return DG_GL_ERROR_TEXTURE;
             }
             texture_written(c, texture);
         }
@@ -1005,7 +1005,7 @@ uint32_t jrg_gl_data_call(JrgGLContext *c, uint32_t fn, const uint8_t *args,
     return error;
 }
 
-bool jrg_gl_context_in_begin(JrgGLContext *c)
+bool dg_gl_context_in_begin(DgGLContext *c)
 {
     return c->in_begin;
 }
@@ -1014,14 +1014,14 @@ bool jrg_gl_context_in_begin(JrgGLContext *c)
  * takes the intentional GPU readback once; subsequent tiles reuse one cache
  * bounded by the device's maximum texture size. A write invalidates it by
  * version, and freeing an object clears the weak cache identity. */
-static uint32_t texture_read(JrgGLContext *c, GLenum target, uint32_t level,
+static uint32_t texture_read(DgGLContext *c, GLenum target, uint32_t level,
                              uint32_t first, uint32_t capacity, uint8_t *result)
 {
-    JrgGLPlatform *p = c->platform;
-    JrgTexture *texture = bound_texture(c, target);
+    DgGLPlatform *p = c->platform;
+    DgTexture *texture = bound_texture(c, target);
     uint64_t bytes = (uint64_t)texture->widths[level] * texture->heights[level] * 4;
     if (!bytes || (uint64_t)first * 4 >= bytes || texture->undefined_levels & (1U << level)) {
-        return JRG_GL_ERROR_TEXTURE;
+        return DG_GL_ERROR_TEXTURE;
     }
     if (!first || p->read_texture != texture || p->read_version != texture->version ||
         p->read_level != level || p->read_bytes != bytes) {
@@ -1029,12 +1029,12 @@ static uint32_t texture_read(JrgGLContext *c, GLenum target, uint32_t level,
         g_clear_pointer(&p->read_pixels, g_free);
         p->read_texture = NULL;
         p->read_bytes = 0;
-        if (bytes > (uint64_t)JRG_GL_MAX_TEXTURE_DIMENSION * JRG_GL_MAX_TEXTURE_DIMENSION * 4) {
-            return JRG_GL_ERROR_LIMIT;
+        if (bytes > (uint64_t)DG_GL_MAX_TEXTURE_DIMENSION * DG_GL_MAX_TEXTURE_DIMENSION * 4) {
+            return DG_GL_ERROR_LIMIT;
         }
         p->read_pixels = g_try_malloc0(bytes);
         if (!p->read_pixels) {
-            return JRG_GL_ERROR_LIMIT;
+            return DG_GL_ERROR_LIMIT;
         }
         texture_wait(c, texture);
         remember_guest_error(c);
@@ -1058,7 +1058,7 @@ static uint32_t texture_read(JrgGLContext *c, GLenum target, uint32_t level,
         if (error) {
             store_guest_error(c, error);
             g_clear_pointer(&p->read_pixels, g_free);
-            return JRG_GL_ERROR_HOST;
+            return DG_GL_ERROR_HOST;
         }
         p->read_texture = texture;
         p->read_version = texture->version;
@@ -1076,7 +1076,7 @@ static uint32_t texture_read(JrgGLContext *c, GLenum target, uint32_t level,
     return 0;
 }
 
-uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
+uint32_t dg_gl_query(DgGLContext *c, uint32_t fn, const uint8_t *args,
                        uint8_t *result, uint32_t *bytes, uint32_t *type)
 {
     uint32_t a = ldl_le_p(args), b = ldl_le_p(args + 4);
@@ -1089,7 +1089,7 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
     bool logical = false;
 
     if (!count || c->in_begin) {
-        return JRG_GL_ERROR_CONTEXT;
+        return DG_GL_ERROR_CONTEXT;
     }
     if (fn == FEnum_glGetTexImage) {
         uint32_t error = texture_read(c, a, b & 0xffff, d, count * 4, result);
@@ -1104,7 +1104,7 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
         if (!c->drawable || a >= c->drawable->width ||
             b >= c->drawable->height || width > c->drawable->width - a ||
             height > c->drawable->height - b) {
-            return JRG_GL_ERROR_DRAWABLE;
+            return DG_GL_ERROR_DRAWABLE;
         }
         remember_guest_error(c);
         glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
@@ -1126,7 +1126,7 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
         glPixelStorei(GL_PACK_SWAP_BYTES, swap_bytes);
         if (error) {
             store_guest_error(c, error);
-            return JRG_GL_ERROR_HOST;
+            return DG_GL_ERROR_HOST;
         }
         *bytes = count * 4;
         return 0;
@@ -1206,15 +1206,15 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
             logical = true;
             break;
         case GL_MAX_ATTRIB_STACK_DEPTH:
-            integers[0] = JRG_ATTRIB_STACK;
+            integers[0] = DG_ATTRIB_STACK;
             logical = true;
             break;
         case GL_MAX_TEXTURE_SIZE:
-            integers[0] = JRG_GL_MAX_TEXTURE_DIMENSION;
+            integers[0] = DG_GL_MAX_TEXTURE_DIMENSION;
             logical = true;
             break;
         case GL_MAX_VIEWPORT_DIMS:
-            integers[0] = integers[1] = JRG_GL_MAX_DIMENSION;
+            integers[0] = integers[1] = DG_GL_MAX_DIMENSION;
             logical = true;
             break;
         case GL_MAX_LIGHTS:
@@ -1228,16 +1228,16 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
         }
         if (!logical) {
             switch (*type) {
-            case JRG_GL_RESULT_INT:
+            case DG_GL_RESULT_INT:
                 glGetIntegerv(a, integers);
                 break;
-            case JRG_GL_RESULT_FLOAT:
+            case DG_GL_RESULT_FLOAT:
                 glGetFloatv(a, floats);
                 break;
-            case JRG_GL_RESULT_DOUBLE:
+            case DG_GL_RESULT_DOUBLE:
                 glGetDoublev(a, doubles);
                 break;
-            case JRG_GL_RESULT_BOOL:
+            case DG_GL_RESULT_BOOL:
                 glGetBooleanv(a, booleans);
                 break;
             }
@@ -1262,19 +1262,19 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
     }
     for (unsigned i = 0; i < count; i++) {
         switch (*type) {
-        case JRG_GL_RESULT_BOOL:
+        case DG_GL_RESULT_BOOL:
             result[i] = !!booleans[i];
             break;
-        case JRG_GL_RESULT_INT:
+        case DG_GL_RESULT_INT:
             stl_le_p(result + i * 4, integers[i]);
             break;
-        case JRG_GL_RESULT_FLOAT: {
+        case DG_GL_RESULT_FLOAT: {
             uint32_t bits;
             memcpy(&bits, &floats[i], 4);
             stl_le_p(result + i * 4, bits);
             break;
         }
-        case JRG_GL_RESULT_DOUBLE: {
+        case DG_GL_RESULT_DOUBLE: {
             uint64_t bits;
             memcpy(&bits, &doubles[i], 8);
             stq_le_p(result + i * 8, bits);
@@ -1282,7 +1282,7 @@ uint32_t jrg_gl_query(JrgGLContext *c, uint32_t fn, const uint8_t *args,
         }
         }
     }
-    *bytes = jrg_gl_query_result_bytes(fn, args);
+    *bytes = dg_gl_query_result_bytes(fn, args);
     return 0;
 }
 
@@ -1301,14 +1301,14 @@ static GLdouble gl_arg_double(const uint8_t *p)
 #define U(n) ldl_le_p(args + (n) * 4)
 #define F(n) gl_arg_float(args + (n) * 4)
 #define D(n) gl_arg_double(args + (n) * 4)
-static uint32_t attrib_push(JrgGLContext *c, GLbitfield mask)
+static uint32_t attrib_push(DgGLContext *c, GLbitfield mask)
 {
-    JrgAttrib *saved;
+    DgAttrib *saved;
     if (mask & ~GL_ALL_ATTRIB_BITS) {
         store_guest_error(c, GL_INVALID_VALUE);
         return 0;
     }
-    if (c->attrib_depth == JRG_ATTRIB_STACK) {
+    if (c->attrib_depth == DG_ATTRIB_STACK) {
         store_guest_error(c, GL_STACK_OVERFLOW);
         return 0;
     }
@@ -1320,7 +1320,7 @@ static uint32_t attrib_push(JrgGLContext *c, GLbitfield mask)
         return 0;
     }
     saved = &c->attrib[c->attrib_depth++];
-    *saved = (JrgAttrib){ .mask = mask, .draw_buffer = c->draw_buffer,
+    *saved = (DgAttrib){ .mask = mask, .draw_buffer = c->draw_buffer,
                          .read_buffer = c->read_buffer };
     if (mask & (GL_FOG_BIT | GL_ENABLE_BIT)) {
         saved->color_sum = glIsEnabled(GL_COLOR_SUM);
@@ -1334,9 +1334,9 @@ static uint32_t attrib_push(JrgGLContext *c, GLbitfield mask)
     return 0;
 }
 
-static uint32_t attrib_pop(JrgGLContext *c)
+static uint32_t attrib_pop(DgGLContext *c)
 {
-    JrgAttrib *saved;
+    DgAttrib *saved;
     if (!c->attrib_depth) {
         store_guest_error(c, GL_STACK_UNDERFLOW);
         return 0;
@@ -1384,7 +1384,7 @@ static uint32_t attrib_pop(JrgGLContext *c)
 /* Remaining resource-side operations; scalar GL execution is Rust-owned. */
 static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
 {
-    JrgGLContext *c = opaque;
+    DgGLContext *c = opaque;
     switch (fn) {
     case FEnum_glPushAttrib:
         return attrib_push(c, U(0));
@@ -1393,7 +1393,7 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
     case FEnum_glDrawBuffer:
     case FEnum_glReadBuffer:
         if (!buffer_selection(U(0), fn == FEnum_glDrawBuffer)) {
-            return JRG_GL_ERROR_UNSUPPORTED;
+            return DG_GL_ERROR_UNSUPPORTED;
         }
         if (fn == FEnum_glDrawBuffer) {
             c->draw_buffer = U(0);
@@ -1403,8 +1403,8 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
         select_buffers(c);
         break;
     case FEnum_glHint:
-        if (jrg_gl_call_validate(fn, args)) {
-            return JRG_GL_ERROR_UNSUPPORTED;
+        if (dg_gl_call_validate(fn, args)) {
+            return DG_GL_ERROR_UNSUPPORTED;
         }
         glHint(U(0), U(1));
         break;
@@ -1416,7 +1416,7 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
     case FEnum_glTexParameteri:
     case FEnum_glTexParameterf:
         if (texture_params(U(0), U(1)) != 1) {
-            return JRG_GL_ERROR_TEXTURE;
+            return DG_GL_ERROR_TEXTURE;
         }
         texture_wait(c, bound_texture(c, U(0)));
         if (fn == FEnum_glTexParameteri) {
@@ -1429,7 +1429,7 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
     case FEnum_glTexEnvi:
     case FEnum_glTexEnvf:
         if (texture_env_params(U(0), U(1)) != 1) {
-            return JRG_GL_ERROR_TEXTURE;
+            return DG_GL_ERROR_TEXTURE;
         }
         if (fn == FEnum_glTexEnvi) {
             glTexEnvi(U(0), U(1), U(2));
@@ -1439,26 +1439,26 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
         break;
     case FEnum_glBegin:
         if (U(0) > GL_POLYGON) {
-            return JRG_GL_ERROR_CONTEXT;
+            return DG_GL_ERROR_CONTEXT;
         }
         if ((c->bound_texture->undefined_levels && glIsEnabled(GL_TEXTURE_2D)) ||
         (c->bound_texture_1d->undefined_levels && glIsEnabled(GL_TEXTURE_1D))) {
-            return JRG_GL_ERROR_TEXTURE;
+            return DG_GL_ERROR_TEXTURE;
         }
         texture_wait(c, c->bound_texture);
         texture_wait(c, c->bound_texture_1d);
         break;
     default:
-        return JRG_GL_ERROR_UNSUPPORTED;
+        return DG_GL_ERROR_UNSUPPORTED;
     }
     return 0;
 }
 
-uint32_t jrg_gl_call(JrgGLContext *c, uint32_t fn, const uint8_t *args)
+uint32_t dg_gl_call(DgGLContext *c, uint32_t fn, const uint8_t *args)
 {
-    uint32_t words = jrg_gl_function_words(fn);
+    uint32_t words = dg_gl_function_words(fn);
     if (words > 32) {
-        return JRG_GL_ERROR_UNSUPPORTED;
+        return DG_GL_ERROR_UNSUPPORTED;
     }
     return dreamgpu_gl_scalar(&c->platform->gl_api, &c->in_begin,
                               scalar_resource, c, fn, args, words * 4);
@@ -1467,10 +1467,10 @@ uint32_t jrg_gl_call(JrgGLContext *c, uint32_t fn, const uint8_t *args)
 #undef F
 #undef D
 
-JrgGLImage *jrg_gl_image_new(JrgGLPlatform *p, uint32_t width, uint32_t height,
+DgGLImage *dg_gl_image_new(DgGLPlatform *p, uint32_t width, uint32_t height,
                             Error **errp)
 {
-    JrgGLImage *image = g_new0(JrgGLImage, 1);
+    DgGLImage *image = g_new0(DgGLImage, 1);
 
     image->width = width;
     image->height = height;
@@ -1508,7 +1508,7 @@ JrgGLImage *jrg_gl_image_new(JrgGLPlatform *p, uint32_t width, uint32_t height,
                                               GBM_BO_USE_RENDERING);
     if (!image->bo || gbm_bo_get_plane_count(image->bo) != 1) {
         error_setg(errp, "A single-plane BGRA GBM export buffer is required");
-        jrg_gl_image_free(p, image);
+        dg_gl_image_free(p, image);
         return NULL;
     }
     image->fd = gbm_bo_get_fd(image->bo);
@@ -1517,7 +1517,7 @@ JrgGLImage *jrg_gl_image_new(JrgGLPlatform *p, uint32_t width, uint32_t height,
     image->modifier = gbm_bo_get_modifier(image->bo);
     if (image->fd < 0 || image->modifier != DRM_FORMAT_MOD_LINEAR) {
         error_setg(errp, "Exporting linear DMA-BUF failed");
-        jrg_gl_image_free(p, image);
+        dg_gl_image_free(p, image);
         return NULL;
     }
     const EGLint attrs[] = {
@@ -1533,14 +1533,14 @@ JrgGLImage *jrg_gl_image_new(JrgGLPlatform *p, uint32_t width, uint32_t height,
     if (image->image == EGL_NO_IMAGE_KHR) {
         error_setg(errp, "Importing DMA-BUF to EGL failed: 0x%x",
                     eglGetError());
-        jrg_gl_image_free(p, image);
+        dg_gl_image_free(p, image);
         return NULL;
     }
 #endif
     return image;
 }
 
-void jrg_gl_image_free(JrgGLPlatform *p, JrgGLImage *image)
+void dg_gl_image_free(DgGLPlatform *p, DgGLImage *image)
 {
     if (!image) {
         return;
@@ -1552,7 +1552,7 @@ void jrg_gl_image_free(JrgGLPlatform *p, JrgGLImage *image)
             glDeleteSync(image->fence);
         }
         CGLSetCurrentContext(NULL);
-        jrg_gl_context_free(image->context);
+        dg_gl_context_free(image->context);
     }
     if (image->surface) {
         CFRelease(image->surface);
@@ -1574,7 +1574,7 @@ void jrg_gl_image_free(JrgGLPlatform *p, JrgGLImage *image)
     g_free(image);
 }
 
-bool jrg_gl_export(JrgGLContext *c, JrgGLDrawable *d, JrgGLImage *image,
+bool dg_gl_export(DgGLContext *c, DgGLDrawable *d, DgGLImage *image,
                     bool exchange, Error **errp)
 {
     GLuint attachment = 0, framebuffer = 0;
@@ -1586,7 +1586,7 @@ bool jrg_gl_export(JrgGLContext *c, JrgGLDrawable *d, JrgGLImage *image,
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw_fb);
     glGetIntegerv(GL_READ_BUFFER, &read_buffer);
     if (exchange) {
-        jrg_gl_exchange(c, d);
+        dg_gl_exchange(c, d);
     }
 #ifdef CONFIG_DARWIN
     GLenum target = GL_TEXTURE_RECTANGLE_ARB;
@@ -1600,8 +1600,8 @@ bool jrg_gl_export(JrgGLContext *c, JrgGLDrawable *d, JrgGLImage *image,
      * Rebinding that numeric name would create a different texture.
      */
     glGetIntegerv(GL_RENDERBUFFER_BINDING, &attachment_binding);
-    jrgGenRenderbuffers(1, &attachment);
-    jrgBindRenderbuffer(GL_RENDERBUFFER, attachment);
+    dgGenRenderbuffers(1, &attachment);
+    dgBindRenderbuffer(GL_RENDERBUFFER, attachment);
 #endif
 #ifdef CONFIG_DARWIN
     CGLError err = CGLTexImageIOSurface2D(c->render, target, GL_RGBA8,
@@ -1615,30 +1615,30 @@ bool jrg_gl_export(JrgGLContext *c, JrgGLDrawable *d, JrgGLImage *image,
 #else
     glEGLImageTargetRenderbufferStorageOES(GL_RENDERBUFFER, image->image);
 #endif
-    jrgGenFramebuffers(1, &framebuffer);
-    jrgBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
+    dgGenFramebuffers(1, &framebuffer);
+    dgBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer);
 #ifdef CONFIG_DARWIN
-    jrgFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+    dgFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                             target, attachment, 0);
 #else
-    jrgFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+    dgFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_RENDERBUFFER, attachment);
 #endif
-    if (jrgCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) !=
+    if (dgCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) !=
         GL_FRAMEBUFFER_COMPLETE) {
         error_setg(errp, "Export framebuffer is incomplete");
         goto out;
     }
-    jrgBindFramebuffer(GL_READ_FRAMEBUFFER, c->framebuffer);
+    dgBindFramebuffer(GL_READ_FRAMEBUFFER, c->framebuffer);
     glReadBuffer(GL_COLOR_ATTACHMENT1);
     glDisable(GL_SCISSOR_TEST);
     /* Guest GL is bottom-left; every exported image is top-left. */
-    jrgBlitFramebuffer(0, d->height, d->width, 0,
+    dgBlitFramebuffer(0, d->height, d->width, 0,
                        0, 0, d->width, d->height,
                        GL_COLOR_BUFFER_BIT, GL_NEAREST);
 #ifdef CONFIG_DARWIN
     if (image->context) {
-        jrg_gl_context_free(image->context);
+        dg_gl_context_free(image->context);
     }
     image->context = c;
     g_atomic_ref_count_inc(&c->refs);
@@ -1664,31 +1664,31 @@ bool jrg_gl_export(JrgGLContext *c, JrgGLDrawable *d, JrgGLImage *image,
 #endif
     ok = true;
 out:
-    jrgBindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
+    dgBindFramebuffer(GL_READ_FRAMEBUFFER, read_fb);
     glReadBuffer(read_buffer);
-    jrgBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
+    dgBindFramebuffer(GL_DRAW_FRAMEBUFFER, draw_fb);
     if (scissor) {
         glEnable(GL_SCISSOR_TEST);
     }
 #ifdef CONFIG_DARWIN
     glBindTexture(target, attachment_binding);
 #else
-    jrgBindRenderbuffer(GL_RENDERBUFFER, attachment_binding);
+    dgBindRenderbuffer(GL_RENDERBUFFER, attachment_binding);
 #endif
     if (framebuffer) {
-        jrgDeleteFramebuffers(1, &framebuffer);
+        dgDeleteFramebuffers(1, &framebuffer);
     }
     if (attachment) {
 #ifdef CONFIG_DARWIN
         glDeleteTextures(1, &attachment);
 #else
-        jrgDeleteRenderbuffers(1, &attachment);
+        dgDeleteRenderbuffers(1, &attachment);
 #endif
     }
     return ok;
 }
 
-bool jrg_gl_image_ready(JrgGLImage *image, Error **errp)
+bool dg_gl_image_ready(DgGLImage *image, Error **errp)
 {
 #ifdef CONFIG_DARWIN
     int64_t deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
@@ -1722,7 +1722,7 @@ bool jrg_gl_image_ready(JrgGLImage *image, Error **errp)
     return true;
 }
 
-void jrg_gl_image_metadata(JrgGLImage *image, uint32_t *stride,
+void dg_gl_image_metadata(DgGLImage *image, uint32_t *stride,
                             uint32_t *offset, uint64_t *modifier)
 {
     *stride = image->stride;
@@ -1730,7 +1730,7 @@ void jrg_gl_image_metadata(JrgGLImage *image, uint32_t *stride,
     *modifier = image->modifier;
 }
 
-uint32_t jrg_gl_image_port(JrgGLImage *image)
+uint32_t dg_gl_image_port(DgGLImage *image)
 {
 #ifdef CONFIG_DARWIN
     return IOSurfaceCreateMachPort(image->surface);
@@ -1739,7 +1739,7 @@ uint32_t jrg_gl_image_port(JrgGLImage *image)
 #endif
 }
 
-int jrg_gl_image_fd(JrgGLImage *image)
+int dg_gl_image_fd(DgGLImage *image)
 {
 #ifdef CONFIG_DARWIN
     return -1;
@@ -1748,7 +1748,7 @@ int jrg_gl_image_fd(JrgGLImage *image)
 #endif
 }
 
-int jrg_gl_image_fence_fd(JrgGLImage *image)
+int dg_gl_image_fence_fd(DgGLImage *image)
 {
 #ifdef CONFIG_DARWIN
     return -1;

@@ -72,12 +72,12 @@ if host_os == 'linux'
 endif
 system_ss.add(when: cocoa, if_true: files('cocoa.m'))
 
-# juke-shmem display backend - needs libdrm on Linux for refresh rate detection
+# dreamgpu-shmem display backend - needs libdrm on Linux for refresh rate detection
 if host_os == 'linux'
   libdrm = dependency('libdrm', method: 'pkg-config', required: true)
-  system_ss.add(libdrm, files('juke-shmem.c'))
+  system_ss.add(libdrm, files('dreamgpu-shmem.c'))
 else
-  system_ss.add(files('juke-shmem.c'))
+  system_ss.add(files('dreamgpu-shmem.c'))
 endif
 
 vnc_ss = ss.source_set()

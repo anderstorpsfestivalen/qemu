@@ -1,10 +1,10 @@
-Juke native GL implementation inventory
+DreamGPU native GL implementation inventory
 ======================================
 
 The device currently accepts 103 donor function IDs. This is an implementation
 inventory for the guest frontend, not an OpenGL version claim. The authoritative
-allowlist is ``jrg_gl_function_words`` in
-``hw/display/juke-retro-gl-platform.c``. QUERY_FUNCTION reports the exact
+allowlist is ``dg_gl_function_words`` in
+``hw/display/dreamgpu-gl-platform.c``. QUERY_FUNCTION reports the exact
 argument count and whether a function uses scalar CALL, immutable DATA_CALL,
 or bounded QUERY. Unlisted functions are rejected.
 
@@ -49,7 +49,7 @@ Implemented execution forms
 * Queries: GetError, GetBooleanv, GetIntegerv, GetFloatv, GetDoublev,
   GetString, IsEnabled, IsTexture, GetTexParameteriv/fv,
   GetTexLevelParameteriv/fv and GetTexEnviv/fv. State selectors are explicitly
-  bounded. Strings identify Juke and expose no GL version or extensions.
+  bounded. Strings identify DreamGPU and expose no GL version or extensions.
   ReadPixels uses normalized rectangles of at most 128 pixels, returning packed
   RGBA8 words through the same 512-byte typed result buffer. The frontend clips
   the public rectangle, tiles it and applies format conversion and PACK state.

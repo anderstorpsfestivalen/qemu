@@ -1,20 +1,20 @@
-Juke retro GPU, ABI 1.0
+DreamGPU retro GPU, ABI 1.0
 ======================
 
-``-vga none -device qemu-retro-gpu`` provides standard VGA and Bochs VBE
+``-vga none -device dreamgpu`` provides standard VGA and Bochs VBE
 scanout together with native host-side 2D operations. Adding
 ``gpu-socket=/path/to/socket`` enables a bounded experimental host OpenGL
 transport and native shared-image export on macOS and Linux. This is not yet
 a complete OpenGL implementation, a Windows ICD, or Glide/Direct3D support.
 
-PCI vendor/device ``1234:1113`` is an experimental Juke identity, not an
+PCI vendor/device ``1234:1113`` is an experimental DreamGPU identity, not an
 upstream allocated ID. The device uses the standard VGA option ROM, whose
 PCI identity QEMU patches to match the device. BAR0 is prefetchable video
 memory (16 MiB by default, configurable with ``vgamem_mb``). BAR2 is an
 8 KiB MMIO aperture. Standard VGA, VBE and framebuffer byte-order registers
-occupy their usual offsets 0x400, 0x500 and 0x600. Juke registers begin at
+occupy their usual offsets 0x400, 0x500 and 0x600. DreamGPU registers begin at
 0x1000. The public constants and command offsets are in
-``include/standard-headers/juke/retro-gpu.h``.
+``include/standard-headers/dreamgpu/gpu.h``.
 
 Submission and completion
 -------------------------
@@ -102,7 +102,7 @@ Independent native cursor
 -------------------------
 
 CURSOR capability adds the synchronous register channel documented in
-``include/standard-headers/juke/retro-cursor.h``. SHAPE captures at most
+``include/standard-headers/dreamgpu/cursor.h``. SHAPE captures at most
 64x64 immutable pixel pairs from guest RAM, validates geometry/hotspot and
 premultiplied-alpha or exact RGB AND/XOR semantics, then atomically commits
 shape, position and visibility. MOVE changes signed hotspot position and
@@ -142,7 +142,7 @@ does not leave a callback capable of signaling an obsolete completion.
 Validation
 ----------
 
-``tests/qtest/juke-retro-gpu-test.c`` exercises PCI/VBE discovery, pixel fills,
+``tests/qtest/dreamgpu-test.c`` exercises PCI/VBE discovery, pixel fills,
 horizontal/vertical overlapping copies, whole-batch validation, malformed
 counts and addresses, bounded work, interrupt masking/acknowledgement/reset,
 immutable submissions, migration and actual VGA scanout through a screendump.
@@ -152,7 +152,7 @@ behavior; Windows driver performance and compatibility require guest tests.
 Native GL transport and image lifetime
 --------------------------------------
 
-``include/standard-headers/juke/retro-gl.h`` defines the separate 0x1100 MMIO
+``include/standard-headers/dreamgpu/gl.h`` defines the separate 0x1100 MMIO
 channel and versioned variable-length records. The driver allocates process
 client tokens and serializes access. Each client owns separately identified
 contexts and drawables. Commands carry the device generation; stale commands,
@@ -251,7 +251,7 @@ GetBooleanv/GetIntegerv/GetFloatv/GetDoublev support a bounded whitelist of
 scalar, vector and matrix state. Texture binding queries return guest names;
 size limits describe this device. IsEnabled, IsTexture, texture parameters,
 texture-level dimensions/formats and texture environment queries are also
-available. GetString returns Juke vendor/renderer strings and no extensions.
+available. GetString returns DreamGPU vendor/renderer strings and no extensions.
 GL_VERSION remains unsupported because the current subset does not implement
 a complete OpenGL version. Host framebuffer IDs, native object pointers and
 host GL version/extension claims are never returned.
@@ -318,7 +318,7 @@ drawable on its next binding. This guard combines with normal, FRONT_ONLY,
 RETAIN and NO_EXPORT semantics. NO_EXPORT accepts only BOUNDED alongside it.
 It adds no GPU work or CPU pixel copies to ordinary presentation.
 
-Native diskless acceptance tests in Juke verify exact texture pixels and
+Native diskless acceptance tests in DreamGPU verify exact texture pixels and
 orientation through QEMU to Metal/Vulkan, namespace and explicit-sharing
 behavior, subimage updates, deletion with a surviving binding, slot recycling,
 native array/indexed draws and ordered desktop composition. This establishes
@@ -328,7 +328,7 @@ Ordered desktop composition
 ---------------------------
 
 The GL record opcode DESKTOP contains the fixed 64-byte descriptor in
-``retro-gl.h``. The kernel display driver holds its primary/GDI serialization
+``gl.h``. The kernel display driver holds its primary/GDI serialization
 barrier until completion, including across CPU accesses. The host first
 validates bounds for every descriptor; captured or written VRAM is then copied
 in 256-KiB main-loop quanta while the GL worker sleeps. Captures go directly
@@ -351,9 +351,9 @@ exact complete returned CPU image and supplies a future legacy display anchor;
 normal CPU frames cannot supersede it until they reach that anchor. Existing
 CPU-only operation needs none of this traffic. The fixed 128-byte host protocol
 and all handle/lifetime details are in
-``include/standard-headers/juke/gpu-transport.h``.
+``include/standard-headers/dreamgpu/transport.h``.
 
-Native integration tests in Juke verify actual QEMU command submission through
+Native integration tests in DreamGPU verify actual QEMU command submission through
 CGL/IOSurface/Metal and EGL/DMA-BUF/Vulkan, slot releases, vertical orientation,
 window clipping, CPU occlusion and readback pixels written back into guest VRAM.
 Guest game support still requires the source-built Windows transport/wrappers
@@ -370,7 +370,7 @@ synchronization callback: GDI must never continue writing a stale mapped
 primary. The host's requested vCPU stop and the driver's nonreturning wait
 together cover even the final instructions of a translated CPU block.
 
-``JUKE_RETRO_GPU_FAULT`` reports device path, reason, operation and submission
+``DREAMGPU_FAULT`` reports device path, reason, operation and submission
 sequence over QMP. The last canvas and its resources remain available for
 display and diagnostics; failure does not grant CPU ownership. QMP ``cont``
 rejects ``internal-error`` until a system reset. Guest engine RESET and a zero
@@ -385,10 +385,24 @@ retained canvas pixels through an independent diagnostic readback.
 Native 2D diagnostics
 ---------------------
 
-Enable ``-trace enable=juke_retro_gpu_*`` only during a diagnostic capture.
+Enable ``-trace enable=dreamgpu_gpu_*`` only during a diagnostic capture.
 The submit event records sequence, command count and validated pixel bytes;
 work events record each inline/BH quantum's bytes, row chunks and native elapsed
 microseconds. Completion records total elapsed time and number of quanta.
 Clock sampling is conditional on the corresponding trace event being enabled.
 This separates native copy execution from scheduling and guest driver latency.
 Disable tracing for comparative performance captures.
+
+Namespace and saved state
+-------------------------
+
+The native device is ``dreamgpu`` and the display backend is
+``dreamgpu-shmem``. The QMP fault event is
+``DREAMGPU_FAULT``. Guest command identifiers, register offsets, PCI identity,
+shared-memory layouts and fixed wire signatures are unchanged by this naming
+migration. Protocol headers live under ``standard-headers/dreamgpu``.
+
+VMState section names now use ``dreamgpu`` and ``dreamgpu-cursor``. Older
+snapshots containing the previous device section names are not an activation
+path for this namespace change: cleanly stop the old guest and cold boot its
+disk using the matched DreamGPU native runtime, guest driver and SDK package.

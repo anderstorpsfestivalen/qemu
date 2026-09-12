@@ -19,7 +19,7 @@ system_ss.add(when: 'CONFIG_SSD0323', if_true: files('ssd0323.c'))
 system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 
 system_ss.add(when: 'CONFIG_VGA_PCI', if_true: files('vga-pci.c'))
-if config_all_devices.has_key('CONFIG_JUKE_RETRO_GPU')
+if config_all_devices.has_key('CONFIG_DREAMGPU')
   # DreamGPU owns the host engine outside QEMU. A separate Cargo target directory
   # prevents recursive locking when QEMU is itself built from a Cargo build script.
   dreamgpu_root = meson.project_source_root() / '../..'
@@ -44,13 +44,13 @@ if config_all_devices.has_key('CONFIG_JUKE_RETRO_GPU')
   dreamgpu_dep = declare_dependency(link_with: dreamgpu_archive,
     include_directories: include_directories('../../../../crates/dreamgpu-host/include',
                                            '../../../../crates/dreamgpu-host/bindings'))
-  system_ss.add(when: 'CONFIG_JUKE_RETRO_GPU',
-                if_true: [files('juke-retro-gpu.c'), dreamgpu_dep])
+  system_ss.add(when: 'CONFIG_DREAMGPU',
+                if_true: [files('dreamgpu.c'), dreamgpu_dep])
 endif
-if juke_gl_deps.length() > 0
-  system_ss.add(when: 'CONFIG_JUKE_RETRO_GPU',
-                if_true: [files('juke-retro-gl.c', 'juke-retro-gl-platform.c'),
-                          juke_gl_deps])
+if dreamgpu_gl_deps.length() > 0
+  system_ss.add(when: 'CONFIG_DREAMGPU',
+                if_true: [files('dreamgpu-gl.c', 'dreamgpu-gl-platform.c'),
+                          dreamgpu_gl_deps])
 endif
 system_ss.add(when: 'CONFIG_VGA_ISA', if_true: files('vga-isa.c'))
 system_ss.add(when: 'CONFIG_VGA_MMIO', if_true: files('vga-mmio.c'))

@@ -1369,15 +1369,15 @@
   'data'    : { '*rendernode' : 'str' } }
 
 ##
-# @DisplayJukeShmem:
+# @DisplayDreamGpuShmem:
 #
-# Juke shared memory display options.
+# DreamGPU shared memory display options.
 #
-# @socket: Unix socket path for passing shared memory fd to Juke.
+# @socket: Unix socket path for passing shared memory fd to DreamGPU.
 #
 # Since: 9.2
 ##
-{ 'struct'  : 'DisplayJukeShmem',
+{ 'struct'  : 'DisplayDreamGpuShmem',
   'data'    : { '*socket' : 'str' } }
 
 ##
@@ -1529,8 +1529,8 @@
 #
 # @dbus: Start a D-Bus service for the display.  (Since 7.0)
 #
-# @juke-shmem: Juke shared memory display for zero-copy framebuffer
-#     sharing.  (Since 9.2)
+# @dreamgpu-shmem: DreamGPU shared memory display for zero-copy
+#     framebuffer sharing.  (Since 9.2)
 #
 # Since: 2.12
 ##
@@ -1545,7 +1545,7 @@
     { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
     { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
     { 'name': 'dbus', 'if': 'CONFIG_DBUS_DISPLAY' },
-    { 'name': 'juke-shmem' }
+    { 'name': 'dreamgpu-shmem' }
   ]
 }
 
@@ -1584,7 +1584,7 @@
                         'if': 'CONFIG_OPENGL' },
       'dbus': { 'type': 'DisplayDBus', 'if': 'CONFIG_DBUS_DISPLAY' },
       'sdl': { 'type': 'DisplaySDL', 'if': 'CONFIG_SDL' },
-      'juke-shmem': 'DisplayJukeShmem'
+      'dreamgpu-shmem': 'DisplayDreamGpuShmem'
   }
 }
 
@@ -1744,15 +1744,15 @@
             '*tls-port': 'int', '*cert-subject': 'str' } }
 
 ##
-# @JUKE_RETRO_GPU_FAULT:
+# @DREAMGPU_FAULT:
 #
 # A display coherence failure stopped the guest in internal-error.
 # CPU access to an incoherent primary must not resume before a system
 # reset.
 #
-# @device: QOM path of the affected qemu-retro-gpu device
+# @device: QOM path of the affected dreamgpu device
 #
-# @reason: Fault reason from the Juke retro GL ABI
+# @reason: Fault reason from the DreamGPU retro GL ABI
 #
 # @operation: Last coherence-sensitive desktop operation, or zero
 #
@@ -1760,6 +1760,6 @@
 #
 # Since: 11.2
 ##
-{ 'event': 'JUKE_RETRO_GPU_FAULT',
+{ 'event': 'DREAMGPU_FAULT',
   'data': { 'device': 'str', 'reason': 'uint32', 'operation': 'uint32',
             'sequence': 'uint32' } }

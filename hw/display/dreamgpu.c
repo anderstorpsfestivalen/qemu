@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
- * Juke VGA-compatible display with bounded native 2D command execution.
+ * DreamGPU VGA-compatible display with bounded native 2D command execution.
  */
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
@@ -14,27 +14,27 @@
 #include "qemu/error-report.h"
 #include "qapi/qapi-events-ui.h"
 #include "system/runstate.h"
-#include "standard-headers/juke/retro-gpu.h"
-#include "standard-headers/juke/retro-gl.h"
-#ifdef CONFIG_JUKE_RETRO_GL
-#include "juke-retro-gl.h"
-#include "juke-retro-gl-platform.h"
+#include "standard-headers/dreamgpu/gpu.h"
+#include "standard-headers/dreamgpu/gl.h"
+#ifdef CONFIG_DREAMGPU_GL
+#include "dreamgpu-gl.h"
+#include "dreamgpu-gl-platform.h"
 #endif
 #include "vga_int.h"
-#include "ui/juke-shmem.h"
+#include "ui/dreamgpu-shmem.h"
 #include "trace.h"
-#include "juke-retro-diagnostics.h"
+#include "dreamgpu-diagnostics.h"
 #include "dreamgpu-host.h"
 
-#define TYPE_JUKE_RETRO_GPU "qemu-retro-gpu"
-OBJECT_DECLARE_SIMPLE_TYPE(JukeRetroGPU, JUKE_RETRO_GPU)
+#define TYPE_DREAMGPU "dreamgpu"
+OBJECT_DECLARE_SIMPLE_TYPE(DreamGpu, DREAMGPU)
 
 /* Bound work per main-loop visit so large batches do not monopolize input. */
-#define JRG_WORK_QUANTUM (256 * 1024)
-#define JRG_INLINE_QUANTUM (4 * 1024 * 1024)
-#define JRG_ROW_QUANTUM 2048
+#define DG_WORK_QUANTUM (256 * 1024)
+#define DG_INLINE_QUANTUM (4 * 1024 * 1024)
+#define DG_ROW_QUANTUM 2048
 
-struct JukeRetroGPU {
+struct DreamGpu {
     PCIDevice parent_obj;
     VGACommonState vga;
     MemoryRegion mmio, regs, vga_regs[4];
@@ -45,20 +45,20 @@ struct JukeRetroGPU {
     uint64_t trace_start_us, validated_bytes;
     uint32_t trace_chunks;
     bool inline_no_irq; /* Transient, only true inside a negotiated SUBMIT. */
-    JukeNativeCursor cursor;
+    DreamGpuNativeCursor cursor;
     uint32_t cursor_addr_lo, cursor_addr_hi, cursor_bytes;
     uint32_t cursor_width, cursor_height, cursor_hot_x, cursor_hot_y;
     uint32_t cursor_format, cursor_x, cursor_y, cursor_flags, cursor_sequence;
     uint32_t cursor_status, cursor_completed, cursor_error;
-    uint8_t commands[JRG_MAX_COMMANDS * JRG_COMMAND_BYTES];
+    uint8_t commands[DG_MAX_COMMANDS * DG_COMMAND_BYTES];
     char *gpu_socket;
     bool diagnostics_enabled;
-    JrgDiagnostics *diagnostics;
-#ifdef CONFIG_JUKE_RETRO_GL
-    JrgGLEngine *gl;
+    DgDiagnostics *diagnostics;
+#ifdef CONFIG_DREAMGPU_GL
+    DgGLEngine *gl;
     QEMUBH *gl_bh;
-    JrgGLFrameRef gl_present;
-    JrgGLTransfer gl_transfer;
+    DgGLFrameRef gl_present;
+    DgGLTransfer gl_transfer;
     bool gl_transfer_active;
     uint32_t gl_transfer_row, gl_transfer_column;
     Error *gl_blocker;
@@ -77,29 +77,29 @@ static uint32_t cmd_word(const uint8_t *cmd, unsigned offset)
     return ldl_le_p(cmd + offset);
 }
 
-static void jrg_update_irq(JukeRetroGPU *s)
+static void dg_update_irq(DreamGpu *s)
 {
     pci_set_irq(&s->parent_obj, !!(s->irq_enable & s->irq_status));
 }
 
-static void jrg_complete(JukeRetroGPU *s, uint32_t error)
+static void dg_complete(DreamGpu *s, uint32_t error)
 {
     if (s->trace_start_us) {
         uint64_t elapsed = g_get_monotonic_time() - s->trace_start_us;
-        trace_juke_retro_gpu_complete(s->active_sequence, error,
+        trace_dreamgpu_gpu_complete(s->active_sequence, error,
                                      s->trace_chunks, elapsed);
     }
     s->error = error;
-    s->status = JRG_STATUS_DONE | (error ? JRG_STATUS_ERROR : 0);
+    s->status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
     s->completed = s->active_sequence;
     s->active_count = s->command_index = s->row = s->column = 0;
     if (!s->inline_no_irq) {
-        s->irq_status |= JRG_IRQ_COMPLETION;
+        s->irq_status |= DG_IRQ_COMPLETION;
     }
-    jrg_update_irq(s);
+    dg_update_irq(s);
 }
 
-static bool jrg_cursor_source_ram(JukeRetroGPU *s, uint64_t address,
+static bool dg_cursor_source_ram(DreamGpu *s, uint64_t address,
                                   uint32_t bytes)
 {
     hwaddr translated, length = bytes;
@@ -116,40 +116,40 @@ static bool jrg_cursor_source_ram(JukeRetroGPU *s, uint64_t address,
            !memory_region_is_rom(mr);
 }
 
-static void jrg_cursor_submit(JukeRetroGPU *s, uint32_t operation)
+static void dg_cursor_submit(DreamGpu *s, uint32_t operation)
 {
     g_autofree uint8_t *data = NULL;
     uint32_t error = 0;
     uint64_t address = ((uint64_t)s->cursor_addr_hi << 32) | s->cursor_addr_lo;
 
-    if (s->cursor_flags & ~JRG_CURSOR_FLAGS_MASK) {
-        error = JRG_CURSOR_ERROR_FLAGS;
-    } else if (operation == JRG_CURSOR_SHAPE) {
-        if (!s->cursor_width || s->cursor_width > JRG_CURSOR_MAX_DIMENSION ||
-            !s->cursor_height || s->cursor_height > JRG_CURSOR_MAX_DIMENSION ||
+    if (s->cursor_flags & ~DG_CURSOR_FLAGS_MASK) {
+        error = DG_CURSOR_ERROR_FLAGS;
+    } else if (operation == DG_CURSOR_SHAPE) {
+        if (!s->cursor_width || s->cursor_width > DG_CURSOR_MAX_DIMENSION ||
+            !s->cursor_height || s->cursor_height > DG_CURSOR_MAX_DIMENSION ||
             s->cursor_hot_x >= s->cursor_width ||
             s->cursor_hot_y >= s->cursor_height ||
-            (s->cursor_format != JRG_CURSOR_ARGB_PREMULTIPLIED &&
-             s->cursor_format != JRG_CURSOR_AND_XOR) ||
+            (s->cursor_format != DG_CURSOR_ARGB_PREMULTIPLIED &&
+             s->cursor_format != DG_CURSOR_AND_XOR) ||
             s->cursor_bytes != s->cursor_width * s->cursor_height * 8) {
-            error = JRG_CURSOR_ERROR_SHAPE;
-        } else if (!jrg_cursor_source_ram(s, address, s->cursor_bytes)) {
-            error = JRG_CURSOR_ERROR_DMA;
+            error = DG_CURSOR_ERROR_SHAPE;
+        } else if (!dg_cursor_source_ram(s, address, s->cursor_bytes)) {
+            error = DG_CURSOR_ERROR_DMA;
         } else {
             data = g_malloc(s->cursor_bytes);
             if (pci_dma_read(&s->parent_obj, address, data,
                               s->cursor_bytes) != MEMTX_OK) {
-                error = JRG_CURSOR_ERROR_DMA;
+                error = DG_CURSOR_ERROR_DMA;
             } else if (!dreamgpu_cursor_validate(data,
                         s->cursor_width * s->cursor_height, s->cursor_format)) {
-                error = JRG_CURSOR_ERROR_SHAPE;
+                error = DG_CURSOR_ERROR_SHAPE;
             }
         }
-    } else if (operation != JRG_CURSOR_MOVE) {
-        error = JRG_CURSOR_ERROR_SHAPE;
+    } else if (operation != DG_CURSOR_MOVE) {
+        error = DG_CURSOR_ERROR_SHAPE;
     }
     if (!error) {
-        if (operation == JRG_CURSOR_SHAPE) {
+        if (operation == DG_CURSOR_SHAPE) {
             s->cursor.width = s->cursor_width;
             s->cursor.height = s->cursor_height;
             s->cursor.hot_x = s->cursor_hot_x;
@@ -161,84 +161,84 @@ static void jrg_cursor_submit(JukeRetroGPU *s, uint32_t operation)
         s->cursor.x = s->cursor_x;
         s->cursor.y = s->cursor_y;
         s->cursor.flags = s->cursor_flags;
-        juke_shmem_native_cursor(s->vga.con, &s->cursor,
-                                  operation == JRG_CURSOR_SHAPE);
+        dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor,
+                                  operation == DG_CURSOR_SHAPE);
     }
-    s->cursor_status = JRG_STATUS_DONE | (error ? JRG_STATUS_ERROR : 0);
+    s->cursor_status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
     s->cursor_error = error;
     s->cursor_completed = s->cursor_sequence;
 }
 
-static uint32_t jrg_cursor_read(JukeRetroGPU *s, uint32_t reg)
+static uint32_t dg_cursor_read(DreamGpu *s, uint32_t reg)
 {
     switch (reg) {
-    case JRG_CURSOR_REG_VERSION: return JRG_CURSOR_ABI_VERSION;
-    case JRG_CURSOR_REG_ADDR_LO: return s->cursor_addr_lo;
-    case JRG_CURSOR_REG_ADDR_HI: return s->cursor_addr_hi;
-    case JRG_CURSOR_REG_BYTES: return s->cursor_bytes;
-    case JRG_CURSOR_REG_WIDTH: return s->cursor_width;
-    case JRG_CURSOR_REG_HEIGHT: return s->cursor_height;
-    case JRG_CURSOR_REG_HOT_X: return s->cursor_hot_x;
-    case JRG_CURSOR_REG_HOT_Y: return s->cursor_hot_y;
-    case JRG_CURSOR_REG_FORMAT: return s->cursor_format;
-    case JRG_CURSOR_REG_X: return s->cursor_x;
-    case JRG_CURSOR_REG_Y: return s->cursor_y;
-    case JRG_CURSOR_REG_FLAGS: return s->cursor_flags;
-    case JRG_CURSOR_REG_SEQUENCE: return s->cursor_sequence;
-    case JRG_CURSOR_REG_STATUS: return s->cursor_status;
-    case JRG_CURSOR_REG_COMPLETED: return s->cursor_completed;
-    case JRG_CURSOR_REG_ERROR: return s->cursor_error;
-    case JRG_CURSOR_REG_MAX_DIMENSION: return JRG_CURSOR_MAX_DIMENSION;
+    case DG_CURSOR_REG_VERSION: return DG_CURSOR_ABI_VERSION;
+    case DG_CURSOR_REG_ADDR_LO: return s->cursor_addr_lo;
+    case DG_CURSOR_REG_ADDR_HI: return s->cursor_addr_hi;
+    case DG_CURSOR_REG_BYTES: return s->cursor_bytes;
+    case DG_CURSOR_REG_WIDTH: return s->cursor_width;
+    case DG_CURSOR_REG_HEIGHT: return s->cursor_height;
+    case DG_CURSOR_REG_HOT_X: return s->cursor_hot_x;
+    case DG_CURSOR_REG_HOT_Y: return s->cursor_hot_y;
+    case DG_CURSOR_REG_FORMAT: return s->cursor_format;
+    case DG_CURSOR_REG_X: return s->cursor_x;
+    case DG_CURSOR_REG_Y: return s->cursor_y;
+    case DG_CURSOR_REG_FLAGS: return s->cursor_flags;
+    case DG_CURSOR_REG_SEQUENCE: return s->cursor_sequence;
+    case DG_CURSOR_REG_STATUS: return s->cursor_status;
+    case DG_CURSOR_REG_COMPLETED: return s->cursor_completed;
+    case DG_CURSOR_REG_ERROR: return s->cursor_error;
+    case DG_CURSOR_REG_MAX_DIMENSION: return DG_CURSOR_MAX_DIMENSION;
     default: return 0;
     }
 }
 
-static void jrg_cursor_write(JukeRetroGPU *s, uint32_t reg, uint32_t value)
+static void dg_cursor_write(DreamGpu *s, uint32_t reg, uint32_t value)
 {
     switch (reg) {
-    case JRG_CURSOR_REG_ADDR_LO:
+    case DG_CURSOR_REG_ADDR_LO:
         s->cursor_addr_lo = value;
         break;
-    case JRG_CURSOR_REG_ADDR_HI:
+    case DG_CURSOR_REG_ADDR_HI:
         s->cursor_addr_hi = value;
         break;
-    case JRG_CURSOR_REG_BYTES:
+    case DG_CURSOR_REG_BYTES:
         s->cursor_bytes = value;
         break;
-    case JRG_CURSOR_REG_WIDTH:
+    case DG_CURSOR_REG_WIDTH:
         s->cursor_width = value;
         break;
-    case JRG_CURSOR_REG_HEIGHT:
+    case DG_CURSOR_REG_HEIGHT:
         s->cursor_height = value;
         break;
-    case JRG_CURSOR_REG_HOT_X:
+    case DG_CURSOR_REG_HOT_X:
         s->cursor_hot_x = value;
         break;
-    case JRG_CURSOR_REG_HOT_Y:
+    case DG_CURSOR_REG_HOT_Y:
         s->cursor_hot_y = value;
         break;
-    case JRG_CURSOR_REG_FORMAT:
+    case DG_CURSOR_REG_FORMAT:
         s->cursor_format = value;
         break;
-    case JRG_CURSOR_REG_X:
+    case DG_CURSOR_REG_X:
         s->cursor_x = value;
         break;
-    case JRG_CURSOR_REG_Y:
+    case DG_CURSOR_REG_Y:
         s->cursor_y = value;
         break;
-    case JRG_CURSOR_REG_FLAGS:
+    case DG_CURSOR_REG_FLAGS:
         s->cursor_flags = value;
         break;
-    case JRG_CURSOR_REG_SEQUENCE:
+    case DG_CURSOR_REG_SEQUENCE:
         s->cursor_sequence = value;
         break;
-    case JRG_CURSOR_REG_SUBMIT:
-        jrg_cursor_submit(s, value);
+    case DG_CURSOR_REG_SUBMIT:
+        dg_cursor_submit(s, value);
         break;
     }
 }
 
-static void jrg_cursor_reset(JukeRetroGPU *s)
+static void dg_cursor_reset(DreamGpu *s)
 {
     s->cursor_addr_lo = s->cursor_addr_hi = s->cursor_bytes = 0;
     s->cursor_width = s->cursor_height = s->cursor_hot_x = s->cursor_hot_y = 0;
@@ -246,34 +246,34 @@ static void jrg_cursor_reset(JukeRetroGPU *s)
     s->cursor_sequence = s->cursor_status = s->cursor_completed = 0;
     s->cursor_error = 0;
     memset(&s->cursor, 0, sizeof(s->cursor));
-    juke_shmem_native_cursor(s->vga.con, &s->cursor, true);
+    dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor, true);
 }
 
-#ifdef CONFIG_JUKE_RETRO_GL
-static void jrg_fault_stop(JukeRetroGPU *s, uint32_t reason, uint32_t sequence)
+#ifdef CONFIG_DREAMGPU_GL
+static void dg_fault_stop(DreamGpu *s, uint32_t reason, uint32_t sequence)
 {
-    if (!reason || reason > JRG_GL_FAULT_DRIVER_INTERNAL || s->gl_fault) {
+    if (!reason || reason > DG_GL_FAULT_DRIVER_INTERNAL || s->gl_fault) {
         return;
     }
     s->gl_fault = reason;
     s->gl_fault_operation = s->gl_sensitive_op;
     s->gl_fault_sequence = sequence;
     g_autofree char *path = object_get_canonical_path(OBJECT(s));
-    error_report("Juke graphics coherence fault %u "
+    error_report("DreamGPU graphics coherence fault %u "
                  "(operation %u, sequence %u); "
                  "guest stopped, system reset required", reason,
                  s->gl_fault_operation, s->gl_fault_sequence);
-    qapi_event_send_juke_retro_gpu_fault(path, reason, s->gl_fault_operation,
+    qapi_event_send_dreamgpu_fault(path, reason, s->gl_fault_operation,
                                         s->gl_fault_sequence);
     vm_stop(RUN_STATE_INTERNAL_ERROR);
 }
 
-static bool jrg_result_ram(JukeRetroGPU *s, uint64_t address, uint32_t bytes)
+static bool dg_result_ram(DreamGpu *s, uint64_t address, uint32_t bytes)
 {
     hwaddr translated, length = bytes;
     MemoryRegion *mr;
 
-    if (!bytes || bytes > JRG_GL_MAX_READBACK_BYTES ||
+    if (!bytes || bytes > DG_GL_MAX_READBACK_BYTES ||
         address > UINT64_MAX - bytes) {
         return false;
     }
@@ -285,32 +285,32 @@ static bool jrg_result_ram(JukeRetroGPU *s, uint64_t address, uint32_t bytes)
            !memory_region_is_rom(mr);
 }
 
-static void jrg_gl_complete(JukeRetroGPU *s, uint32_t sequence, uint32_t error)
+static void dg_gl_complete(DreamGpu *s, uint32_t sequence, uint32_t error)
 {
     if (s->gl_trace_start_us) {
-        trace_juke_retro_gl_complete(sequence, error,
+        trace_dreamgpu_gl_complete(sequence, error,
                                     g_get_monotonic_time() -
                                     s->gl_trace_start_us);
         s->gl_trace_start_us = 0;
     }
     if (error && s->gl_sensitive_op) {
-        jrg_fault_stop(s, JRG_GL_FAULT_HOST_COHERENCE, sequence);
+        dg_fault_stop(s, DG_GL_FAULT_HOST_COHERENCE, sequence);
     }
-    s->gl_status = JRG_STATUS_DONE | (error ? JRG_STATUS_ERROR : 0);
+    s->gl_status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
     s->gl_completed = sequence;
     s->gl_error = error;
-    s->irq_status |= JRG_IRQ_GL_COMPLETION;
-    jrg_update_irq(s);
+    s->irq_status |= DG_IRQ_GL_COMPLETION;
+    dg_update_irq(s);
 }
 
-static void jrg_gl_transfer_work(JukeRetroGPU *s)
+static void dg_gl_transfer_work(DreamGpu *s)
 {
-    JrgGLTransfer *t = &s->gl_transfer;
-    uint32_t budget = JRG_WORK_QUANTUM;
+    DgGLTransfer *t = &s->gl_transfer;
+    uint32_t budget = DG_WORK_QUANTUM;
     uint32_t chunks = 0, error = 0;
     uint64_t cpu_epoch = 0, cpu_generation = 0;
 
-    if (!s->gl_transfer_active && jrg_gl_engine_transfer(s->gl, t)) {
+    if (!s->gl_transfer_active && dg_gl_engine_transfer(s->gl, t)) {
         s->gl_transfer_active = true;
         s->gl_transfer_row = s->gl_transfer_column = 0;
     }
@@ -318,7 +318,7 @@ static void jrg_gl_transfer_work(JukeRetroGPU *s)
         return;
     }
     if (t->generation != s->generation) {
-        error = JRG_GL_ERROR_GENERATION;
+        error = DG_GL_ERROR_GENERATION;
     }
     while (!error && budget && s->gl_transfer_row < t->height) {
         uint32_t row = s->gl_transfer_row;
@@ -328,7 +328,7 @@ static void jrg_gl_transfer_work(JukeRetroGPU *s)
                           (uint64_t)row * t->vram_stride + column;
         uint8_t *pixels = t->pixels + (size_t)row * t->stride + column;
         if (offset + count > s->vga.vram_size) {
-            error = JRG_GL_ERROR_DESKTOP;
+            error = DG_GL_ERROR_DESKTOP;
             break;
         }
         if (t->writeback) {
@@ -338,7 +338,7 @@ static void jrg_gl_transfer_work(JukeRetroGPU *s)
             memcpy(pixels, s->vga.vram_ptr + offset, count);
         }
         budget -= count;
-        if (++chunks == JRG_ROW_QUANTUM) {
+        if (++chunks == DG_ROW_QUANTUM) {
             budget = 0;
         }
         s->gl_transfer_column += count;
@@ -352,22 +352,22 @@ static void jrg_gl_transfer_work(JukeRetroGPU *s)
         return;
     }
     if (!error && t->return_cpu &&
-        !juke_shmem_cpu_anchor(s->vga.con, &cpu_epoch, &cpu_generation)) {
-        error = JRG_GL_ERROR_DESKTOP;
+        !dreamgpu_shmem_cpu_anchor(s->vga.con, &cpu_epoch, &cpu_generation)) {
+        error = DG_GL_ERROR_DESKTOP;
     }
     s->gl_transfer_active = false;
-    jrg_gl_engine_transfer_done(s->gl, error, cpu_epoch, cpu_generation);
+    dg_gl_engine_transfer_done(s->gl, error, cpu_epoch, cpu_generation);
 }
 
-static void jrg_gl_completed_bh(void *opaque)
+static void dg_gl_completed_bh(void *opaque)
 {
-    JukeRetroGPU *s = opaque;
-    JrgGLCompletion done;
+    DreamGpu *s = opaque;
+    DgGLCompletion done;
 
     if (s->gl) {
-        jrg_gl_transfer_work(s);
+        dg_gl_transfer_work(s);
     }
-    while (s->gl && jrg_gl_engine_completion(s->gl, &done)) {
+    while (s->gl && dg_gl_engine_completion(s->gl, &done)) {
         if (done.generation != s->generation) {
             g_free(done.bulk_result);
             continue;
@@ -376,74 +376,74 @@ static void jrg_gl_completed_bh(void *opaque)
             s->gl_present = done.present;
             if (!done.error && done.result_bytes) {
                 if (done.result_bytes > s->gl_active_result_capacity ||
-                    !jrg_result_ram(s, s->gl_active_result_address,
+                    !dg_result_ram(s, s->gl_active_result_address,
                                      done.result_bytes) ||
                     pci_dma_write(&s->parent_obj, s->gl_active_result_address,
                                    done.bulk_result ? done.bulk_result : done.result, done.result_bytes) !=
                     MEMTX_OK) {
-                    done.error = JRG_GL_ERROR_DMA;
+                    done.error = DG_GL_ERROR_DMA;
                 } else {
                     s->gl_result_bytes = done.result_bytes;
                     s->gl_result_type = done.result_type;
                 }
             }
-            jrg_gl_complete(s, done.sequence, done.error);
+            dg_gl_complete(s, done.sequence, done.error);
         }
-        if (!done.resources_live && !(s->gl_status & JRG_STATUS_BUSY)) {
+        if (!done.resources_live && !(s->gl_status & DG_STATUS_BUSY)) {
             migrate_del_blocker(&s->gl_blocker);
         }
         g_free(done.bulk_result);
     }
 }
 
-static void jrg_gl_notify(void *opaque)
+static void dg_gl_notify(void *opaque)
 {
-    JukeRetroGPU *s = opaque;
+    DreamGpu *s = opaque;
 
     qemu_bh_schedule(s->gl_bh);
 }
 
-static void jrg_gl_submit(JukeRetroGPU *s)
+static void dg_gl_submit(DreamGpu *s)
 {
     uint64_t address = ((uint64_t)s->gl_addr_hi << 32) | s->gl_addr_lo;
     uint32_t width = 0, height = 0, error, records;
     g_autofree uint8_t *data = NULL;
     Error *err = NULL;
 
-    if ((s->gl_status & JRG_STATUS_BUSY) || s->gl_fault) {
+    if ((s->gl_status & DG_STATUS_BUSY) || s->gl_fault) {
         return;
     }
     s->gl_trace_start_us =
-        trace_event_get_state_backends(TRACE_JUKE_RETRO_GL_SUBMIT) ||
-        trace_event_get_state_backends(TRACE_JUKE_RETRO_GL_COMPLETE) ?
+        trace_event_get_state_backends(TRACE_DREAMGPU_GL_SUBMIT) ||
+        trace_event_get_state_backends(TRACE_DREAMGPU_GL_COMPLETE) ?
         g_get_monotonic_time() : 0;
     s->gl_sensitive_op = 0;
     s->gl_result_bytes = s->gl_result_type = 0;
     s->gl_active_result_capacity = 0;
-    if (!s->gl_bytes || s->gl_bytes > JRG_GL_MAX_BYTES || (s->gl_bytes & 3)) {
-        jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_BATCH);
+    if (!s->gl_bytes || s->gl_bytes > DG_GL_MAX_BYTES || (s->gl_bytes & 3)) {
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_BATCH);
         return;
     }
     if (s->gl_generation != s->generation) {
-        jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_GENERATION);
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_GENERATION);
         return;
     }
     data = g_malloc(s->gl_bytes);
     if (address > UINT64_MAX - s->gl_bytes ||
         pci_dma_read(&s->parent_obj, address, data, s->gl_bytes) != MEMTX_OK) {
-        jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_DMA);
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DMA);
         return;
     }
     /* Recognize even an invalid coherence request before signaling failure. */
-    for (size_t offset = 0; offset + JRG_GL_HEADER_BYTES <= s->gl_bytes;) {
+    for (size_t offset = 0; offset + DG_GL_HEADER_BYTES <= s->gl_bytes;) {
         const uint8_t *r = data + offset;
-        uint32_t size = cmd_word(r, JRG_GL_OFF_SIZE);
-        if (size < JRG_GL_HEADER_BYTES || size > s->gl_bytes - offset) {
+        uint32_t size = cmd_word(r, DG_GL_OFF_SIZE);
+        if (size < DG_GL_HEADER_BYTES || size > s->gl_bytes - offset) {
             break;
         }
-        if (cmd_word(r, JRG_GL_OFF_OP) == JRG_GL_DESKTOP && size >= 36) {
-            uint32_t op = cmd_word(r, JRG_GL_HEADER_BYTES);
-            if (op == JRG_DESKTOP_READBACK || op == JRG_DESKTOP_RETURN) {
+        if (cmd_word(r, DG_GL_OFF_OP) == DG_GL_DESKTOP && size >= 36) {
+            uint32_t op = cmd_word(r, DG_GL_HEADER_BYTES);
+            if (op == DG_DESKTOP_READBACK || op == DG_DESKTOP_RETURN) {
                 s->gl_sensitive_op = op;
             }
         }
@@ -453,24 +453,24 @@ static void jrg_gl_submit(JukeRetroGPU *s)
         width = s->vga.vbe_regs[VBE_DISPI_INDEX_XRES];
         height = s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
     }
-    error = jrg_gl_validate(data, s->gl_bytes, s->generation, width, height,
+    error = dg_gl_validate(data, s->gl_bytes, s->generation, width, height,
                               s->vga.vram_size, &records);
     if (error) {
-        jrg_gl_complete(s, s->gl_sequence, error);
+        dg_gl_complete(s, s->gl_sequence, error);
         return;
     }
-    if (cmd_word(data, JRG_GL_OFF_OP) == JRG_GL_QUERY) {
-        uint32_t required = jrg_gl_query_result_bytes(cmd_word(data, 32),
+    if (cmd_word(data, DG_GL_OFF_OP) == DG_GL_QUERY) {
+        uint32_t required = dg_gl_query_result_bytes(cmd_word(data, 32),
                                                        data + 36);
         uint64_t result_address = ((uint64_t)s->gl_result_addr_hi << 32) |
                                  s->gl_result_addr_lo;
         if (s->gl_result_capacity < required ||
-            s->gl_result_capacity > JRG_GL_MAX_READBACK_BYTES) {
-            jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_BATCH);
+            s->gl_result_capacity > DG_GL_MAX_READBACK_BYTES) {
+            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_BATCH);
             return;
         }
-        if (!jrg_result_ram(s, result_address, s->gl_result_capacity)) {
-            jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_DMA);
+        if (!dg_result_ram(s, result_address, s->gl_result_capacity)) {
+            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DMA);
             return;
         }
         s->gl_active_result_address = result_address;
@@ -483,119 +483,119 @@ static void jrg_gl_submit(JukeRetroGPU *s)
     for (size_t offset = 0; offset < s->gl_bytes;) {
         const uint8_t *r = data + offset;
         if (s->diagnostics_enabled) {
-            jrg_diagnostic_record(s->diagnostics, r);
+            dg_diagnostic_record(s->diagnostics, r);
         }
-        if (cmd_word(r, JRG_GL_OFF_OP) == JRG_GL_DESKTOP &&
+        if (cmd_word(r, DG_GL_OFF_OP) == DG_GL_DESKTOP &&
             (s->vga.vbe_regs[VBE_DISPI_INDEX_BPP] != 32 ||
-             (s->status & JRG_STATUS_BUSY))) {
-            jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_DESKTOP);
+             (s->status & DG_STATUS_BUSY))) {
+            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DESKTOP);
             return;
         }
-        offset += cmd_word(r, JRG_GL_OFF_SIZE);
+        offset += cmd_word(r, DG_GL_OFF_SIZE);
     }
     if (!s->gpu_socket || !*s->gpu_socket) {
-        jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_TRANSPORT);
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_TRANSPORT);
         return;
     }
     if (!s->gl_blocker) {
         error_setg(&s->gl_blocker,
-                   "Juke active OpenGL resources cannot be migrated or saved");
+                   "DreamGPU active OpenGL resources cannot be migrated or saved");
         if (migrate_add_blocker(&s->gl_blocker, &err) < 0) {
             error_report_err(err);
-            jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_HOST);
+            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_HOST);
             return;
         }
     }
     if (!s->gl) {
-        s->gl = jrg_gl_engine_new(s->gpu_socket, jrg_gl_notify, s);
+        s->gl = dg_gl_engine_new(s->gpu_socket, dg_gl_notify, s);
     }
-    if (!jrg_gl_engine_submit(s->gl, data, s->gl_bytes, s->gl_sequence,
+    if (!dg_gl_engine_submit(s->gl, data, s->gl_bytes, s->gl_sequence,
                               s->generation, width, height, records)) {
-        jrg_gl_complete(s, s->gl_sequence, JRG_GL_ERROR_LIMIT);
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_LIMIT);
         return;
     }
     data = NULL;
-    s->gl_status = JRG_STATUS_BUSY;
+    s->gl_status = DG_STATUS_BUSY;
     s->gl_error = 0;
     if (s->gl_trace_start_us) {
-        trace_juke_retro_gl_submit(s->gl_sequence, records, s->gl_bytes,
+        trace_dreamgpu_gl_submit(s->gl_sequence, records, s->gl_bytes,
                                   g_get_monotonic_time() -
                                   s->gl_trace_start_us);
     }
 }
 
-static uint64_t jrg_gl_read(JukeRetroGPU *s, hwaddr addr)
+static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr)
 {
     switch (addr) {
-    case JRG_GL_REG_FAULT_STOP: return s->gl_fault;
-    case JRG_GL_REG_FAULT_OPERATION: return s->gl_fault_operation;
-    case JRG_GL_REG_FAULT_SEQUENCE: return s->gl_fault_sequence;
-    case JRG_GL_REG_RESULT_ADDR_LO: return s->gl_result_addr_lo;
-    case JRG_GL_REG_RESULT_ADDR_HI: return s->gl_result_addr_hi;
-    case JRG_GL_REG_RESULT_CAPACITY: return s->gl_result_capacity;
-    case JRG_GL_REG_RESULT_BYTES: return s->gl_result_bytes;
-    case JRG_GL_REG_RESULT_TYPE: return s->gl_result_type;
-    case JRG_GL_REG_PRESENT_SLOT: return s->gl_present.slot;
-    case JRG_GL_REG_PRESENT_EPOCH_LO: return s->gl_present.epoch;
-    case JRG_GL_REG_PRESENT_EPOCH_HI: return s->gl_present.epoch >> 32;
-    case JRG_GL_REG_PRESENT_FRAME_LO: return s->gl_present.generation;
-    case JRG_GL_REG_PRESENT_FRAME_HI: return s->gl_present.generation >> 32;
-    case JRG_GL_REG_PRESENT_CLIENT: return s->gl_present.client;
-    case JRG_GL_REG_PRESENT_DRAWABLE: return s->gl_present.drawable;
-    case JRG_GL_REG_VERSION: return JRG_GL_VERSION;
-    case JRG_GL_REG_ADDR_LO: return s->gl_addr_lo;
-    case JRG_GL_REG_ADDR_HI: return s->gl_addr_hi;
-    case JRG_GL_REG_BYTES: return s->gl_bytes;
-    case JRG_GL_REG_SEQUENCE: return s->gl_sequence;
-    case JRG_GL_REG_GENERATION: return s->generation;
-    case JRG_GL_REG_STATUS: return s->gl_status;
-    case JRG_GL_REG_COMPLETED: return s->gl_completed;
-    case JRG_GL_REG_ERROR: return s->gl_error;
-    case JRG_GL_REG_MAX_BYTES: return JRG_GL_MAX_BYTES;
-    case JRG_GL_REG_MAX_RECORDS: return JRG_GL_MAX_RECORDS;
-    case JRG_GL_REG_QUERY_FUNCTION: return s->gl_query_function;
-    case JRG_GL_REG_FUNCTION_WORDS:
-        return jrg_gl_function_words(s->gl_query_function);
+    case DG_GL_REG_FAULT_STOP: return s->gl_fault;
+    case DG_GL_REG_FAULT_OPERATION: return s->gl_fault_operation;
+    case DG_GL_REG_FAULT_SEQUENCE: return s->gl_fault_sequence;
+    case DG_GL_REG_RESULT_ADDR_LO: return s->gl_result_addr_lo;
+    case DG_GL_REG_RESULT_ADDR_HI: return s->gl_result_addr_hi;
+    case DG_GL_REG_RESULT_CAPACITY: return s->gl_result_capacity;
+    case DG_GL_REG_RESULT_BYTES: return s->gl_result_bytes;
+    case DG_GL_REG_RESULT_TYPE: return s->gl_result_type;
+    case DG_GL_REG_PRESENT_SLOT: return s->gl_present.slot;
+    case DG_GL_REG_PRESENT_EPOCH_LO: return s->gl_present.epoch;
+    case DG_GL_REG_PRESENT_EPOCH_HI: return s->gl_present.epoch >> 32;
+    case DG_GL_REG_PRESENT_FRAME_LO: return s->gl_present.generation;
+    case DG_GL_REG_PRESENT_FRAME_HI: return s->gl_present.generation >> 32;
+    case DG_GL_REG_PRESENT_CLIENT: return s->gl_present.client;
+    case DG_GL_REG_PRESENT_DRAWABLE: return s->gl_present.drawable;
+    case DG_GL_REG_VERSION: return DG_GL_VERSION;
+    case DG_GL_REG_ADDR_LO: return s->gl_addr_lo;
+    case DG_GL_REG_ADDR_HI: return s->gl_addr_hi;
+    case DG_GL_REG_BYTES: return s->gl_bytes;
+    case DG_GL_REG_SEQUENCE: return s->gl_sequence;
+    case DG_GL_REG_GENERATION: return s->generation;
+    case DG_GL_REG_STATUS: return s->gl_status;
+    case DG_GL_REG_COMPLETED: return s->gl_completed;
+    case DG_GL_REG_ERROR: return s->gl_error;
+    case DG_GL_REG_MAX_BYTES: return DG_GL_MAX_BYTES;
+    case DG_GL_REG_MAX_RECORDS: return DG_GL_MAX_RECORDS;
+    case DG_GL_REG_QUERY_FUNCTION: return s->gl_query_function;
+    case DG_GL_REG_FUNCTION_WORDS:
+        return dg_gl_function_words(s->gl_query_function);
     default: return 0;
     }
 }
 
-static void jrg_gl_write(JukeRetroGPU *s, hwaddr addr, uint32_t value)
+static void dg_gl_write(DreamGpu *s, hwaddr addr, uint32_t value)
 {
     switch (addr) {
-    case JRG_GL_REG_FAULT_STOP:
-        jrg_fault_stop(s, value, s->gl_sequence);
+    case DG_GL_REG_FAULT_STOP:
+        dg_fault_stop(s, value, s->gl_sequence);
         break;
-    case JRG_GL_REG_RESULT_ADDR_LO:
+    case DG_GL_REG_RESULT_ADDR_LO:
         s->gl_result_addr_lo = value;
         break;
-    case JRG_GL_REG_RESULT_ADDR_HI:
+    case DG_GL_REG_RESULT_ADDR_HI:
         s->gl_result_addr_hi = value;
         break;
-    case JRG_GL_REG_RESULT_CAPACITY:
+    case DG_GL_REG_RESULT_CAPACITY:
         s->gl_result_capacity = value;
         break;
-    case JRG_GL_REG_ADDR_LO:
+    case DG_GL_REG_ADDR_LO:
         s->gl_addr_lo = value;
         break;
-    case JRG_GL_REG_ADDR_HI:
+    case DG_GL_REG_ADDR_HI:
         s->gl_addr_hi = value;
         break;
-    case JRG_GL_REG_BYTES:
+    case DG_GL_REG_BYTES:
         s->gl_bytes = value;
         break;
-    case JRG_GL_REG_SEQUENCE:
+    case DG_GL_REG_SEQUENCE:
         s->gl_sequence = value;
         break;
-    case JRG_GL_REG_GENERATION:
+    case DG_GL_REG_GENERATION:
         s->gl_generation = value;
         break;
-    case JRG_GL_REG_QUERY_FUNCTION:
+    case DG_GL_REG_QUERY_FUNCTION:
         s->gl_query_function = value;
         break;
-    case JRG_GL_REG_SUBMIT:
+    case DG_GL_REG_SUBMIT:
         if (value == 1) {
-            jrg_gl_submit(s);
+            dg_gl_submit(s);
         }
         break;
     }
@@ -603,24 +603,24 @@ static void jrg_gl_write(JukeRetroGPU *s, hwaddr addr, uint32_t value)
 #endif
 
 /* The host Rust engine validates the complete immutable DMA snapshot. */
-static uint32_t jrg_validate(JukeRetroGPU *s)
+static uint32_t dg_validate(DreamGpu *s)
 {
     return dreamgpu_2d_validate(s->commands, s->active_count,
                                s->vga.vram_size, &s->validated_bytes);
 }
 
-static void jrg_transfer(void *opaque, uint32_t op, uint32_t bpp,
+static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp,
                           uint64_t src, uint64_t dst, uint32_t bytes,
                           uint32_t color)
 {
-    JukeRetroGPU *s = opaque;
+    DreamGpu *s = opaque;
     uint8_t *out = s->vga.vram_ptr + dst;
 
     /* Guest CPU threads can access VRAM outside BQL. Keep RAM access in QEMU:
      * Rust receives integer bounds only and never creates guest RAM references. */
-    if (op == JRG_CMD_COPY) {
+    if (op == DG_CMD_COPY) {
         memmove(out, s->vga.vram_ptr + src, bytes);
-    } else if (op == JRG_CMD_FILL) {
+    } else if (op == DG_CMD_FILL) {
         if (bpp == 1) {
             memset(out, color, bytes);
         } else {
@@ -636,14 +636,14 @@ static void jrg_transfer(void *opaque, uint32_t op, uint32_t bpp,
     memory_region_set_dirty(&s->vga.vram, dst, bytes);
 }
 
-static void jrg_run(JukeRetroGPU *s, uint32_t budget)
+static void dg_run(DreamGpu *s, uint32_t budget)
 {
     DreamGpuProgress progress = {
         s->command_index, s->row, s->column,
     };
     DreamGpuWork work;
     uint32_t error;
-    bool tracing = trace_event_get_state_backends(TRACE_JUKE_RETRO_GPU_WORK);
+    bool tracing = trace_event_get_state_backends(TRACE_DREAMGPU_GPU_WORK);
     uint64_t start_us = tracing ? g_get_monotonic_time() : 0;
 
     if (s->trace_start_us) {
@@ -653,76 +653,76 @@ static void jrg_run(JukeRetroGPU *s, uint32_t budget)
      * asynchronously. Preserve the existing migratable progress fields. */
     error = dreamgpu_2d_execute(s->commands, s->active_count,
                                s->vga.vram_size,
-                               &progress, budget, jrg_transfer, s, &work);
+                               &progress, budget, dg_transfer, s, &work);
     if (error) {
-        jrg_complete(s, error);
+        dg_complete(s, error);
         return;
     }
     s->command_index = progress.command;
     s->row = progress.row;
     s->column = progress.column;
     if (tracing) {
-        trace_juke_retro_gpu_work(s->active_sequence, work.bytes, work.chunks,
+        trace_dreamgpu_gpu_work(s->active_sequence, work.bytes, work.chunks,
                                  g_get_monotonic_time() - start_us,
-                                 budget == JRG_INLINE_QUANTUM);
+                                 budget == DG_INLINE_QUANTUM);
     }
     if (s->command_index == s->active_count) {
-        jrg_complete(s, JRG_ERROR_NONE);
+        dg_complete(s, DG_ERROR_NONE);
     } else {
         qemu_bh_schedule(s->work_bh);
     }
 }
 
-static void jrg_work(void *opaque)
+static void dg_work(void *opaque)
 {
-    jrg_run(opaque, JRG_WORK_QUANTUM);
+    dg_run(opaque, DG_WORK_QUANTUM);
 }
 
-static void jrg_submit(JukeRetroGPU *s)
+static void dg_submit(DreamGpu *s)
 {
     uint64_t addr = ((uint64_t)s->addr_hi << 32) | s->addr_lo;
     uint32_t error;
 
     /* A producer owns the channel until completion; never replace its work. */
-    if (s->status & JRG_STATUS_BUSY) {
+    if (s->status & DG_STATUS_BUSY) {
         return;
     }
     s->trace_start_us =
-        trace_event_get_state_backends(TRACE_JUKE_RETRO_GPU_COMPLETE) ?
+        trace_event_get_state_backends(TRACE_DREAMGPU_GPU_COMPLETE) ?
         g_get_monotonic_time() : 0;
     s->trace_chunks = 0;
     s->validated_bytes = 0;
     s->active_sequence = s->sequence;
     s->active_count = s->count;
     s->command_index = s->row = s->column = 0;
-    s->error = JRG_ERROR_NONE;
-    if (!s->count || s->count > JRG_MAX_COMMANDS) {
-        jrg_complete(s, JRG_ERROR_BATCH_COUNT);
+    s->error = DG_ERROR_NONE;
+    if (!s->count || s->count > DG_MAX_COMMANDS) {
+        dg_complete(s, DG_ERROR_BATCH_COUNT);
         return;
     }
-    if (addr > UINT64_MAX - s->count * JRG_COMMAND_BYTES ||
+    if (addr > UINT64_MAX - s->count * DG_COMMAND_BYTES ||
         pci_dma_read(&s->parent_obj, addr, s->commands,
-                     s->count * JRG_COMMAND_BYTES) != MEMTX_OK) {
-        jrg_complete(s, JRG_ERROR_DMA);
+                     s->count * DG_COMMAND_BYTES) != MEMTX_OK) {
+        dg_complete(s, DG_ERROR_DMA);
         return;
     }
-    error = jrg_validate(s);
+    error = dg_validate(s);
     if (error) {
-        jrg_complete(s, error);
+        dg_complete(s, error);
         return;
     }
-    trace_juke_retro_gpu_submit(s->active_sequence, s->active_count,
-                               s->validated_bytes, JRG_INLINE_QUANTUM);
-    s->status = JRG_STATUS_BUSY;
+    trace_dreamgpu_gpu_submit(s->active_sequence, s->active_count,
+                               s->validated_bytes, DG_INLINE_QUANTUM);
+    s->status = DG_STATUS_BUSY;
     /*
      * A full 1024x768x32 GDI blit fits in one bounded MMIO exit. Larger
      * operations continue in small BH quanta; narrow/tall rectangles are
      * separately bounded by the row limit to cap dirty-logging overhead.
      */
-    jrg_run(s, JRG_INLINE_QUANTUM);
+    dg_run(s, DG_INLINE_QUANTUM);
 }
 
-static void jrg_engine_reset(JukeRetroGPU *s)
+static void dg_engine_reset(DreamGpu *s)
 {
     qemu_bh_cancel(s->work_bh);
     s->trace_start_us = 0;
@@ -733,8 +733,8 @@ static void jrg_engine_reset(JukeRetroGPU *s)
     s->row = s->column = 0;
     memset(s->commands, 0, sizeof(s->commands));
     s->generation++;
-    jrg_cursor_reset(s);
-#ifdef CONFIG_JUKE_RETRO_GL
+    dg_cursor_reset(s);
+#ifdef CONFIG_DREAMGPU_GL
     s->gl_addr_lo = s->gl_addr_hi = s->gl_bytes = s->gl_sequence = 0;
     s->gl_generation = s->gl_status = s->gl_completed = s->gl_error = 0;
     s->gl_query_function = 0;
@@ -746,192 +746,192 @@ static void jrg_engine_reset(JukeRetroGPU *s)
     memset(&s->gl_present, 0, sizeof(s->gl_present));
     if (s->gl) {
         uint64_t epoch = 0, generation = 0;
-        juke_shmem_cpu_anchor(s->vga.con, &epoch, &generation);
-        jrg_gl_engine_reset(s->gl, s->generation, epoch, generation);
+        dreamgpu_shmem_cpu_anchor(s->vga.con, &epoch, &generation);
+        dg_gl_engine_reset(s->gl, s->generation, epoch, generation);
     }
 #endif
-    jrg_update_irq(s);
+    dg_update_irq(s);
 }
 
-static uint64_t jrg_read(void *opaque, hwaddr addr, unsigned size)
+static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size)
 {
-    JukeRetroGPU *s = opaque;
-    if (s->diagnostics_enabled && addr + JRG_REG_MAGIC < JRG_MMIO_SIZE) {
-        s->diagnostics->reads[(addr + JRG_REG_MAGIC) / 4]++;
+    DreamGpu *s = opaque;
+    if (s->diagnostics_enabled && addr + DG_REG_MAGIC < DG_MMIO_SIZE) {
+        s->diagnostics->reads[(addr + DG_REG_MAGIC) / 4]++;
     }
 
-    if (addr + JRG_REG_MAGIC >= JRG_CURSOR_REG_VERSION &&
-        addr + JRG_REG_MAGIC <= JRG_CURSOR_REG_MAX_DIMENSION) {
-        return jrg_cursor_read(s, addr + JRG_REG_MAGIC);
+    if (addr + DG_REG_MAGIC >= DG_CURSOR_REG_VERSION &&
+        addr + DG_REG_MAGIC <= DG_CURSOR_REG_MAX_DIMENSION) {
+        return dg_cursor_read(s, addr + DG_REG_MAGIC);
     }
-#ifdef CONFIG_JUKE_RETRO_GL
-    if (addr + JRG_REG_MAGIC >= JRG_GL_REG_VERSION) {
-        return jrg_gl_read(s, addr + JRG_REG_MAGIC);
+#ifdef CONFIG_DREAMGPU_GL
+    if (addr + DG_REG_MAGIC >= DG_GL_REG_VERSION) {
+        return dg_gl_read(s, addr + DG_REG_MAGIC);
     }
 #endif
 
-    switch (addr + JRG_REG_MAGIC) {
-    case JRG_REG_MAGIC: return JRG_MAGIC;
-    case JRG_REG_VERSION: return JRG_ABI_VERSION;
-    case JRG_REG_CAPS:
-        return JRG_CAP_FILL | JRG_CAP_COPY | JRG_CAP_DAMAGE |
-               JRG_CAP_COMPLETION_IRQ | JRG_CAP_INLINE_NO_IRQ | JRG_CAP_CURSOR
-#ifdef CONFIG_JUKE_RETRO_GL
+    switch (addr + DG_REG_MAGIC) {
+    case DG_REG_MAGIC: return DG_MAGIC;
+    case DG_REG_VERSION: return DG_ABI_VERSION;
+    case DG_REG_CAPS:
+        return DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE |
+               DG_CAP_COMPLETION_IRQ | DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR
+#ifdef CONFIG_DREAMGPU_GL
                | (s->gpu_socket && *s->gpu_socket ?
-                  JRG_CAP_GL_TRANSPORT | JRG_CAP_GL_FRONT_BUFFERS |
-                  JRG_CAP_GL_PRESENT_BOUNDS | JRG_CAP_GL_BULK_READBACK : 0)
+                  DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
+                  DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK : 0)
 #endif
                ;
-    case JRG_REG_VRAM_SIZE: return s->vga.vram_size;
-    case JRG_REG_BATCH_ADDR_LO: return s->addr_lo;
-    case JRG_REG_BATCH_ADDR_HI: return s->addr_hi;
-    case JRG_REG_BATCH_COUNT: return s->count;
-    case JRG_REG_SUBMIT_SEQUENCE: return s->sequence;
-    case JRG_REG_STATUS: return s->status;
-    case JRG_REG_COMPLETED_SEQUENCE: return s->completed;
-    case JRG_REG_ERROR: return s->error;
-    case JRG_REG_IRQ_ENABLE: return s->irq_enable;
-    case JRG_REG_IRQ_STATUS: return s->irq_status;
-    case JRG_REG_GENERATION: return s->generation;
-    case JRG_REG_MAX_COMMANDS: return JRG_MAX_COMMANDS;
-    case JRG_REG_MAX_WORK_BYTES: return JRG_MAX_WORK_BYTES;
+    case DG_REG_VRAM_SIZE: return s->vga.vram_size;
+    case DG_REG_BATCH_ADDR_LO: return s->addr_lo;
+    case DG_REG_BATCH_ADDR_HI: return s->addr_hi;
+    case DG_REG_BATCH_COUNT: return s->count;
+    case DG_REG_SUBMIT_SEQUENCE: return s->sequence;
+    case DG_REG_STATUS: return s->status;
+    case DG_REG_COMPLETED_SEQUENCE: return s->completed;
+    case DG_REG_ERROR: return s->error;
+    case DG_REG_IRQ_ENABLE: return s->irq_enable;
+    case DG_REG_IRQ_STATUS: return s->irq_status;
+    case DG_REG_GENERATION: return s->generation;
+    case DG_REG_MAX_COMMANDS: return DG_MAX_COMMANDS;
+    case DG_REG_MAX_WORK_BYTES: return DG_MAX_WORK_BYTES;
     default: return 0;
     }
 }
 
-static void jrg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
+static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 {
-    JukeRetroGPU *s = opaque;
-    if (s->diagnostics_enabled && addr + JRG_REG_MAGIC < JRG_MMIO_SIZE) {
-        s->diagnostics->writes[(addr + JRG_REG_MAGIC) / 4]++;
+    DreamGpu *s = opaque;
+    if (s->diagnostics_enabled && addr + DG_REG_MAGIC < DG_MMIO_SIZE) {
+        s->diagnostics->writes[(addr + DG_REG_MAGIC) / 4]++;
     }
 
-    if (addr + JRG_REG_MAGIC >= JRG_CURSOR_REG_VERSION &&
-        addr + JRG_REG_MAGIC <= JRG_CURSOR_REG_MAX_DIMENSION) {
-        jrg_cursor_write(s, addr + JRG_REG_MAGIC, value);
+    if (addr + DG_REG_MAGIC >= DG_CURSOR_REG_VERSION &&
+        addr + DG_REG_MAGIC <= DG_CURSOR_REG_MAX_DIMENSION) {
+        dg_cursor_write(s, addr + DG_REG_MAGIC, value);
         return;
     }
-#ifdef CONFIG_JUKE_RETRO_GL
-    if (addr + JRG_REG_MAGIC >= JRG_GL_REG_VERSION) {
-        jrg_gl_write(s, addr + JRG_REG_MAGIC, value);
+#ifdef CONFIG_DREAMGPU_GL
+    if (addr + DG_REG_MAGIC >= DG_GL_REG_VERSION) {
+        dg_gl_write(s, addr + DG_REG_MAGIC, value);
         return;
     }
 #endif
 
-    switch (addr + JRG_REG_MAGIC) {
-    case JRG_REG_BATCH_ADDR_LO:
+    switch (addr + DG_REG_MAGIC) {
+    case DG_REG_BATCH_ADDR_LO:
         s->addr_lo = value;
         break;
-    case JRG_REG_BATCH_ADDR_HI:
+    case DG_REG_BATCH_ADDR_HI:
         s->addr_hi = value;
         break;
-    case JRG_REG_BATCH_COUNT:
+    case DG_REG_BATCH_COUNT:
         s->count = value;
         break;
-    case JRG_REG_SUBMIT_SEQUENCE:
+    case DG_REG_SUBMIT_SEQUENCE:
         s->sequence = value;
         break;
-    case JRG_REG_SUBMIT:
-        if (value == JRG_SUBMIT_START ||
-            value == (JRG_SUBMIT_START | JRG_SUBMIT_INLINE_NO_IRQ)) {
+    case DG_REG_SUBMIT:
+        if (value == DG_SUBMIT_START ||
+            value == (DG_SUBMIT_START | DG_SUBMIT_INLINE_NO_IRQ)) {
             /* Only this MMIO callback can suppress its own completion IRQ. */
-            s->inline_no_irq = value & JRG_SUBMIT_INLINE_NO_IRQ;
-            jrg_submit(s);
+            s->inline_no_irq = value & DG_SUBMIT_INLINE_NO_IRQ;
+            dg_submit(s);
             s->inline_no_irq = false;
         }
         break;
-    case JRG_REG_IRQ_ENABLE:
-        s->irq_enable = value & (JRG_IRQ_COMPLETION | JRG_IRQ_GL_COMPLETION);
-        jrg_update_irq(s);
+    case DG_REG_IRQ_ENABLE:
+        s->irq_enable = value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
+        dg_update_irq(s);
         break;
-    case JRG_REG_IRQ_STATUS:
+    case DG_REG_IRQ_STATUS:
         s->irq_status &= ~(value &
-                           (JRG_IRQ_COMPLETION | JRG_IRQ_GL_COMPLETION));
-        jrg_update_irq(s);
+                           (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION));
+        dg_update_irq(s);
         break;
-    case JRG_REG_RESET:
+    case DG_REG_RESET:
         if (value == 1) {
-#ifdef CONFIG_JUKE_RETRO_GL
+#ifdef CONFIG_DREAMGPU_GL
             if (s->gl_fault) {
                 break;
             }
 #endif
-            jrg_engine_reset(s);
+            dg_engine_reset(s);
         }
         break;
     }
 }
 
-static const MemoryRegionOps jrg_ops = {
-    .read = jrg_read,
-    .write = jrg_write,
+static const MemoryRegionOps dg_ops = {
+    .read = dg_read,
+    .write = dg_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = { .min_access_size = 4, .max_access_size = 4 },
     .impl = { .min_access_size = 4, .max_access_size = 4 },
 };
 
-static int jrg_post_load(void *opaque, int version_id)
+static int dg_post_load(void *opaque, int version_id)
 {
-    JukeRetroGPU *s = opaque;
+    DreamGpu *s = opaque;
 
-    if ((s->cursor.flags & ~JRG_CURSOR_FLAGS_MASK) ||
-        (s->cursor_status & JRG_STATUS_BUSY) ||
-        s->cursor.width > JRG_CURSOR_MAX_DIMENSION ||
-        s->cursor.height > JRG_CURSOR_MAX_DIMENSION ||
+    if ((s->cursor.flags & ~DG_CURSOR_FLAGS_MASK) ||
+        (s->cursor_status & DG_STATUS_BUSY) ||
+        s->cursor.width > DG_CURSOR_MAX_DIMENSION ||
+        s->cursor.height > DG_CURSOR_MAX_DIMENSION ||
         (!!s->cursor.width != !!s->cursor.height) ||
         (s->cursor.width &&
          (s->cursor.hot_x < 0 || s->cursor.hot_y < 0 ||
           s->cursor.hot_x >= s->cursor.width ||
           s->cursor.hot_y >= s->cursor.height ||
-          (s->cursor.format != JRG_CURSOR_ARGB_PREMULTIPLIED &&
-           s->cursor.format != JRG_CURSOR_AND_XOR) ||
+          (s->cursor.format != DG_CURSOR_ARGB_PREMULTIPLIED &&
+           s->cursor.format != DG_CURSOR_AND_XOR) ||
           !dreamgpu_cursor_validate(s->cursor.pixels,
                     s->cursor.width * s->cursor.height, s->cursor.format)))) {
         return -EINVAL;
     }
-#ifdef CONFIG_JUKE_RETRO_GL
+#ifdef CONFIG_DREAMGPU_GL
     /* Active GL jobs/resources are never part of a valid saved state. */
-    if (s->gl_status & JRG_STATUS_BUSY) {
+    if (s->gl_status & DG_STATUS_BUSY) {
         return -EINVAL;
     }
 #endif
-    if (s->status & JRG_STATUS_BUSY) {
+    if (s->status & DG_STATUS_BUSY) {
         const uint8_t *c;
 
-        if (jrg_validate(s) || s->command_index >= s->active_count ||
+        if (dg_validate(s) || s->command_index >= s->active_count ||
             s->row >= cmd_word(s->commands +
-                              s->command_index * JRG_COMMAND_BYTES,
-                              JRG_CMD_HEIGHT)) {
+                              s->command_index * DG_COMMAND_BYTES,
+                              DG_CMD_HEIGHT)) {
             return -EINVAL;
         }
-        c = s->commands + s->command_index * JRG_COMMAND_BYTES;
-        if (s->column >= cmd_word(c, JRG_CMD_WIDTH) *
-                         cmd_word(c, JRG_CMD_BPP) ||
-            s->column % cmd_word(c, JRG_CMD_BPP)) {
+        c = s->commands + s->command_index * DG_COMMAND_BYTES;
+        if (s->column >= cmd_word(c, DG_CMD_WIDTH) *
+                         cmd_word(c, DG_CMD_BPP) ||
+            s->column % cmd_word(c, DG_CMD_BPP)) {
             return -EINVAL;
         }
         qemu_bh_schedule(s->work_bh);
     }
-    jrg_update_irq(s);
-    juke_shmem_native_cursor(s->vga.con, &s->cursor, true);
+    dg_update_irq(s);
+    dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor, true);
     return 0;
 }
 
-static int jrg_pre_load(void *opaque)
+static int dg_pre_load(void *opaque)
 {
-    JukeRetroGPU *s = opaque;
+    DreamGpu *s = opaque;
 
     qemu_bh_cancel(s->work_bh);
     s->trace_start_us = 0;
-    jrg_cursor_reset(s);
-#ifdef CONFIG_JUKE_RETRO_GL
+    dg_cursor_reset(s);
+#ifdef CONFIG_DREAMGPU_GL
     /*
      * Restoring a pre-3D checkpoint discards the current graphics session.
      * This explicit VM restore may wait for teardown; normal MMIO never does.
      */
     qemu_bh_cancel(s->gl_bh);
     s->gl_transfer_active = false;
-    jrg_gl_engine_free(s->gl);
+    dg_gl_engine_free(s->gl);
     s->gl = NULL;
     memset(&s->gl_present, 0, sizeof(s->gl_present));
     s->gl_result_addr_lo = s->gl_result_addr_hi = s->gl_result_capacity = 0;
@@ -943,102 +943,102 @@ static int jrg_pre_load(void *opaque)
     return 0;
 }
 
-static const VMStateDescription vmstate_jrg_cursor = {
-    .name = "juke-retro-cursor",
+static const VMStateDescription vmstate_dg_cursor = {
+    .name = "dreamgpu-cursor",
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
-        VMSTATE_UINT32(width, JukeNativeCursor),
-        VMSTATE_UINT32(height, JukeNativeCursor),
-        VMSTATE_UINT32(format, JukeNativeCursor),
-        VMSTATE_INT32(hot_x, JukeNativeCursor),
-        VMSTATE_INT32(hot_y, JukeNativeCursor),
-        VMSTATE_INT32(x, JukeNativeCursor),
-        VMSTATE_INT32(y, JukeNativeCursor),
-        VMSTATE_UINT32(flags, JukeNativeCursor),
-        VMSTATE_UINT8_ARRAY(pixels, JukeNativeCursor, JRG_CURSOR_MAX_BYTES),
+        VMSTATE_UINT32(width, DreamGpuNativeCursor),
+        VMSTATE_UINT32(height, DreamGpuNativeCursor),
+        VMSTATE_UINT32(format, DreamGpuNativeCursor),
+        VMSTATE_INT32(hot_x, DreamGpuNativeCursor),
+        VMSTATE_INT32(hot_y, DreamGpuNativeCursor),
+        VMSTATE_INT32(x, DreamGpuNativeCursor),
+        VMSTATE_INT32(y, DreamGpuNativeCursor),
+        VMSTATE_UINT32(flags, DreamGpuNativeCursor),
+        VMSTATE_UINT8_ARRAY(pixels, DreamGpuNativeCursor, DG_CURSOR_MAX_BYTES),
         VMSTATE_END_OF_LIST()
     },
 };
 
-static const VMStateDescription vmstate_jrg = {
-    .name = TYPE_JUKE_RETRO_GPU,
+static const VMStateDescription vmstate_dg = {
+    .name = TYPE_DREAMGPU,
     .version_id = 3,
     .minimum_version_id = 1,
-    .pre_load = jrg_pre_load,
-    .post_load = jrg_post_load,
+    .pre_load = dg_pre_load,
+    .post_load = dg_post_load,
     .fields = (const VMStateField[]) {
-        VMSTATE_PCI_DEVICE(parent_obj, JukeRetroGPU),
-        VMSTATE_STRUCT(vga, JukeRetroGPU, 0, vmstate_vga_common,
+        VMSTATE_PCI_DEVICE(parent_obj, DreamGpu),
+        VMSTATE_STRUCT(vga, DreamGpu, 0, vmstate_vga_common,
                        VGACommonState),
-        VMSTATE_UINT32(addr_lo, JukeRetroGPU),
-        VMSTATE_UINT32(addr_hi, JukeRetroGPU),
-        VMSTATE_UINT32(count, JukeRetroGPU),
-        VMSTATE_UINT32(sequence, JukeRetroGPU),
-        VMSTATE_UINT32(status, JukeRetroGPU),
-        VMSTATE_UINT32(completed, JukeRetroGPU),
-        VMSTATE_UINT32(error, JukeRetroGPU),
-        VMSTATE_UINT32(irq_enable, JukeRetroGPU),
-        VMSTATE_UINT32(irq_status, JukeRetroGPU),
-        VMSTATE_UINT32(generation, JukeRetroGPU),
-        VMSTATE_UINT32(active_count, JukeRetroGPU),
-        VMSTATE_UINT32(active_sequence, JukeRetroGPU),
-        VMSTATE_UINT32(command_index, JukeRetroGPU),
-        VMSTATE_UINT32(row, JukeRetroGPU),
-        VMSTATE_UINT32(column, JukeRetroGPU),
-        VMSTATE_UINT8_ARRAY(commands, JukeRetroGPU,
-                           JRG_MAX_COMMANDS * JRG_COMMAND_BYTES),
-        VMSTATE_STRUCT(cursor, JukeRetroGPU, 3, vmstate_jrg_cursor,
-                        JukeNativeCursor),
-        VMSTATE_UINT32_V(cursor_addr_lo, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_addr_hi, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_bytes, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_width, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_height, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_hot_x, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_hot_y, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_format, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_x, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_y, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_flags, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_sequence, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_status, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_completed, JukeRetroGPU, 3),
-        VMSTATE_UINT32_V(cursor_error, JukeRetroGPU, 3),
-#ifdef CONFIG_JUKE_RETRO_GL
-        VMSTATE_UINT32(gl_addr_lo, JukeRetroGPU),
-        VMSTATE_UINT32(gl_addr_hi, JukeRetroGPU),
-        VMSTATE_UINT32(gl_bytes, JukeRetroGPU),
-        VMSTATE_UINT32(gl_sequence, JukeRetroGPU),
-        VMSTATE_UINT32(gl_generation, JukeRetroGPU),
-        VMSTATE_UINT32(gl_status, JukeRetroGPU),
-        VMSTATE_UINT32(gl_completed, JukeRetroGPU),
-        VMSTATE_UINT32(gl_error, JukeRetroGPU),
-        VMSTATE_UINT32(gl_query_function, JukeRetroGPU),
-        VMSTATE_UINT32_V(gl_result_addr_lo, JukeRetroGPU, 2),
-        VMSTATE_UINT32_V(gl_result_addr_hi, JukeRetroGPU, 2),
-        VMSTATE_UINT32_V(gl_result_capacity, JukeRetroGPU, 2),
-        VMSTATE_UINT32_V(gl_result_bytes, JukeRetroGPU, 2),
-        VMSTATE_UINT32_V(gl_result_type, JukeRetroGPU, 2),
+        VMSTATE_UINT32(addr_lo, DreamGpu),
+        VMSTATE_UINT32(addr_hi, DreamGpu),
+        VMSTATE_UINT32(count, DreamGpu),
+        VMSTATE_UINT32(sequence, DreamGpu),
+        VMSTATE_UINT32(status, DreamGpu),
+        VMSTATE_UINT32(completed, DreamGpu),
+        VMSTATE_UINT32(error, DreamGpu),
+        VMSTATE_UINT32(irq_enable, DreamGpu),
+        VMSTATE_UINT32(irq_status, DreamGpu),
+        VMSTATE_UINT32(generation, DreamGpu),
+        VMSTATE_UINT32(active_count, DreamGpu),
+        VMSTATE_UINT32(active_sequence, DreamGpu),
+        VMSTATE_UINT32(command_index, DreamGpu),
+        VMSTATE_UINT32(row, DreamGpu),
+        VMSTATE_UINT32(column, DreamGpu),
+        VMSTATE_UINT8_ARRAY(commands, DreamGpu,
+                           DG_MAX_COMMANDS * DG_COMMAND_BYTES),
+        VMSTATE_STRUCT(cursor, DreamGpu, 3, vmstate_dg_cursor,
+                        DreamGpuNativeCursor),
+        VMSTATE_UINT32_V(cursor_addr_lo, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_addr_hi, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_bytes, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_width, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_height, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_hot_x, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_hot_y, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_format, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_x, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_y, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_flags, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_sequence, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_status, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_completed, DreamGpu, 3),
+        VMSTATE_UINT32_V(cursor_error, DreamGpu, 3),
+#ifdef CONFIG_DREAMGPU_GL
+        VMSTATE_UINT32(gl_addr_lo, DreamGpu),
+        VMSTATE_UINT32(gl_addr_hi, DreamGpu),
+        VMSTATE_UINT32(gl_bytes, DreamGpu),
+        VMSTATE_UINT32(gl_sequence, DreamGpu),
+        VMSTATE_UINT32(gl_generation, DreamGpu),
+        VMSTATE_UINT32(gl_status, DreamGpu),
+        VMSTATE_UINT32(gl_completed, DreamGpu),
+        VMSTATE_UINT32(gl_error, DreamGpu),
+        VMSTATE_UINT32(gl_query_function, DreamGpu),
+        VMSTATE_UINT32_V(gl_result_addr_lo, DreamGpu, 2),
+        VMSTATE_UINT32_V(gl_result_addr_hi, DreamGpu, 2),
+        VMSTATE_UINT32_V(gl_result_capacity, DreamGpu, 2),
+        VMSTATE_UINT32_V(gl_result_bytes, DreamGpu, 2),
+        VMSTATE_UINT32_V(gl_result_type, DreamGpu, 2),
 #endif
         VMSTATE_END_OF_LIST()
     },
 };
 
-static void jrg_reset(DeviceState *dev)
+static void dg_reset(DeviceState *dev)
 {
-    JukeRetroGPU *s = JUKE_RETRO_GPU(dev);
+    DreamGpu *s = DREAMGPU(dev);
 
-#ifdef CONFIG_JUKE_RETRO_GL
+#ifdef CONFIG_DREAMGPU_GL
     s->gl_fault = s->gl_fault_operation = s->gl_fault_sequence = 0;
 #endif
-    jrg_engine_reset(s);
+    dg_engine_reset(s);
     vga_common_reset(&s->vga);
 }
 
-static void jrg_realize(PCIDevice *dev, Error **errp)
+static void dg_realize(PCIDevice *dev, Error **errp)
 {
-    JukeRetroGPU *s = JUKE_RETRO_GPU(dev);
+    DreamGpu *s = DREAMGPU(dev);
 
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
         return;
@@ -1047,37 +1047,37 @@ static void jrg_realize(PCIDevice *dev, Error **errp)
              pci_address_space_io(dev), true);
     s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0,
                                             s->vga.hw_ops, &s->vga);
-    s->work_bh = qemu_bh_new(jrg_work, s);
-#ifdef CONFIG_JUKE_RETRO_GL
-    s->gl_bh = qemu_bh_new(jrg_gl_completed_bh, s);
+    s->work_bh = qemu_bh_new(dg_work, s);
+#ifdef CONFIG_DREAMGPU_GL
+    s->gl_bh = qemu_bh_new(dg_gl_completed_bh, s);
 #endif
-    pci_register_bar(dev, JRG_VRAM_BAR, PCI_BASE_ADDRESS_MEM_PREFETCH,
+    pci_register_bar(dev, DG_VRAM_BAR, PCI_BASE_ADDRESS_MEM_PREFETCH,
                      &s->vga.vram);
-    memory_region_init(&s->mmio, OBJECT(dev), "juke-retro-gpu.mmio",
-                       JRG_MMIO_SIZE);
+    memory_region_init(&s->mmio, OBJECT(dev), "dreamgpu.mmio",
+                       DG_MMIO_SIZE);
     pci_std_vga_mmio_region_init(&s->vga, OBJECT(dev), &s->mmio,
                                  s->vga_regs, true, false);
-    memory_region_init_io(&s->regs, OBJECT(dev), &jrg_ops, s,
-                          "juke-retro-gpu.commands", 0x1000);
-    memory_region_add_subregion(&s->mmio, JRG_REG_MAGIC, &s->regs);
-    pci_register_bar(dev, JRG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
+    memory_region_init_io(&s->regs, OBJECT(dev), &dg_ops, s,
+                          "dreamgpu.commands", 0x1000);
+    memory_region_add_subregion(&s->mmio, DG_REG_MAGIC, &s->regs);
+    pci_register_bar(dev, DG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
                      &s->mmio);
     pci_set_byte(dev->config + PCI_INTERRUPT_PIN, 1);
 }
 
 /* Diagnostics are host control state, deliberately not part of VM migration.
  * Enabling starts a fresh bounded window; disabling freezes it for inspection. */
-static bool jrg_diagnostics_get(Object *obj, Error **errp)
+static bool dg_diagnostics_get(Object *obj, Error **errp)
 {
-    return JUKE_RETRO_GPU(obj)->diagnostics_enabled;
+    return DREAMGPU(obj)->diagnostics_enabled;
 }
 
-static void jrg_diagnostics_set(Object *obj, bool enabled, Error **errp)
+static void dg_diagnostics_set(Object *obj, bool enabled, Error **errp)
 {
-    JukeRetroGPU *s = JUKE_RETRO_GPU(obj);
+    DreamGpu *s = DREAMGPU(obj);
     if (enabled) {
         if (!s->diagnostics) {
-            s->diagnostics = g_new0(JrgDiagnostics, 1);
+            s->diagnostics = g_new0(DgDiagnostics, 1);
         } else {
             memset(s->diagnostics, 0, sizeof(*s->diagnostics));
         }
@@ -1088,10 +1088,10 @@ static void jrg_diagnostics_set(Object *obj, bool enabled, Error **errp)
     s->diagnostics_enabled = enabled;
 }
 
-static char *jrg_diagnostics_stats(Object *obj, Error **errp)
+static char *dg_diagnostics_stats(Object *obj, Error **errp)
 {
-    JukeRetroGPU *s = JUKE_RETRO_GPU(obj);
-    const JrgDiagnostics *d = s->diagnostics;
+    DreamGpu *s = DREAMGPU(obj);
+    const DgDiagnostics *d = s->diagnostics;
     GString *out = g_string_new(NULL);
     bool comma = false;
     g_string_append_printf(out, "{\"schema\":1,\"enabled\":%s,\"elapsed_us\":%" PRIu64 ",\"mmio\":[",
@@ -1142,7 +1142,7 @@ static char *jrg_diagnostics_stats(Object *obj, Error **errp)
     g_string_append(out, "],\"queries\":[");
     if (d) {
         for (unsigned i = 0; i < d->query_count; i++) {
-            const JrgDiagnosticQuery *q = &d->queries[i];
+            const DgDiagnosticQuery *q = &d->queries[i];
             g_string_append_printf(out, "%s{\"function\":%u,\"arg0\":%u,\"arg1\":%u,\"count\":%" PRIu64 "}",
                 i ? "," : "", q->function, q->arg0, q->arg1, q->count);
         }
@@ -1152,48 +1152,48 @@ static char *jrg_diagnostics_stats(Object *obj, Error **errp)
     return g_string_free(out, false);
 }
 
-static void jrg_instance_init(Object *obj)
+static void dg_instance_init(Object *obj)
 {
-    object_property_add_bool(obj, "diagnostic-counters", jrg_diagnostics_get, jrg_diagnostics_set);
-    object_property_add_str(obj, "diagnostic-stats", jrg_diagnostics_stats, NULL);
+    object_property_add_bool(obj, "diagnostic-counters", dg_diagnostics_get, dg_diagnostics_set);
+    object_property_add_str(obj, "diagnostic-stats", dg_diagnostics_stats, NULL);
 }
 
-static const Property jrg_properties[] = {
-    DEFINE_PROP_UINT32("vgamem_mb", JukeRetroGPU, vga.vram_size_mb, 16),
-    DEFINE_PROP_STRING("gpu-socket", JukeRetroGPU, gpu_socket),
+static const Property dg_properties[] = {
+    DEFINE_PROP_UINT32("vgamem_mb", DreamGpu, vga.vram_size_mb, 16),
+    DEFINE_PROP_STRING("gpu-socket", DreamGpu, gpu_socket),
 };
 
-static void jrg_class_init(ObjectClass *klass, const void *data)
+static void dg_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
     AcpiDevAmlIfClass *ac = ACPI_DEV_AML_IF_CLASS(klass);
 
-    pc->realize = jrg_realize;
-    pc->vendor_id = JRG_PCI_VENDOR_ID;
-    pc->device_id = JRG_PCI_DEVICE_ID;
+    pc->realize = dg_realize;
+    pc->vendor_id = DG_PCI_VENDOR_ID;
+    pc->device_id = DG_PCI_DEVICE_ID;
     pc->revision = 1;
     pc->class_id = PCI_CLASS_DISPLAY_VGA;
     pc->romfile = "vgabios-stdvga.bin";
-    dc->desc = "Juke VGA/VBE display with native 2D acceleration";
+    dc->desc = "DreamGPU VGA/VBE display with native 2D acceleration";
     dc->hotpluggable = false;
-    dc->vmsd = &vmstate_jrg;
-    device_class_set_props(dc, jrg_properties);
-    device_class_set_legacy_reset(dc, jrg_reset);
+    dc->vmsd = &vmstate_dg;
+    device_class_set_props(dc, dg_properties);
+    device_class_set_legacy_reset(dc, dg_reset);
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     ac->build_dev_aml = build_vga_aml;
 }
 
-static void jrg_finalize(Object *obj)
+static void dg_finalize(Object *obj)
 {
-    JukeRetroGPU *s = JUKE_RETRO_GPU(obj);
+    DreamGpu *s = DREAMGPU(obj);
 
-#ifdef CONFIG_JUKE_RETRO_GL
+#ifdef CONFIG_DREAMGPU_GL
     if (s->gl_bh) {
         qemu_bh_cancel(s->gl_bh);
     }
     s->gl_transfer_active = false;
-    jrg_gl_engine_free(s->gl);
+    dg_gl_engine_free(s->gl);
     if (s->gl_bh) {
         qemu_bh_delete(s->gl_bh);
     }
@@ -1205,13 +1205,13 @@ static void jrg_finalize(Object *obj)
     g_free(s->diagnostics);
 }
 
-static const TypeInfo jrg_info = {
-    .name = TYPE_JUKE_RETRO_GPU,
+static const TypeInfo dg_info = {
+    .name = TYPE_DREAMGPU,
     .parent = TYPE_PCI_DEVICE,
-    .instance_size = sizeof(JukeRetroGPU),
-    .instance_init = jrg_instance_init,
-    .instance_finalize = jrg_finalize,
-    .class_init = jrg_class_init,
+    .instance_size = sizeof(DreamGpu),
+    .instance_init = dg_instance_init,
+    .instance_finalize = dg_finalize,
+    .class_init = dg_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { TYPE_ACPI_DEV_AML_IF },
@@ -1219,8 +1219,8 @@ static const TypeInfo jrg_info = {
     },
 };
 
-static void jrg_register_types(void)
+static void dg_register_types(void)
 {
-    type_register_static(&jrg_info);
+    type_register_static(&dg_info);
 }
-type_init(jrg_register_types)
+type_init(dg_register_types)

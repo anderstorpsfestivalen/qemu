@@ -51,7 +51,7 @@ qtests_filter = \
   (get_option('default_devices') and host_os != 'windows' ? ['test-filter-redirector'] : [])
 
 qtests_i386 = \
-  (config_all_devices.has_key('CONFIG_JUKE_RETRO_GPU') ? ['juke-retro-gpu-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_DREAMGPU') ? ['dreamgpu-test'] : []) + \
   (slirp.found() ? ['pxe-test'] : []) + \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_ACPI_VMGENID') ? ['vmgenid-test'] : []) +             \
