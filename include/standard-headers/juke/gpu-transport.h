@@ -11,7 +11,7 @@
  * attaching an IOSurface send right. Other records always use the Unix socket.
  */
 #define JGPU_MAGIC                  0x4a475055
-#define JGPU_VERSION                1
+#define JGPU_VERSION                2
 #define JGPU_PACKET_BYTES           128
 #define JGPU_MAX_EXPORT_SLOTS       96
 #define JGPU_MAX_DRAWABLES          32
@@ -128,7 +128,10 @@
  * desktopEpoch56/sequence64, allocationBytes72, readbackToken88. Success has
  * one immutable packed BGRA fd; errors have no fd. The sender can close its
  * descriptor after sendmsg; QEMU owns its received copy until DMA completes.
- * DISCARD releases a retained resource without painting and advances ordering.
+ * Version 2 DISCARD uses desktopEpoch=sequence=0 and releases the exact
+ * retained resource in FIFO order without painting, requiring a desktop seed,
+ * or changing CPU authority. Its image identity remains mandatory.
+ * Sequenced DISCARD records retain their ordinary desktop barrier semantics.
  */
 
 #endif

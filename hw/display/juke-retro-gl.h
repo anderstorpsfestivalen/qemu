@@ -23,6 +23,7 @@ typedef struct JrgGLCompletion {
     JrgGLFrameRef present;
     uint32_t result_bytes, result_type;
     uint8_t result[JRG_GL_MAX_RESULT_BYTES];
+    uint8_t *bulk_result; /* Lazy bounded allocation; ownership follows completion. */
 } JrgGLCompletion;
 
 uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
@@ -39,8 +40,6 @@ void jrg_gl_engine_reset(JrgGLEngine *engine, uint32_t generation,
                           uint64_t cpu_epoch, uint64_t cpu_generation);
 bool jrg_gl_engine_completion(JrgGLEngine *engine, JrgGLCompletion *completion);
 uint32_t jrg_gl_function_words(uint32_t function);
-uint32_t jrg_gl_query_validate(uint32_t function, const uint8_t *args);
-uint32_t jrg_gl_query_result_bytes(uint32_t function, const uint8_t *args);
 bool jrg_gl_engine_transfer(JrgGLEngine *engine, JrgGLTransfer *transfer);
 void jrg_gl_engine_transfer_done(JrgGLEngine *engine, uint32_t error,
                                  uint64_t cpu_epoch, uint64_t cpu_generation);

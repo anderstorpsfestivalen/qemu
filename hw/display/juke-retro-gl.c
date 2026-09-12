@@ -66,6 +66,13 @@ typedef struct JrgCpuSlot {
     uint64_t epoch, sequence;
 } JrgCpuSlot;
 
+static void completion_free(void *opaque)
+{
+    JrgGLCompletion *done = opaque;
+    g_free(done->bulk_result);
+    g_free(done);
+}
+
 typedef struct JrgBatch {
     uint8_t *data;
     size_t bytes;
@@ -75,6 +82,7 @@ typedef struct JrgBatch {
     uint32_t primary_width, primary_height;
     uint32_t result_bytes, result_type;
     uint8_t result[JRG_GL_MAX_RESULT_BYTES];
+    uint8_t *bulk_result; /* Lazy bounded allocation; ownership follows completion. */
 } JrgBatch;
 
 struct JrgGLEngine {
@@ -197,6 +205,28 @@ static uint32_t validate_desktop(const uint8_t *r, uint32_t primary_width,
     return *work > JRG_DESKTOP_MAX_BYTES ? JRG_GL_ERROR_LIMIT : 0;
 }
 
+/* Failure-only diagnostics carry bounded numeric command headers, never payloads. */
+static void trace_rejection(const uint8_t *r, uint32_t size, uint32_t sequence,
+                            bool execution, uint32_t error)
+{
+    uint32_t op = word(r, JRG_GL_OFF_OP);
+    uint32_t args = op == JRG_GL_DATA_CALL ? JRG_GL_DATA_ARGS : 36;
+    char tail[96];
+    /* QEMU trace events allow at most ten arguments. Keep the original fields
+     * and format only bounded numeric tail words, only on rejected records. */
+    snprintf(tail, sizeof(tail), "a4=0x%x a5=0x%x a6=0x%x a7=0x%x",
+        size >= args + 20 ? word(r, args + 16) : 0,
+        size >= args + 24 ? word(r, args + 20) : 0,
+        size >= args + 28 ? word(r, args + 24) : 0,
+        size >= args + 32 ? word(r, args + 28) : 0);
+    trace_juke_retro_gl_reject(sequence, execution, op,
+        size >= 36 ? word(r, 32) : 0,
+        size >= args + 4 ? word(r, args) : 0,
+        size >= args + 8 ? word(r, args + 4) : 0,
+        size >= args + 12 ? word(r, args + 8) : 0,
+        size >= args + 16 ? word(r, args + 12) : 0, error, tail);
+}
+
 uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                          uint32_t primary_width, uint32_t primary_height,
                          uint32_t vram_size, uint32_t *records)
@@ -251,6 +281,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
             }
             uint32_t words = jrg_gl_function_words(word(r, expected));
             if (words == UINT32_MAX || (words & JRG_GL_FUNCTION_KIND_MASK)) {
+                trace_rejection(r, size, 0, false, JRG_GL_ERROR_UNSUPPORTED);
                 return JRG_GL_ERROR_UNSUPPORTED;
             }
             expected += 4 + words * 4;
@@ -265,6 +296,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
             if (count == UINT32_MAX ||
                 (count & JRG_GL_FUNCTION_KIND_MASK) !=
                 JRG_GL_FUNCTION_INLINE_DATA) {
+                trace_rejection(r, size, 0, false, JRG_GL_ERROR_UNSUPPORTED);
                 return JRG_GL_ERROR_UNSUPPORTED;
             }
             count &= ~JRG_GL_FUNCTION_INLINE_DATA;
@@ -278,6 +310,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                                                   count * 4,
                                                   bytes);
             if (error) {
+                trace_rejection(r, size, 0, false, error);
                 return error;
             }
             for (unsigned i = bytes; i < QEMU_ALIGN_UP(bytes, 4); i++) {
@@ -294,6 +327,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
             }
             uint32_t query_error = jrg_gl_query_validate(word(r, 32), r + 36);
             if (query_error) {
+                trace_rejection(r, size, 0, false, query_error);
                 return query_error;
             }
             expected = JRG_GL_QUERY_BYTES;
@@ -307,6 +341,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                                              primary_width, primary_height,
                                              vram_size, &desktop_work);
             if (error) {
+                trace_rejection(r, size, 0, false, error);
                 return error;
             }
             break;
@@ -337,6 +372,7 @@ uint32_t jrg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
         if (op == JRG_GL_CALL) {
             uint32_t error = jrg_gl_call_validate(word(r, 32), r + 36);
             if (error) {
+                trace_rejection(r, size, 0, false, error);
                 return error;
             }
         }
@@ -1163,6 +1199,8 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
     uint32_t wire_op = 0, error = 0;
     uint8_t packet[JGPU_PACKET_BYTES];
 
+    bool detached = op == JRG_DESKTOP_DISCARD;
+
     if (op == JRG_DESKTOP_SEED) {
         if (e->desktop_active) {
             return JRG_GL_ERROR_DESKTOP;
@@ -1171,12 +1209,16 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
         e->desktop_sequence = 0;
         e->desktop_width = batch->primary_width;
         e->desktop_height = batch->primary_height;
-    } else if (!e->desktop_active ||
+    } else if (!detached && (!e->desktop_active ||
                batch->primary_width != e->desktop_width ||
-               batch->primary_height != e->desktop_height) {
+               batch->primary_height != e->desktop_height)) {
         return JRG_GL_ERROR_DESKTOP;
     }
-    ++e->desktop_sequence;
+    /* Releasing an occluded retained image does not acquire or mutate the
+     * desktop. Keep it ordered in the output FIFO, outside desktop epochs. */
+    if (!detached) {
+        ++e->desktop_sequence;
+    }
     switch (op) {
     case JRG_DESKTOP_SEED:
     case JRG_DESKTOP_PATCH:
@@ -1235,7 +1277,9 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
         }
         qemu_mutex_unlock(&e->lock);
         if (!valid) {
-            --e->desktop_sequence;
+            if (!detached) {
+                --e->desktop_sequence;
+            }
             return JRG_GL_ERROR_DESKTOP;
         }
         wire_op = op == JRG_DESKTOP_BLIT ? JGPU_DESKTOP_BLIT :
@@ -1249,8 +1293,8 @@ static uint32_t execute_desktop(JrgGLEngine *e, const uint8_t *record,
     stl_le_p(packet + JGPU_DESKTOP_OFF_DST_Y, word(r, JRG_DESKTOP_DST_Y));
     stl_le_p(packet + JGPU_DESKTOP_OFF_WIDTH, w);
     stl_le_p(packet + JGPU_DESKTOP_OFF_HEIGHT, h);
-    stq_le_p(packet + JGPU_OFF_EPOCH, e->desktop_epoch);
-    stq_le_p(packet + JGPU_OFF_GENERATION, e->desktop_sequence);
+    stq_le_p(packet + JGPU_OFF_EPOCH, detached ? 0 : e->desktop_epoch);
+    stq_le_p(packet + JGPU_OFF_GENERATION, detached ? 0 : e->desktop_sequence);
     if (op == JRG_DESKTOP_FILL) {
         stl_le_p(packet + JGPU_DESKTOP_OFF_COLOR, word(r, JRG_DESKTOP_SRC_X));
     } else if (op == JRG_DESKTOP_COPY || op == JRG_DESKTOP_BLIT ||
@@ -1462,9 +1506,15 @@ static uint32_t execute_record(JrgGLEngine *e, const uint8_t *r,
                                     word(r, JRG_GL_DATA_BYTES));
         }
         if (op == JRG_GL_QUERY) {
+            uint32_t required = jrg_gl_query_result_bytes(word(r, 32), r + 36);
+            if (required > JRG_GL_MAX_READBACK_BYTES) return JRG_GL_ERROR_LIMIT;
+            if (required > sizeof(batch->result)) {
+                batch->bulk_result = g_try_malloc(required);
+                if (!batch->bulk_result) return JRG_GL_ERROR_LIMIT;
+            }
             return jrg_gl_query(c->native, word(r, 32), r + 36,
-                                batch->result, &batch->result_bytes,
-                                &batch->result_type);
+                                batch->bulk_result ? batch->bulk_result : batch->result,
+                                &batch->result_bytes, &batch->result_type);
         }
         if ((word(r, JRG_GL_OFF_FLAGS) & JRG_GL_PRESENT_EXCLUSIVE) &&
             (d->width != batch->primary_width ||
@@ -1564,6 +1614,11 @@ static void *render_worker(void *opaque)
             }
             err = NULL;
             result = execute_record(e, batch->data + offset, batch, &err);
+            if (result) {
+                trace_rejection(batch->data + offset,
+                    word(batch->data + offset, JRG_GL_OFF_SIZE),
+                    batch->sequence, true, result);
+            }
             if (err) {
                 error_report_err(err);
             }
@@ -1586,7 +1641,12 @@ static void *render_worker(void *opaque)
         if (!result) {
             done->result_bytes = batch->result_bytes;
             done->result_type = batch->result_type;
-            memcpy(done->result, batch->result, batch->result_bytes);
+            if (batch->bulk_result) {
+                done->bulk_result = batch->bulk_result;
+                batch->bulk_result = NULL;
+            } else {
+                memcpy(done->result, batch->result, batch->result_bytes);
+            }
         }
         for (unsigned i = 0; i < G_N_ELEMENTS(e->contexts); i++) {
             done->resources_live |= e->contexts[i].native != NULL;
@@ -1594,11 +1654,12 @@ static void *render_worker(void *opaque)
         for (unsigned i = 0; i < G_N_ELEMENTS(e->drawables); i++) {
             done->resources_live |= e->drawables[i].native != NULL;
         }
+        g_free(batch->bulk_result);
         g_free(batch->data);
         g_free(batch);
         qemu_mutex_lock(&e->lock);
         if (g_queue_get_length(&e->completions) == 16) {
-            g_free(g_queue_pop_head(&e->completions));
+            completion_free(g_queue_pop_head(&e->completions));
         }
         g_queue_push_tail(&e->completions, done);
         qemu_mutex_unlock(&e->lock);
@@ -1656,7 +1717,7 @@ void jrg_gl_engine_free(JrgGLEngine *e)
         g_free(e->batch->data);
         g_free(e->batch);
     }
-    g_queue_clear_full(&e->completions, g_free);
+    g_queue_clear_full(&e->completions, completion_free);
 #ifdef CONFIG_DARWIN
     if (e->remote) {
         mach_port_deallocate(mach_task_self(), e->remote);

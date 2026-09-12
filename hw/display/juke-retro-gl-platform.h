@@ -44,4 +44,7 @@ uint32_t jrg_gl_image_port(JrgGLImage *image);
 int jrg_gl_image_fd(JrgGLImage *image);
 int jrg_gl_image_fence_fd(JrgGLImage *image);
 
+uint32_t jrg_gl_query_validate(uint32_t function, const uint8_t *args);
+uint32_t jrg_gl_query_result_bytes(uint32_t function, const uint8_t *args);
+
 #endif
