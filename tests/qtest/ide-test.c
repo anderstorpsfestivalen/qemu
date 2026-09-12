@@ -1076,11 +1076,16 @@ static void ide_wait_intr(QTestState *qts, int irq)
 #define CDROM_PIO 0
 #define CDROM_DMA (1 << 0)
 #define CDROM_RAW (1 << 1)
+#define CDROM_CUE (1 << 2)
+#define CDROM_CUE_2048 (1 << 3)
 
 static void cdrom_read_impl(int nblocks, unsigned flags)
 {
     bool dma = flags & CDROM_DMA;
     bool raw = flags & CDROM_RAW;
+    bool cue = flags & CDROM_CUE;
+    bool cue_2048 = flags & CDROM_CUE_2048;
+    g_autofree char *cue_path = g_strconcat(tmp_path[0], ".cue", NULL);
     QTestState *qts;
     QPCIDevice *dev;
     QPCIBar bmdma_bar, ide_bar;
@@ -1101,13 +1106,31 @@ static void cdrom_read_impl(int nblocks, unsigned flags)
     /* Prepopulate the CDROM with an interesting pattern */
     generate_pattern(pattern, patt_len, ATAPI_BLOCK_SIZE);
     fh = fopen(tmp_path[0], "wb+");
-    ret = fwrite(pattern, ATAPI_BLOCK_SIZE, patt_blocks, fh);
-    g_assert_cmpint(ret, ==, patt_blocks);
+    if (cue && !cue_2048) {
+        uint8_t sector[2352] = { 0 };
+        memset(sector + 1, 0xff, 10);
+        sector[15] = 1;
+        memset(sector + 2064, 0x93, 288);
+        for (i = 0; i < patt_blocks; i++) {
+            memcpy(sector + 16, pattern + i * 2048, 2048);
+            g_assert_cmpint(fwrite(sector, 1, sizeof(sector), fh), ==, 2352);
+        }
+    } else {
+        ret = fwrite(pattern, ATAPI_BLOCK_SIZE, patt_blocks, fh);
+        g_assert_cmpint(ret, ==, patt_blocks);
+    }
     fclose(fh);
+    if (cue) {
+        g_autofree char *contents = g_strdup_printf(
+            "FILE \"%s\" BINARY\nTRACK 01 MODE1/%u\nINDEX 01 00:00:00\n",
+            tmp_path[0], cue_2048 ? 2048 : 2352);
+        g_assert_true(g_file_set_contents(cue_path, contents, -1, NULL));
+    }
 
     qts = ide_test_start(
-            "-drive if=none,file=%s,media=cdrom,format=raw,id=sr0,index=0 "
-            "-device ide-cd,drive=sr0,bus=ide.0", tmp_path[0]);
+            "-drive if=none,file=%s,media=cdrom,format=%s,id=sr0,index=0 "
+            "-device ide-cd,drive=sr0,bus=ide.0", cue ? cue_path : tmp_path[0],
+            cue ? "cue" : "raw");
     dev = get_pci_device(qts, &bmdma_bar, &ide_bar);
     qtest_irq_intercept_in(qts, "ioapic");
 
@@ -1183,6 +1206,12 @@ static void cdrom_read_impl(int nblocks, unsigned flags)
 
             g_assert_cmpint(memcmp(sec, pattern + i * ATAPI_BLOCK_SIZE,
                                    ATAPI_BLOCK_SIZE), ==, 0);
+            if (cue && !cue_2048) {
+                /* Raw BIN EDC/ECC bytes must survive; do not synthesize ISO. */
+                for (j = 2048; j < 2336; j++) {
+                    g_assert_cmphex(sec[j], ==, 0x93);
+                }
+            }
         }
     } else {
         g_assert_cmpint(memcmp(pattern, rx, rxsize), ==, 0);
@@ -1192,6 +1221,391 @@ static void cdrom_read_impl(int nblocks, unsigned flags)
     g_free(rx);
     test_bmdma_teardown(qts);
     free_pci_device(dev);
+    unlink(cue_path);
+}
+
+static void test_cdrom_cue_pio(void)
+{
+    cdrom_read_impl(16, CDROM_CUE);
+}
+
+static void test_cdrom_cue_dma(void)
+{
+    cdrom_read_impl(16, CDROM_CUE | CDROM_DMA);
+}
+
+static void test_cdrom_cue_pio_raw(void)
+{
+    cdrom_read_impl(16, CDROM_CUE | CDROM_RAW);
+}
+
+static void test_cdrom_cue_dma_raw(void)
+{
+    cdrom_read_impl(16, CDROM_CUE | CDROM_DMA | CDROM_RAW);
+}
+
+static void test_cdrom_cue_2048(void)
+{
+    cdrom_read_impl(16, CDROM_CUE | CDROM_CUE_2048 | CDROM_PIO);
+    cdrom_read_impl(16, CDROM_CUE | CDROM_CUE_2048 | CDROM_DMA | CDROM_RAW);
+}
+
+static int cdrom_packet(QTestState *qts, QPCIDevice *dev, QPCIBar bar,
+                         const uint8_t packet[12], uint8_t *out, unsigned capacity)
+{
+    unsigned done = 0;
+    qpci_io_writeb(dev, bar, reg_device, 0);
+    qpci_io_writeb(dev, bar, reg_feature, 0);
+    qpci_io_writeb(dev, bar, reg_lba_middle, 0);
+    qpci_io_writeb(dev, bar, reg_lba_high, 4);
+    qpci_io_writeb(dev, bar, reg_command, CMD_PACKET);
+    assert_bit_set(ide_wait_clear(qts, BSY), DRQ);
+    for (unsigned i = 0; i < 12; i += 2) {
+        qpci_io_writew(dev, bar, reg_data, lduw_le_p(packet + i));
+    }
+    for (;;) {
+        uint8_t status = ide_wait_clear(qts, BSY);
+        if (status & ERR) {
+            return -1;
+        }
+        if (!(status & DRQ)) {
+            return done;
+        }
+        unsigned n = qpci_io_readb(dev, bar, reg_lba_middle) |
+                     qpci_io_readb(dev, bar, reg_lba_high) << 8;
+        g_assert_cmpuint(n, >, 0);
+        g_assert_cmpuint(n, <=, capacity - done);
+        for (unsigned i = 0; i < n; i += 2) {
+            uint16_t value = qpci_io_readw(dev, bar, reg_data);
+            out[done++] = value;
+            if (i + 1 < n) {
+                out[done++] = value >> 8;
+            }
+        }
+    }
+}
+
+static int cdrom_set_audio_page(QTestState *qts, QPCIDevice *dev, QPCIBar bar,
+                                uint8_t left, uint8_t right)
+{
+    uint8_t packet[12] = { 0x55, 0x10, 0, 0, 0, 0, 0, 0, 24 };
+    uint8_t page[24] = { 0 };
+    page[8] = 0x0e; page[9] = 14; page[10] = 4;
+    page[16] = 1; page[17] = left; page[18] = 2; page[19] = right;
+    qpci_io_writeb(dev, bar, reg_device, 0);
+    qpci_io_writeb(dev, bar, reg_feature, 0);
+    qpci_io_writeb(dev, bar, reg_lba_middle, 24);
+    qpci_io_writeb(dev, bar, reg_lba_high, 0);
+    qpci_io_writeb(dev, bar, reg_command, CMD_PACKET);
+    assert_bit_set(ide_wait_clear(qts, BSY), DRQ);
+    for (unsigned i = 0; i < sizeof(packet); i += 2) {
+        qpci_io_writew(dev, bar, reg_data, lduw_le_p(packet + i));
+    }
+    assert_bit_set(ide_wait_clear(qts, BSY), DRQ);
+    g_assert_cmpint(qpci_io_readb(dev, bar, reg_nsectors) & 3, ==, 0);
+    for (unsigned i = 0; i < sizeof(page); i += 2) {
+        qpci_io_writew(dev, bar, reg_data, lduw_le_p(page + i));
+    }
+    return ide_wait_clear(qts, BSY) & ERR ? -1 : 0;
+}
+
+static void test_cdrom_cue_audio(void)
+{
+    bool snapshot = have_qemu_img();
+    g_autofree char *state = g_strconcat(tmp_path[0], ".qcow2", NULL);
+    g_autofree char *state_args = snapshot ?
+        g_strdup_printf("-drive file=%s,format=qcow2,if=ide,index=1", state) :
+        g_strdup("");
+    g_autofree char *cue = g_strconcat(tmp_path[0], ".cue", NULL);
+    g_autofree char *contents = g_strdup_printf(
+        "FILE \"%s\" BINARY\nTRACK 01 MODE1/2352\nINDEX 01 00:00:00\n"
+        "TRACK 02 AUDIO\nINDEX 01 00:00:01\n", tmp_path[0]);
+    g_autofree uint8_t *bin = g_malloc0(65 * 2352);
+    QPCIBar bm, bar;
+    QTestState *qts;
+    QPCIDevice *dev;
+    uint8_t out[128], packet[12] = { 0x4b, 0, 0, 0, 0, 0, 0, 0, 1 };
+    uint8_t sub[12] = { 0x42, 0, 0x40, 1, 0, 0, 0, 0, 16 };
+    uint8_t play[12] = { 0x45, 0, 0, 0, 0, 1, 0, 0, 64 };
+    uint8_t page[12] = { 0x5a, 0, 0x0e, 0, 0, 0, 0, 0, 24 };
+    bin[15] = 1;
+    g_assert_true(g_file_set_contents(tmp_path[0], (char *)bin, 65 * 2352, NULL));
+    g_assert_true(g_file_set_contents(cue, contents, -1, NULL));
+    if (snapshot) {
+        g_assert_true(mkimg(state, "qcow2", 1));
+    }
+    qts = ide_test_start("-audiodev none,id=cdsound "
+        "-global ide-cd.audiodev=cdsound -drive if=ide,index=0,media=cdrom,"
+        "file=%s,format=cue,readonly=on %s", cue, state_args);
+    dev = get_pci_device(qts, &bm, &bar);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, sizeof(out)), ==, -1);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, page, out, sizeof(out)), ==, 24);
+    g_assert_cmpint(out[10], ==, 4);
+    g_assert_cmpint(out[17], ==, 255);
+    g_assert_cmpint(cdrom_set_audio_page(qts, dev, bar, 0, 128), ==, 0);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, page, out, sizeof(out)), ==, 24);
+    g_assert_cmpint(out[17], ==, 0);
+    g_assert_cmpint(out[19], ==, 128);
+    play[5] = 0; /* A data track cannot become speaker noise. */
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, play, out, sizeof(out)), ==, -1);
+    play[5] = 1;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, play, out, sizeof(out)), ==, 0);
+    packet[8] = 0;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, sizeof(out)), ==, 0);
+    qtest_clock_step(qts, 100000000);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+    g_assert_cmpint(out[1], ==, 0x12);
+    g_assert_cmpuint(ldl_be_p(out + 8), ==, 1);
+    if (snapshot) {
+        g_autofree char *reply = qtest_hmp(qts, "savevm cd-paused");
+        g_assert_cmpstr(reply, ==, "");
+    }
+    packet[8] = 1;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, sizeof(out)), ==, 0);
+    for (unsigned i = 0; i < 200; i++) {
+        qtest_clock_step(qts, 10000000);
+        g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+        if (out[1] == 0x13) {
+            break;
+        }
+    }
+    g_assert_cmpint(out[1], ==, 0x13);
+    g_assert_cmpuint(ldl_be_p(out + 8), ==, 65);
+    if (snapshot) {
+        g_autofree char *reply = qtest_hmp(qts, "loadvm cd-paused");
+        g_assert_cmpstr(reply, ==, "");
+        qtest_clock_step(qts, 100000000);
+        g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+        g_assert_cmpint(out[1], ==, 0x12);
+        g_assert_cmpuint(ldl_be_p(out + 8), ==, 1);
+        g_assert_cmpint(cdrom_packet(qts, dev, bar, page, out, sizeof(out)), ==, 24);
+        g_assert_cmpint(out[17], ==, 0);
+        g_assert_cmpint(out[19], ==, 128);
+        packet[8] = 1;
+        g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, sizeof(out)), ==, 0);
+        for (unsigned i = 0; i < 200; i++) {
+            qtest_clock_step(qts, 10000000);
+            g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+            if (out[1] == 0x13) {
+                break;
+            }
+        }
+        g_assert_cmpint(out[1], ==, 0x13);
+        g_assert_cmpuint(ldl_be_p(out + 8), ==, 65);
+    }
+    memset(play, 0, sizeof(play));
+    play[0] = 0x47; play[4] = 2; play[5] = 1; play[7] = 2; play[8] = 65;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, play, out, sizeof(out)), ==, 0);
+    /* Reset cancels any outstanding prefetch before its storage is reused. */
+    qtest_outb(qts, IDE_BASE2, IDE_CTRL_RESET);
+    qtest_outb(qts, IDE_BASE2, 0);
+    qtest_clock_step(qts, 100000000);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+    g_assert_cmpint(out[1], ==, 0x15);
+    g_assert_cmpuint(ldl_be_p(out + 8), ==, 0);
+    free_pci_device(dev);
+    ide_test_quit(qts);
+    unlink(cue);
+    if (snapshot) {
+        unlink(state);
+    }
+}
+
+static void cdrom_cue_audio_pcm(bool mute_left, bool mixing)
+{
+    g_autofree char *cue = g_strconcat(tmp_path[0], ".cue", NULL);
+    g_autofree char *wav = g_strconcat(tmp_path[0], ".wav", NULL);
+    g_autofree char *contents = g_strdup_printf(
+        "FILE \"%s\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n", tmp_path[0]);
+    g_autofree uint8_t *bin = g_malloc(32 * 2352);
+    g_autofree char *pcm = NULL;
+    gsize length;
+    QPCIBar bm, bar;
+    QTestState *qts;
+    QPCIDevice *dev;
+    uint8_t out[16], play[12] = { 0x45, 0, 0, 0, 0, 0, 0, 0, 32 };
+    uint8_t sub[12] = { 0x42, 0, 0x40, 1, 0, 0, 0, 0, 16 };
+    for (unsigned i = 0; i < 32 * 2352; i += 4) {
+        stw_le_p(bin + i, 1234);
+        stw_le_p(bin + i + 2, (uint16_t)-2345);
+    }
+    g_assert_true(g_file_set_contents(tmp_path[0], (char *)bin, 32 * 2352, NULL));
+    g_assert_true(g_file_set_contents(cue, contents, -1, NULL));
+    qts = ide_test_start("-audiodev wav,id=cdsound,path=%s,"
+        "%s "
+        "-global ide-cd.audiodev=cdsound -drive if=ide,index=0,media=cdrom,"
+        "file=%s,format=cue,readonly=on", wav,
+        mixing ? "out.frequency=44100,out.channels=2,out.format=s16" :
+                 "out.mixing-engine=off", cue);
+    dev = get_pci_device(qts, &bm, &bar);
+    if (mute_left) {
+        g_assert_cmpint(cdrom_set_audio_page(qts, dev, bar, 0, 255), ==, 0);
+    }
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, play, out, sizeof(out)), ==, 0);
+    for (unsigned i = 0; i < 100; i++) {
+        qtest_clock_step(qts, 10000000);
+        g_assert_cmpint(cdrom_packet(qts, dev, bar, sub, out, sizeof(out)), ==, 16);
+    }
+    g_assert_cmpint(out[1], ==, 0x13);
+    free_pci_device(dev);
+    ide_test_quit(qts);
+    g_assert_true(g_file_get_contents(wav, &pcm, &length, NULL));
+    g_assert_cmpuint(length, >=, 44 + 32 * 2352);
+    unsigned audible = 0;
+    for (unsigned i = 44; i + 4 <= length; i += 4) {
+        int16_t left = lduw_le_p(pcm + i), right = lduw_le_p(pcm + i + 2);
+        if (left || right) {
+            g_assert_cmpint(left, ==, mute_left ? 0 : 1234);
+            g_assert_cmpint(right, ==, -2345);
+            audible++;
+        }
+    }
+    g_assert_cmpuint(audible, ==, 32 * 588);
+    unlink(wav);
+    unlink(cue);
+}
+
+static void test_cdrom_cue_audio_pcm(void)
+{
+    cdrom_cue_audio_pcm(false, true);
+}
+
+static void test_cdrom_cue_audio_pcm_mute(void)
+{
+    cdrom_cue_audio_pcm(true, true);
+}
+
+static void test_cdrom_cue_audio_pcm_direct(void)
+{
+    cdrom_cue_audio_pcm(false, false);
+}
+
+static void test_cdrom_cue_toc(void)
+{
+    g_autofree char *cue = g_strconcat(tmp_path[0], ".cue", NULL);
+    g_autofree char *contents = g_strdup_printf(
+        "FILE \"%s\" BINARY\r\nTRACK 01 MODE1/2352\r\n"
+        "INDEX 01 00:00:00\r\nTRACK 02 AUDIO\r\nPREGAP 00:00:03\r\n"
+        "INDEX 01 00:00:40\r\nTRACK 03 AUDIO\r\n"
+        "INDEX 00 00:00:48\r\nINDEX 01 00:00:50\r\n", tmp_path[0]);
+    g_autofree uint8_t *bin = g_malloc(60 * 2352);
+    g_autofree uint8_t *out = g_malloc(16 * 2352);
+    QPCIBar bm, bar;
+    QTestState *qts;
+    QPCIDevice *dev;
+    uint8_t packet[12] = { 0x43, 0, 0, 0, 0, 0, 0, 0, 128 };
+
+    for (unsigned i = 0; i < 60; i++) {
+        memset(bin + i * 2352, i + 1, 2352);
+        if (i < 40) {
+            bin[i * 2352 + 15] = 1;
+        }
+    }
+    g_assert_true(g_file_set_contents(tmp_path[0], (char *)bin, 60 * 2352, NULL));
+    g_assert_true(g_file_set_contents(cue, contents, -1, NULL));
+    qts = ide_test_start("-drive if=none,id=disc,file=%s,format=cue,readonly=on "
+                         "-device ide-cd,drive=disc,bus=ide.0", cue);
+    dev = get_pci_device(qts, &bm, &bar);
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 128), ==, 36);
+    g_assert_cmpint(lduw_be_p(out), ==, 34);
+    g_assert_cmpint(out[2], ==, 1);
+    g_assert_cmpint(out[3], ==, 3);
+    for (unsigned i = 0; i < 4; i++) {
+        const uint32_t starts[] = { 0, 43, 53, 63 };
+        g_assert_cmpint(out[5 + i * 8], ==, i ? 0x10 : 0x14);
+        g_assert_cmpint(out[6 + i * 8], ==, i == 3 ? 0xaa : i + 1);
+        g_assert_cmpuint(ldl_be_p(out + 8 + i * 8), ==, starts[i]);
+    }
+    packet[1] = 2;
+    packet[6] = 2;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 128), ==, 28);
+    g_assert_cmpint(out[6], ==, 2);
+    g_assert_cmpint(out[9], ==, 0);
+    g_assert_cmpint(out[10], ==, 2);
+    g_assert_cmpint(out[11], ==, 43);
+    packet[6] = 4;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 128), ==, -1);
+    packet[6] = 0;
+    packet[2] = 2;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 128), ==, 70);
+    g_assert_cmpint(out[7], ==, 0xa0);
+    g_assert_cmpint(out[18], ==, 0xa1);
+    g_assert_cmpint(out[23], ==, 3);
+
+    /* Exact MCI open request observed from the unmodified Win98 driver. */
+    memset(packet, 0, sizeof(packet));
+    packet[0] = 0x42; packet[1] = 2; packet[2] = 0x40;
+    packet[3] = 1; packet[8] = 16;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 128), ==, 16);
+    g_assert_cmpint(out[1], ==, 0x15);
+    g_assert_cmpint(out[5], ==, 0x14);
+    g_assert_cmpint(out[6], ==, 1);
+    g_assert_cmpint(out[7], ==, 1);
+    g_assert_cmpint(out[10], ==, 2);
+    g_assert_cmpuint(ldl_be_p(out + 12), ==, 0);
+
+    /* Read across stored data, generated silence and original CDDA bytes. */
+    memset(packet, 0, sizeof(packet));
+    packet[0] = 0xbe; packet[5] = 39; packet[8] = 6; packet[9] = 0xf8;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 16 * 2352), ==,
+                    6 * 2352);
+    g_assert_cmpmem(out, 2352, bin + 39 * 2352, 2352);
+    for (unsigned i = 2352; i < 4 * 2352; i++) {
+        g_assert_cmpint(out[i], ==, 0);
+    }
+    g_assert_cmpmem(out + 4 * 2352, 2 * 2352, bin + 40 * 2352, 2 * 2352);
+    packet[1] = 4; packet[5] = 43; packet[8] = 3; packet[9] = 0x10;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 16 * 2352), ==,
+                    3 * 2352);
+    g_assert_cmpmem(out, 3 * 2352, bin + 40 * 2352, 3 * 2352);
+    packet[1] = 8;
+    g_assert_cmpint(cdrom_packet(qts, dev, bar, packet, out, 16 * 2352), ==, -1);
+    free_pci_device(dev);
+    ide_test_quit(qts);
+    unlink(cue);
+}
+
+/* Parsing must reject inconsistent descriptors before exposing any medium. */
+static void test_cdrom_cue_invalid(void)
+{
+    static const char *invalid[] = {
+        "TRACK 01 MODE1/2352\n", /* Missing INDEX. */
+        "TRACK 01 MODE1/2352\nINDEX 01 00:00:75\n",
+        "TRACK 02 MODE1/2352\nINDEX 01 00:00:00\n",
+        "TRACK 01 MODE2/2352\nINDEX 01 00:00:00\n",
+        "TRACK 01 MODE1/2352\nINDEX 01 00:00:00\n"
+        "TRACK 02 AUDIO\nINDEX 01 00:00:02\n", /* Past BIN end. */
+        "TRACK 01 MODE1/2352\nINDEX 01 00:00:00\n"
+        "TRACK 02 AUDIO\nINDEX 01 00:00:00\n", /* Empty track. */
+        "TRACK 01 MODE1/2352\nINDEX 01 00:00:00\n"
+        "TRACK 02 MODE1/2352\nPREGAP 00:02:00\nINDEX 01 00:00:01\n",
+        "FILE \"second.bin\" BINARY\n",
+    };
+    g_autofree char *cue = g_strconcat(tmp_path[0], ".cue", NULL);
+    uint8_t bin[2352 * 2] = { 0 };
+    QTestState *qts = ide_test_start("");
+
+    g_assert_true(g_file_set_contents(tmp_path[0], (char *)bin, sizeof(bin), NULL));
+    for (unsigned i = 0; i < ARRAY_SIZE(invalid) + 2; i++) {
+        g_autofree char *contents = g_strdup_printf("FILE \"%s\" BINARY\n%s",
+            tmp_path[0], i < ARRAY_SIZE(invalid) ? invalid[i] :
+            "TRACK 01 MODE1/2352\nINDEX 01 00:00:00\n");
+        size_t length = strlen(contents);
+        if (i == ARRAY_SIZE(invalid)) {
+            contents[length / 2] = 0; /* Embedded NUL cannot hide directives. */
+        } else if (i == ARRAY_SIZE(invalid) + 1) {
+            g_assert_true(g_file_set_contents(tmp_path[0], (char *)bin,
+                                              sizeof(bin) - 1, NULL));
+        }
+        g_assert_true(g_file_set_contents(cue, contents, length, NULL));
+        QDict *error = qtest_qmp_assert_failure_ref(qts,
+            "{'execute':'blockdev-add','arguments':{'driver':'cue',"
+            "'node-name':'bad','read-only':true,'file':{'driver':'file',"
+            "'filename':%s}}}", cue);
+        qobject_unref(error);
+    }
+    ide_test_quit(qts);
+    unlink(cue);
 }
 
 static void test_cdrom_pio(void)
@@ -1287,6 +1701,17 @@ int main(int argc, char **argv)
     qtest_add_func("/ide/cdrom/dma_large", test_cdrom_dma_large);
     qtest_add_func("/ide/cdrom/pio_raw", test_cdrom_pio_raw);
     qtest_add_func("/ide/cdrom/dma_raw", test_cdrom_dma_raw);
+    qtest_add_func("/ide/cdrom/cue/pio", test_cdrom_cue_pio);
+    qtest_add_func("/ide/cdrom/cue/dma", test_cdrom_cue_dma);
+    qtest_add_func("/ide/cdrom/cue/pio_raw", test_cdrom_cue_pio_raw);
+    qtest_add_func("/ide/cdrom/cue/dma_raw", test_cdrom_cue_dma_raw);
+    qtest_add_func("/ide/cdrom/cue/toc", test_cdrom_cue_toc);
+    qtest_add_func("/ide/cdrom/cue/mode1_2048", test_cdrom_cue_2048);
+    qtest_add_func("/ide/cdrom/cue/invalid", test_cdrom_cue_invalid);
+    qtest_add_func("/ide/cdrom/cue/audio", test_cdrom_cue_audio);
+    qtest_add_func("/ide/cdrom/cue/audio_pcm", test_cdrom_cue_audio_pcm);
+    qtest_add_func("/ide/cdrom/cue/audio_pcm_mute", test_cdrom_cue_audio_pcm_mute);
+    qtest_add_func("/ide/cdrom/cue/audio_pcm_direct", test_cdrom_cue_audio_pcm_direct);
 
     ret = g_test_run();
 

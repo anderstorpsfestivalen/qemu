@@ -23,10 +23,13 @@
 #include "system/dma.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/block/block.h"
+#include "block/cdrom-image.h"
 
 typedef struct IDEDevice IDEDevice;
 typedef struct IDEState IDEState;
 typedef struct IDEBus IDEBus;
+typedef struct AudioBackend AudioBackend;
+typedef struct IDECDAudio IDECDAudio;
 
 typedef void EndTransferFunc(IDEState *);
 
@@ -104,6 +107,16 @@ struct IDEState {
     int lba;
     int cd_sector_size;
     int atapi_dma; /* true if dma is requested for the packet cmd */
+    bool cdrom_raw_image;
+    CdromImageRead cdrom_raw_read;
+    uint32_t cdrom_position;
+    uint32_t cdrom_audio_end;
+    uint16_t cdrom_audio_offset;
+    uint8_t cdrom_audio_status;
+    uint8_t cdrom_audio_volume[2];
+    uint8_t cdrom_audio_channel[2];
+    AudioBackend *cdrom_audio_be;
+    IDECDAudio *cdrom_audio;
     BlockAcctCookie acct;
     BlockAIOCB *pio_aiocb;
     QEMUIOVector qiov;
@@ -151,6 +164,7 @@ struct IDEDevice {
     DeviceState qdev;
     uint32_t unit;
     BlockConf conf;
+    AudioBackend *audio_be;
     int chs_trans;
     char *version;
     char *serial;

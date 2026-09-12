@@ -207,8 +207,6 @@ void pci_std_vga_mmio_region_init(VGACommonState *s,
                                   MemoryRegion *subs,
                                   bool qext, bool edid)
 {
-    PCIVGAState *d = container_of(s, PCIVGAState, vga);
-
     memory_region_init_io(&subs[0], owner, &pci_vga_ioport_ops, s,
                           "vga ioports remapped", PCI_VGA_IOPORT_SIZE);
     memory_region_add_subregion(parent, PCI_VGA_IOPORT_OFFSET,
@@ -227,6 +225,8 @@ void pci_std_vga_mmio_region_init(VGACommonState *s,
     }
 
     if (edid) {
+        PCIVGAState *d = container_of(s, PCIVGAState, vga);
+
         qemu_edid_generate(d->edid, sizeof(d->edid), &d->edid_info);
         qemu_edid_region_io(&subs[3], owner, d->edid, sizeof(d->edid));
         memory_region_add_subregion(parent, 0, &subs[3]);

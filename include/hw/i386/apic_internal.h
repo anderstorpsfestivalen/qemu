@@ -161,6 +161,7 @@ struct APICCommonState {
     uint32_t apicbase;
     uint8_t id; /* legacy APIC ID */
     uint32_t initial_apic_id;
+    bool initial_apic_feature;
     uint8_t version;
     uint8_t arb_id;
     uint8_t tpr;

@@ -51,6 +51,7 @@ qtests_filter = \
   (get_option('default_devices') and host_os != 'windows' ? ['test-filter-redirector'] : [])
 
 qtests_i386 = \
+  (config_all_devices.has_key('CONFIG_JUKE_RETRO_GPU') ? ['juke-retro-gpu-test'] : []) + \
   (slirp.found() ? ['pxe-test'] : []) + \
   qtests_filter + \
   (config_all_devices.has_key('CONFIG_ACPI_VMGENID') ? ['vmgenid-test'] : []) +             \
@@ -65,6 +66,7 @@ qtests_i386 = \
   (config_all_devices.has_key('CONFIG_I440FX') ? ['ide-test'] : []) +                       \
   (config_all_devices.has_key('CONFIG_I440FX') ? ['numa-test'] : []) +                      \
   (config_all_devices.has_key('CONFIG_I440FX') ? ['test-x86-cpuid-compat'] : []) +          \
+  (config_all_devices.has_key('CONFIG_I440FX') ? ['tcg-invalidate-test'] : []) +           \
   (config_all_devices.has_key('CONFIG_ISA_TESTDEV') ? ['endianness-test'] : []) +           \
   (config_all_devices.has_key('CONFIG_SGA') ? ['boot-serial-test'] : []) +                  \
   (config_all_devices.has_key('CONFIG_ISA_IPMI_KCS') ? ['ipmi-kcs-test'] : []) +            \

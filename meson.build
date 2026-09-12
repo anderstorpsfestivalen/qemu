@@ -1784,6 +1784,16 @@ if (have_system or have_tools) and (virgl.found() or opengl.found())
 endif
 have_vhost_user_gpu = have_vhost_user_gpu and virgl.found() and opengl.found() and gbm.found()
 
+# Juke legacy desktop GL forwarding uses native offscreen contexts; it does
+# not depend on the SDL/virgl display backend or QEMU's --enable-opengl switch.
+juke_gl_deps = []
+if have_system and host_os == 'darwin'
+  juke_gl_deps = [dependency('appleframeworks',
+                            modules: ['OpenGL', 'IOSurface', 'CoreFoundation'])]
+elif have_system and host_os == 'linux'
+  juke_gl_deps = [dependency('epoxy'), dependency('gbm'), dependency('libdrm')]
+endif
+
 libcbor = not_found
 if not get_option('libcbor').auto() or have_system
   libcbor = dependency('libcbor', version: '>=0.7.0',
@@ -2269,6 +2279,7 @@ endif
 #################
 
 config_host_data = configuration_data()
+config_host_data.set('CONFIG_JUKE_RETRO_GL', juke_gl_deps.length() > 0)
 
 config_host_data.set('CONFIG_HAVE_RUST', have_rust)
 audio_drivers_selected = []

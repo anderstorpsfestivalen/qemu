@@ -16,8 +16,10 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "ui/console.h"
+#include "ui/juke-shmem.h"
 #include "ui/surface.h"
 #include "ui/input.h"
+#include "qemu/bswap.h"
 #include "qemu/memfd.h"
 #include "qemu/sockets.h"
 
@@ -112,23 +114,48 @@ typedef struct JukeShmemState {
     int shmem_fd;
     char *socket_path;
     int client_fd;
-    bool fd_sent, dirty;
+    bool fd_sent, dirty, cpu_anchor_pending;
     int32_t mouse_x, mouse_y;
     bool mouse_initialized;
-    uint64_t generation, input_id;
+    uint64_t generation, input_id, epoch;
     JukeFrameMeta cursor;
     uint8_t input_bytes[sizeof(JukeInputEvent)];
     size_t input_used;
     bool held_keys[256], held_buttons[INPUT_BUTTON__MAX];
     JukeMessage deferred_ack;
+    uint8_t *cursor_shmem;
+    int cursor_fd;
+    bool cursor_fd_sent, cursor_shape_dirty, cursor_notify_shape;
+    bool cursor_position_dirty;
+    uint64_t cursor_epoch, cursor_generation, cursor_position_sequence;
+    JukeNativeCursor native_cursor;
     int normal_refresh_ms;
     uint64_t input_refresh_until_us;
 } JukeShmemState;
+
+/* The configured display has one default console. All access is under BQL. */
+static JukeShmemState *juke_active_display;
+
+bool juke_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
+                           uint64_t *generation)
+{
+    JukeShmemState *s = juke_active_display;
+
+    if (!s || s->dcl.con != con || !s->shmem) {
+        return false;
+    }
+    *epoch = s->epoch;
+    *generation = s->generation + 1;
+    s->dirty = true;
+    s->cpu_anchor_pending = true;
+    return true;
+}
 
 static void juke_shmem_send_fd(JukeShmemState *s);
 static int juke_shmem_connect(JukeShmemState *s);
 static void juke_shmem_input_ready(void *opaque);
 static void juke_shmem_ack_ready(void *opaque);
+static void juke_shmem_cursor_publish(JukeShmemState *s);
 
 static uint64_t juke_now_us(void)
 {
@@ -162,6 +189,7 @@ static void juke_shmem_disconnect(JukeShmemState *s)
         s->client_fd = -1;
     }
     s->fd_sent = false;
+    s->cursor_fd_sent = false;
     s->input_used = 0;
     s->deferred_ack.kind = 0;
     juke_shmem_release_input(s, false);
@@ -195,17 +223,200 @@ static void juke_shmem_notify(JukeShmemState *s, uint8_t kind,
 static void juke_shmem_ack_ready(void *opaque)
 {
     JukeShmemState *s = opaque;
-    ssize_t n = send(s->client_fd, &s->deferred_ack, sizeof(s->deferred_ack),
-                     MSG_DONTWAIT | MSG_NOSIGNAL);
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
-        return;
+
+    if (s->deferred_ack.kind) {
+        ssize_t n = send(s->client_fd, &s->deferred_ack,
+                         sizeof(s->deferred_ack), MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                     errno == EINTR)) {
+            return;
+        }
+        if (n != sizeof(s->deferred_ack)) {
+            juke_shmem_disconnect(s);
+            return;
+        }
+        s->deferred_ack.kind = 0;
     }
-    if (n != sizeof(s->deferred_ack)) {
-        juke_shmem_disconnect(s);
-        return;
-    }
-    s->deferred_ack.kind = 0;
     qemu_set_fd_handler(s->client_fd, juke_shmem_input_ready, NULL, s);
+    juke_shmem_cursor_publish(s);
+}
+
+/* Return 1 for sent, 0 for backpressure, -1 for a disconnected stream. */
+static int juke_shmem_cursor_send(JukeShmemState *s, const uint8_t *packet,
+                                   int fd)
+{
+    union {
+        struct cmsghdr align;
+        uint8_t bytes[CMSG_SPACE(sizeof(int))];
+    } control = { 0 };
+    struct iovec iov = { .iov_base = (void *)packet,
+                         .iov_len = JCUR_PACKET_BYTES };
+    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+
+    if (fd >= 0) {
+        msg.msg_control = control.bytes;
+        msg.msg_controllen = sizeof(control.bytes);
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &fd, sizeof(fd));
+    }
+    ssize_t n = sendmsg(s->client_fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+        return 0;
+    }
+    if (n != JCUR_PACKET_BYTES) {
+        juke_shmem_disconnect(s);
+        return -1;
+    }
+    return 1;
+}
+
+static void juke_shmem_cursor_new_mapping(JukeShmemState *s)
+{
+    if (s->cursor_shmem) {
+        qemu_memfd_free(s->cursor_shmem, JCUR_MAPPING_BYTES, s->cursor_fd);
+    }
+    s->cursor_shmem = qemu_memfd_alloc("juke-cursor", JCUR_MAPPING_BYTES, 0,
+                                       &s->cursor_fd, NULL);
+    s->cursor_fd_sent = false;
+    if (!s->cursor_shmem) {
+        s->cursor_fd = -1;
+        error_report("juke-shmem: failed to allocate native cursor mapping");
+        return;
+    }
+    memset(s->cursor_shmem, 0, JCUR_MAPPING_BYTES);
+    stl_le_p(s->cursor_shmem + JCUR_HDR_MAGIC, JCUR_MAGIC);
+    stl_le_p(s->cursor_shmem + JCUR_HDR_VERSION, JCUR_VERSION);
+    stl_le_p(s->cursor_shmem + JCUR_HDR_MAX_DIMENSION,
+              JRG_CURSOR_MAX_DIMENSION);
+    stl_le_p(s->cursor_shmem + JCUR_HDR_SLOT_COUNT, JCUR_SLOT_COUNT);
+    stq_le_p(s->cursor_shmem + JCUR_HDR_EPOCH, ++s->cursor_epoch);
+    s->cursor_generation = 0;
+    s->cursor_position_sequence = 1;
+    s->cursor_shape_dirty = s->native_cursor.width != 0;
+    s->cursor_notify_shape = false;
+    s->cursor_position_dirty = true;
+}
+
+static void juke_shmem_cursor_publish(JukeShmemState *s)
+{
+    uint8_t packet[JCUR_PACKET_BYTES] = { 0 };
+    bool writable = false;
+    int sent;
+
+    if (s->client_fd < 0 || !s->fd_sent || !s->cursor_shmem) {
+        return;
+    }
+    if (!s->cursor_fd_sent) {
+        packet[0] = JCUR_MSG_MAPPING;
+        stq_le_p(packet + 8, s->cursor_epoch);
+        stq_le_p(packet + 16, juke_now_us());
+        sent = juke_shmem_cursor_send(s, packet, s->cursor_fd);
+        if (sent <= 0) {
+            writable = sent == 0;
+            goto out;
+        }
+        s->cursor_fd_sent = true;
+    }
+    if (s->cursor_shape_dirty) {
+        bool published = false;
+        for (unsigned i = 0; i < JCUR_SLOT_COUNT; i++) {
+            uint32_t *state = (uint32_t *)(s->cursor_shmem +
+                                          JCUR_HDR_SLOTS + i * 4);
+            uint32_t old = qatomic_load_acquire(state);
+            if ((old == JCUR_FREE || old == JCUR_READY) &&
+                qatomic_cmpxchg(state, old, JCUR_WRITING) == old) {
+                const JukeNativeCursor *c = &s->native_cursor;
+                uint8_t *slot = s->cursor_shmem + JCUR_HEADER_BYTES +
+                                i * JCUR_SLOT_BYTES;
+
+                memset(slot, 0, JCUR_SLOT_BYTES);
+                stq_le_p(slot + JCUR_SLOT_GENERATION, ++s->cursor_generation);
+                stl_le_p(slot + JCUR_SLOT_WIDTH, c->width);
+                stl_le_p(slot + JCUR_SLOT_HEIGHT, c->height);
+                stl_le_p(slot + JCUR_SLOT_HOT_X, c->hot_x);
+                stl_le_p(slot + JCUR_SLOT_HOT_Y, c->hot_y);
+                stl_le_p(slot + JCUR_SLOT_FORMAT, c->format);
+                stq_le_p(slot + JCUR_SLOT_POSITION_SEQUENCE,
+                          s->cursor_position_sequence);
+                stl_le_p(slot + JCUR_SLOT_X, c->x);
+                stl_le_p(slot + JCUR_SLOT_Y, c->y);
+                stl_le_p(slot + JCUR_SLOT_FLAGS, c->flags);
+                memcpy(slot + JCUR_SLOT_PIXELS, c->pixels,
+                        c->width * c->height * JRG_CURSOR_PIXEL_BYTES);
+                qatomic_store_release(state, JCUR_READY);
+                qatomic_store_release((uint64_t *)(s->cursor_shmem +
+                                      JCUR_HDR_GENERATION), s->cursor_generation);
+                s->cursor_shape_dirty = false;
+                s->cursor_notify_shape = true;
+                published = true;
+                break;
+            }
+        }
+        if (!published) {
+            /* Leased slots need a later refresh, never a writable busy loop. */
+            goto out;
+        }
+    }
+    if (s->cursor_notify_shape) {
+        packet[0] = JCUR_MSG_SHAPE;
+        stq_le_p(packet + 8, s->cursor_generation);
+        stq_le_p(packet + 16, juke_now_us());
+        sent = juke_shmem_cursor_send(s, packet, -1);
+        if (sent <= 0) {
+            writable = sent == 0;
+            goto out;
+        }
+        s->cursor_notify_shape = false;
+    }
+    if (s->cursor_position_dirty) {
+        packet[0] = JCUR_MSG_POSITION;
+        packet[JCUR_PACKET_FLAGS] = s->native_cursor.flags;
+        stq_le_p(packet + JCUR_PACKET_SEQUENCE, s->cursor_position_sequence);
+        stl_le_p(packet + JCUR_PACKET_X, s->native_cursor.x);
+        stl_le_p(packet + JCUR_PACKET_Y, s->native_cursor.y);
+        sent = juke_shmem_cursor_send(s, packet, -1);
+        if (sent <= 0) {
+            writable = sent == 0;
+            goto out;
+        }
+        s->cursor_position_dirty = false;
+    }
+out:
+    if (s->client_fd >= 0) {
+        qemu_set_fd_handler(s->client_fd, juke_shmem_input_ready,
+            writable || s->deferred_ack.kind ? juke_shmem_ack_ready : NULL, s);
+    }
+}
+
+void juke_shmem_native_cursor(QemuConsole *con, const JukeNativeCursor *cursor,
+                              bool shape)
+{
+    JukeShmemState *s = juke_active_display;
+
+    if (!s || s->dcl.con != con) {
+        return;
+    }
+    if (shape) {
+        s->native_cursor = *cursor;
+        s->cursor_shape_dirty = cursor->width != 0;
+        if (!cursor->width) {
+            s->cursor_notify_shape = false;
+            if (s->cursor_shmem) {
+                /* A reset retires the old shape, including consumer copies. */
+                juke_shmem_cursor_new_mapping(s);
+            }
+        }
+    } else {
+        s->native_cursor.x = cursor->x;
+        s->native_cursor.y = cursor->y;
+        s->native_cursor.flags = cursor->flags;
+    }
+    s->cursor_position_sequence++;
+    s->cursor_position_dirty = true;
+    juke_shmem_cursor_publish(s);
 }
 
 static JukeFrameMeta *juke_shmem_slot(JukeShmemState *s, int i)
@@ -220,6 +431,12 @@ static uint8_t *juke_shmem_pixels(JukeShmemState *s, int i)
 
 static void juke_shmem_publish(JukeShmemState *s)
 {
+    if (s->cpu_anchor_pending) {
+        /* Input can publish between refreshes. Refresh the VGA surface first,
+         * so a ReturnCpu/reset anchor cannot match stale converted pixels. */
+        s->cpu_anchor_pending = false;
+        qemu_console_hw_update(s->dcl.con);
+    }
     if (!s->shmem || !s->surface || !s->dirty) {
         return;
     }
@@ -480,6 +697,9 @@ static void juke_shmem_gfx_switch(DisplayChangeListener *dcl,
     s->shmem->height = h;
     s->shmem->stride = stride;
     s->shmem->format = format;
+    ++s->epoch;
+    s->shmem->reserved[0] = s->epoch;
+    s->shmem->reserved[1] = s->epoch >> 32;
     s->dirty = true;
 
     /* Preserve mouse position across resolution changes, just clamp to new bounds.
@@ -524,6 +744,7 @@ static void juke_shmem_refresh(DisplayChangeListener *dcl)
 
     qemu_console_hw_update(dcl->con);
     juke_shmem_publish(s);
+    juke_shmem_cursor_publish(s);
 }
 
 /*
@@ -650,6 +871,8 @@ static int juke_shmem_connect(JukeShmemState *s)
     if (s->surface) {
         juke_shmem_gfx_switch(&s->dcl, s->surface);
     }
+    juke_shmem_cursor_new_mapping(s);
+    juke_shmem_cursor_publish(s);
 
     return 0;
 }
@@ -746,8 +969,10 @@ static void juke_shmem_init(DisplayState *ds, DisplayOptions *opts)
     JukeShmemState *s = g_new0(JukeShmemState, 1);
 
     s->dcl.con = qemu_console_lookup_default();
+    juke_active_display = s;
     s->dcl.ops = &juke_shmem_ops;
     s->shmem_fd = -1;
+    s->cursor_fd = -1;
     s->client_fd = -1;
 
     if (opts->u.juke_shmem.socket) {

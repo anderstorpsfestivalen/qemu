@@ -22,6 +22,7 @@
 #include "qapi/qapi-types-block.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
+#include "qemu/audio.h"
 #include "hw/ide/ide-dev.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
@@ -121,6 +122,7 @@ void ide_dev_initfn(IDEDevice *dev, IDEDriveKind kind, Error **errp)
     if (ide_init_drive(s, dev, kind, errp) < 0) {
         return;
     }
+    s->cdrom_audio_be = dev->audio_be;
 
     if (!dev->version) {
         dev->version = g_strdup(s->version);
@@ -187,6 +189,9 @@ static void ide_hd_realize(IDEDevice *dev, Error **errp)
 
 static void ide_cd_realize(IDEDevice *dev, Error **errp)
 {
+    if (dev->audio_be && !audio_be_check(&dev->audio_be, errp)) {
+        return;
+    }
     ide_dev_initfn(dev, IDE_CD, errp);
 }
 
@@ -218,6 +223,7 @@ static const TypeInfo ide_hd_info = {
 
 static const Property ide_cd_properties[] = {
     DEFINE_IDE_DEV_PROPERTIES(),
+    DEFINE_AUDIO_PROPERTIES(IDEDrive, dev.audio_be),
 };
 
 static void ide_cd_class_init(ObjectClass *klass, const void *data)

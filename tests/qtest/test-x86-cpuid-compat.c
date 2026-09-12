@@ -43,6 +43,67 @@ static bool qom_get_bool(const char *path, const char *prop)
     return b;
 }
 
+/* Windows 98 disables the APIC before restarting; reset must restore CPUID. */
+static void test_apic_feature_reset(void)
+{
+    static const uint8_t disable_apic[] = {
+        0xfa,                               /* cli */
+        0x66, 0xb9, 0x1b, 0, 0, 0,          /* mov ecx, IA32_APIC_BASE */
+        0x0f, 0x32,                         /* rdmsr */
+        0x66, 0x25, 0xff, 0xf7, 0xff, 0xff, /* and eax, ~APICBASE_ENABLE */
+        0x0f, 0x30,                         /* wrmsr */
+        0xf4, 0xeb, 0xfd,                   /* hlt; jmp hlt */
+    };
+    g_autofree char *filename = NULL;
+    g_autofree char *path = NULL;
+    g_autofree char *args = NULL;
+    g_autofree uint8_t *rom = g_malloc0(65536);
+    QDict *response;
+    int fd = g_file_open_tmp("qemu-apic-reset-XXXXXX", &filename, NULL);
+
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    memcpy(rom, disable_apic, sizeof(disable_apic));
+    memcpy(rom + 0xfff0, "\xea\x00\x00\x00\xf0", 5);
+    g_assert_true(g_file_set_contents(filename, (char *)rom, 65536, NULL));
+    args = g_strdup_printf("-accel tcg -cpu pentium3 -S -bios %s", filename);
+    qtest_start(args);
+    path = get_cpu0_qom_path();
+    g_assert_true(qom_get_bool(path, "apic"));
+    for (unsigned reset = 0; reset < 2; reset++) {
+        response = qmp("{'execute':'cont'}");
+        g_assert_true(qdict_haskey(response, "return"));
+        qobject_unref(response);
+        int64_t deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+        while (qom_get_bool(path, "apic")) {
+            g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+            g_usleep(1000);
+        }
+        response = qmp("{'execute':'stop'}");
+        g_assert_true(qdict_haskey(response, "return"));
+        qobject_unref(response);
+        response = qmp("{'execute':'system_reset'}");
+        g_assert_true(qdict_haskey(response, "return"));
+        qobject_unref(response);
+        qmp_eventwait("RESET");
+        g_assert_true(qom_get_bool(path, "apic"));
+    }
+    qtest_end();
+    unlink(filename);
+
+    /* SMP can instantiate an APIC even when its CPUID feature was disabled. */
+    g_clear_pointer(&path, g_free);
+    qtest_start("-cpu pentium3,apic=off -smp 2");
+    path = get_cpu0_qom_path();
+    g_assert_false(qom_get_bool(path, "apic"));
+    response = qmp("{'execute':'system_reset'}");
+    g_assert_true(qdict_haskey(response, "return"));
+    qobject_unref(response);
+    qmp_eventwait("RESET");
+    g_assert_false(qom_get_bool(path, "apic"));
+    qtest_end();
+}
+
 typedef struct CpuidTestArgs {
     /* test name */
     const char *name;
@@ -416,6 +477,9 @@ int main(int argc, char **argv)
     g_test_add_func("/x86/cpuid/parsing-plus-minus/subprocess",
                     test_plus_minus_subprocess);
     g_test_add_func("/x86/cpuid/parsing-plus-minus", test_plus_minus);
+    if (qtest_has_accel("tcg") && qtest_has_cpu_model("pentium3")) {
+        qtest_add_func("x86/cpuid/apic-feature-reset", test_apic_feature_reset);
+    }
 
     for (int i = 0; i < ARRAY_SIZE(cpuid_tests); i++) {
         if (!qtest_has_cpu_model(cpuid_tests[i].cpu)) {

@@ -3338,7 +3338,7 @@
 ##
 { 'enum': 'BlockdevDriver',
   'data': [ 'blkdebug', 'blklogwrites', 'blkreplay', 'blkverify', 'bochs',
-            'cloop', 'compress', 'copy-before-write', 'copy-on-read', 'dmg',
+            'cloop', 'compress', 'copy-before-write', 'copy-on-read', 'cue', 'dmg',
             'file', 'snapshot-access', 'ftp', 'ftps',
             {'name': 'host_cdrom', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
             {'name': 'host_device', 'if': 'HAVE_HOST_BLOCK_DEVICE' },
@@ -3491,6 +3491,20 @@
 ##
 { 'struct': 'BlockdevOptionsGenericFormat',
   'data': { 'file': 'BlockdevRef' } }
+
+##
+# @BlockdevOptionsCue:
+#
+# Read-only CDRWIN CUE and referenced BINARY optical media.
+#
+# @data-file: optional explicit local BIN child, otherwise derived
+#     from FILE.
+#
+# Since: 11.0
+##
+{ 'struct': 'BlockdevOptionsCue',
+  'base': 'BlockdevOptionsGenericFormat',
+  'data': { '*data-file': 'BlockdevRef' } }
 
 ##
 # @BlockdevOptionsLUKS:
@@ -4839,6 +4853,7 @@
       'bochs':      'BlockdevOptionsGenericFormat',
       'cloop':      'BlockdevOptionsGenericFormat',
       'compress':   'BlockdevOptionsGenericFormat',
+      'cue':        'BlockdevOptionsCue',
       'copy-before-write':'BlockdevOptionsCbw',
       'copy-on-read':'BlockdevOptionsCor',
       'dmg':        'BlockdevOptionsGenericFormat',

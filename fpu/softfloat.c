@@ -2758,12 +2758,33 @@ float128 floatx80_to_float128(floatx80 a, float_status *s)
     return float128_round_pack_canonical(&p, s);
 }
 
-floatx80 float32_to_floatx80(float32 a, float_status *s)
+/* Keep canonical temporaries and their stack frame off the exact fast path. */
+static floatx80 __attribute__((noinline))
+float32_to_floatx80_canonical(float32 a, float_status *s)
 {
     FloatParts64 p64 = float32_unpack_canonical(a, s);
     FloatParts128 p128 = parts64_to_parts128(&p64, s);
 
     return floatx80_round_pack_canonical(&p128, s);
+}
+
+floatx80 float32_to_floatx80(float32 a, float_status *s)
+{
+    unsigned exp = extract32(a, 23, 8);
+
+    /*
+     * Every normal binary32 value is exactly representable in floatx80,
+     * including at its narrowest (24-bit) rounding precision. Rebase the
+     * exponent and restore the explicit integer bit directly: no rounding,
+     * exceptions, or status-dependent handling is needed. Leave zeros,
+     * denormals, infinities and NaNs to the canonical path below.
+     */
+    if (likely(exp - 1 < 254)) {
+        return packFloatx80(extract32(a, 31, 1), exp + (16383 - 127),
+                            ((uint64_t)(a & 0x7fffff) << 40) | (1ull << 63));
+    }
+
+    return float32_to_floatx80_canonical(a, s);
 }
 
 floatx80 float64_to_floatx80(float64 a, float_status *s)

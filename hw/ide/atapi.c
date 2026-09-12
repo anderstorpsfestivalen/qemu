@@ -35,6 +35,8 @@
 #define ATAPI_SECTOR_SIZE (1 << ATAPI_SECTOR_BITS)
 
 static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret);
+static const CdromImageTrack *cdrom_image_track(const CdromImageInfo *info,
+                                                uint32_t lba, uint8_t *number);
 
 static void padstr8(uint8_t *buf, int buf_size, const char *src)
 {
@@ -99,6 +101,10 @@ static void cd_read_sector_cb(void *opaque, int ret)
 
     trace_cd_read_sector_cb(s->lba, ret);
 
+    if (s->cdrom_raw_image && s->cd_sector_size == 2352) {
+        s->pio_aiocb = NULL;
+    }
+
     if (ret < 0) {
         block_acct_failed(blk_get_stats(s->blk), &s->acct);
         ide_atapi_io_error(s, ret);
@@ -107,7 +113,7 @@ static void cd_read_sector_cb(void *opaque, int ret)
 
     block_acct_done(blk_get_stats(s->blk), &s->acct);
 
-    if (s->cd_sector_size == 2352) {
+    if (s->cd_sector_size == 2352 && !s->cdrom_raw_image) {
         /* unpack back-to-front so a sector never clobbers an unmoved one */
         for (i = nsec - 1; i >= 0; i--) {
             memmove(s->io_buffer + i * 2352 + 16, s->io_buffer + i * 2048,
@@ -153,6 +159,18 @@ static int cd_read_sector(IDEState *s)
 
     /* a burst is bounded by the byte count limit, so it fits io_buffer */
     assert(nsec * s->cd_sector_size <= s->io_buffer_total_len);
+
+    if (s->cdrom_raw_image && s->cd_sector_size == 2352) {
+        s->cdrom_raw_read = (CdromImageRead) {
+            .lba = s->lba, .count = nsec, .buffer = s->io_buffer,
+        };
+        block_acct_start(blk_get_stats(s->blk), &s->acct, nsec * 2352,
+                          BLOCK_ACCT_READ);
+        s->status |= BUSY_STAT;
+        s->pio_aiocb = blk_aio_ioctl(s->blk, QEMU_CDROM_READ_RAW,
+                                    &s->cdrom_raw_read, cd_read_sector_cb, s);
+        return 0;
+    }
 
     /*
      * Read the payload packed at the front of io_buffer; the 2352 raw case is
@@ -359,7 +377,9 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
         if (s->lba != -1) {
             if (s->cd_sector_size == 2352) {
                 n = 1;
-                cd_data_to_raw(s->io_buffer, s->lba);
+                if (!s->cdrom_raw_image) {
+                    cd_data_to_raw(s->io_buffer, s->lba);
+                }
             } else {
                 n = s->io_buffer_size >> 11;
             }
@@ -390,6 +410,15 @@ static void ide_atapi_cmd_read_dma_cb(void *opaque, int ret)
         data_offset = 0;
     }
     trace_ide_atapi_cmd_read_dma_cb_aio(s, s->lba, n);
+    if (s->cdrom_raw_image && s->cd_sector_size == 2352) {
+        s->cdrom_raw_read = (CdromImageRead) {
+            .lba = s->lba, .count = n, .buffer = s->io_buffer,
+        };
+        s->bus->dma->aiocb = blk_aio_ioctl(s->blk, QEMU_CDROM_READ_RAW,
+                                           &s->cdrom_raw_read,
+                                           ide_atapi_cmd_read_dma_cb, s);
+        return;
+    }
     qemu_iovec_init_buf(&s->bus->dma->qiov, s->io_buffer + data_offset,
                         n * ATAPI_SECTOR_SIZE);
 
@@ -430,6 +459,9 @@ static void ide_atapi_cmd_read_dma(IDEState *s, int lba, int nb_sectors,
 static void ide_atapi_cmd_read(IDEState *s, int lba, int nb_sectors,
                                int sector_size)
 {
+    ide_cd_audio_stop(s, 0x15);
+    s->cdrom_position = lba;
+    s->cdrom_audio_offset = 0;
     trace_ide_atapi_cmd_read(s, s->atapi_dma ? "dma" : "pio",
                              lba, nb_sectors);
     if (s->atapi_dma) {
@@ -877,22 +909,15 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
             ide_atapi_cmd_reply(s, 16, max_len);
             break;
         case MODE_PAGE_AUDIO_CTL:
-            stw_be_p(&buf[0], 24 - 2);
-            buf[2] = 0x70;
-            buf[3] = 0;
-            buf[4] = 0;
-            buf[5] = 0;
-            buf[6] = 0;
-            buf[7] = 0;
-
+            memset(buf, 0, 24);
+            stw_be_p(buf, 22);
             buf[8] = MODE_PAGE_AUDIO_CTL;
-            buf[9] = 24 - 10;
-            /* Fill with CDROM audio volume */
-            buf[17] = 0;
-            buf[19] = 0;
-            buf[21] = 0;
-            buf[23] = 0;
-
+            buf[9] = 14;
+            buf[10] = 4; /* IMMED, no stop-on-track-crossing. */
+            buf[16] = s->cdrom_audio_channel[0];
+            buf[17] = s->cdrom_audio_volume[0];
+            buf[18] = s->cdrom_audio_channel[1];
+            buf[19] = s->cdrom_audio_volume[1];
             ide_atapi_cmd_reply(s, 24, max_len);
             break;
         case MODE_PAGE_CAPABILITIES:
@@ -917,10 +942,9 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
             if (s->tray_locked) {
                 buf[14] |= 1 << 1;
             }
-            buf[15] = 0x00; /* No volume & mute control, no changer */
+            buf[15] = 0x03; /* Independent channel volume/mute, no changer. */
             stw_be_p(&buf[16], 704); /* 4x read speed */
-            buf[18] = 0; /* Two volume levels */
-            buf[19] = 2;
+            stw_be_p(buf + 18, 256);
             stw_be_p(&buf[20], 512); /* 512k buffer */
             stw_be_p(&buf[22], 704); /* 4x read speed current */
             buf[24] = 0;
@@ -936,9 +960,21 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
         }
         break;
     case 1: /* changeable values */
-        goto error_cmd;
     case 2: /* default values */
-        goto error_cmd;
+        if (code != MODE_PAGE_AUDIO_CTL) {
+            goto error_cmd;
+        }
+        memset(buf, 0, 24);
+        stw_be_p(buf, 22);
+        buf[8] = MODE_PAGE_AUDIO_CTL;
+        buf[9] = 14;
+        buf[10] = action == 2 ? 4 : 0;
+        buf[16] = 1;
+        buf[17] = 255;
+        buf[18] = 2;
+        buf[19] = 255;
+        ide_atapi_cmd_reply(s, 24, max_len);
+        break;
     default:
     case 3: /* saved values */
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST,
@@ -949,6 +985,46 @@ static void cmd_mode_sense(IDEState *s, uint8_t *buf)
 
 error_cmd:
     ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+}
+
+void ide_atapi_mode_select_end(IDEState *s)
+{
+    uint8_t *p = s->io_buffer;
+    ide_transfer_stop(s);
+    if (lduw_be_p(p + 6) || p[8] != MODE_PAGE_AUDIO_CTL || p[9] != 14 ||
+        p[10] != 4 || p[11] || p[12] || p[13] || p[14] || p[15] ||
+        (p[16] != 0 && p[16] != 1) || (p[18] != 0 && p[18] != 2) ||
+        p[20] || p[21] || p[22] || p[23]) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, 0x26);
+        return;
+    }
+    s->cdrom_audio_channel[0] = p[16];
+    s->cdrom_audio_volume[0] = p[17];
+    s->cdrom_audio_channel[1] = p[18];
+    s->cdrom_audio_volume[1] = p[19];
+    ide_cd_audio_volume(s);
+    ide_atapi_cmd_ok(s);
+}
+
+static void cmd_mode_select(IDEState *s, uint8_t *buf)
+{
+    unsigned bytes = lduw_be_p(buf + 7);
+    if (buf[1] != 0x10 || (bytes && bytes != 24) || s->atapi_dma ||
+        (bytes && (s->lcyl | (s->hcyl << 8)) < bytes)) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    if (!bytes) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    s->packet_transfer_size = s->elementary_transfer_size = bytes;
+    s->nsector = 0; /* Data-out, not command or device-to-host. */
+    s->lcyl = bytes;
+    s->hcyl = 0;
+    s->status = READY_STAT | SEEK_STAT;
+    ide_transfer_start(s, s->io_buffer, bytes, ide_atapi_mode_select_end);
+    ide_bus_set_irq(s->bus);
 }
 
 static void cmd_test_unit_ready(IDEState *s, uint8_t *buf)
@@ -983,7 +1059,8 @@ static void cmd_read(IDEState *s, uint8_t* buf)
     }
 
     lba = ldl_be_p(buf + 2);
-    if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
+    if (lba >= total_sectors || nb_sectors > total_sectors - lba ||
+        nb_sectors > INT_MAX / 2352) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
         return;
     }
@@ -994,6 +1071,8 @@ static void cmd_read(IDEState *s, uint8_t* buf)
 static void cmd_read_cd(IDEState *s, uint8_t* buf)
 {
     unsigned int nb_sectors, lba, transfer_request;
+    CdromImageInfo image;
+    bool audio = false, cue;
 
     /* Total logical sectors of ATAPI_SECTOR_SIZE(=2048) bytes */
     uint64_t total_sectors = s->nb_sectors >> 2;
@@ -1005,12 +1084,41 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     }
 
     lba = ldl_be_p(buf + 2);
-    if (lba >= total_sectors || lba + nb_sectors - 1 >= total_sectors) {
+    if (lba >= total_sectors || nb_sectors > total_sectors - lba ||
+        nb_sectors > INT_MAX / 2352) {
         ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
         return;
     }
 
     transfer_request = buf[9] & 0xf8;
+    cue = blk_ioctl(s->blk, QEMU_CDROM_GET_INFO, &image) == 0;
+    s->cdrom_raw_image = cue && image.sector_bytes == 2352;
+    if (cue && (buf[10] || (buf[9] & 7))) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    if (cue) {
+        uint8_t number;
+        unsigned expected = (buf[1] >> 2) & 7;
+        const CdromImageTrack *first = cdrom_image_track(&image, lba, &number);
+        audio = !first->control;
+        if (expected > 2) {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+            return;
+        }
+        for (unsigned i = number - 1; i < image.tracks; i++) {
+            const CdromImageTrack *track = &image.track[i];
+            if (track->index0 >= lba + nb_sectors) {
+                break;
+            }
+            if ((expected == 1 && track->control) ||
+                (expected == 2 && !track->control) ||
+                (transfer_request == 0x10 && audio == !!track->control)) {
+                ide_atapi_cmd_error(s, ILLEGAL_REQUEST, 0x64);
+                return;
+            }
+        }
+    }
     if (transfer_request == 0x00) {
         /* nothing */
         ide_atapi_cmd_ok(s);
@@ -1025,7 +1133,7 @@ static void cmd_read_cd(IDEState *s, uint8_t* buf)
     switch (transfer_request) {
     case 0x10:
         /* normal read */
-        ide_atapi_cmd_read(s, lba, nb_sectors, 2048);
+        ide_atapi_cmd_read(s, lba, nb_sectors, audio ? 2352 : 2048);
         break;
     case 0xf8:
         /* read all data */
@@ -1049,6 +1157,216 @@ static void cmd_seek(IDEState *s, uint8_t* buf)
         return;
     }
 
+    ide_cd_audio_stop(s, 0x15);
+    s->cdrom_position = lba;
+    s->cdrom_audio_offset = 0;
+    ide_atapi_cmd_ok(s);
+}
+
+static const CdromImageTrack *cdrom_image_track(const CdromImageInfo *info,
+                                                uint32_t lba, uint8_t *number)
+{
+    for (unsigned i = info->tracks; i > 0; i--) {
+        if (lba >= info->track[i - 1].index0) {
+            *number = i;
+            return &info->track[i - 1];
+        }
+    }
+    *number = 1;
+    return &info->track[0];
+}
+
+static void cdrom_toc_address(uint8_t *p, uint32_t lba, bool msf)
+{
+    if (msf) {
+        p[0] = 0;
+        lba_to_msf(p + 1, lba);
+    } else {
+        stl_be_p(p, lba);
+    }
+}
+
+static int cdrom_image_toc(const CdromImageInfo *info, uint8_t *out,
+                            bool msf, unsigned start, unsigned format)
+{
+    uint8_t *p = out + 4;
+    if ((format == 0 && start > info->tracks && start != 0xaa) ||
+        (format != 0 && start > 1) || format > 2) {
+        return -1;
+    }
+    memset(out, 0, 4 + 11 * (CDROM_IMAGE_MAX_TRACKS + 3));
+    out[2] = 1;
+    out[3] = format == 0 ? info->tracks : 1;
+    if (format == 2) {
+        for (unsigned point = 0xa0; point <= 0xa2; point++, p += 11) {
+            p[0] = 1;
+            p[1] = 0x10 | info->track[0].control;
+            p[3] = point;
+            if (point == 0xa0) {
+                p[8] = 1;
+            } else if (point == 0xa1) {
+                p[8] = info->tracks;
+            } else {
+                lba_to_msf(p + 8, info->sectors);
+            }
+        }
+        for (unsigned i = 0; i < info->tracks; i++, p += 11) {
+            p[0] = 1;
+            p[1] = 0x10 | info->track[i].control;
+            p[3] = i + 1;
+            lba_to_msf(p + 8, info->track[i].start);
+        }
+    } else if (format == 1) {
+        p[1] = 0x10 | info->track[0].control;
+        p[2] = 1;
+        cdrom_toc_address(p + 4, info->track[0].start, msf);
+        p += 8;
+    } else {
+        for (unsigned i = MAX(1, start); i <= info->tracks; i++, p += 8) {
+            p[1] = 0x10 | info->track[i - 1].control;
+            p[2] = i;
+            cdrom_toc_address(p + 4, info->track[i - 1].start, msf);
+        }
+        p[1] = 0x10 | info->track[info->tracks - 1].control;
+        p[2] = 0xaa;
+        cdrom_toc_address(p + 4, info->sectors, msf);
+        p += 8;
+    }
+    stw_be_p(out, p - out - 2);
+    return p - out;
+}
+
+static void cmd_read_subchannel(IDEState *s, uint8_t *buf)
+{
+    int max_len = lduw_be_p(buf + 7);
+    bool msf = buf[1] & 2;
+    uint8_t number = 1, control = 4, index = 1;
+    uint32_t position = s->cdrom_position, relative = position;
+    CdromImageInfo image;
+
+    if (buf[1] & ~2 || buf[2] != 0x40 || buf[3] != 1) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+        return;
+    }
+    if (!blk_ioctl(s->blk, QEMU_CDROM_GET_INFO, &image)) {
+        const CdromImageTrack *track = cdrom_image_track(&image, position,
+                                                        &number);
+        control = track->control;
+        index = position >= track->start;
+        relative = index ? position - track->start : track->start - position;
+    }
+    memset(buf, 0, 16);
+    buf[1] = s->cdrom_audio_status;
+    stw_be_p(buf + 2, 12);
+    buf[4] = 1;
+    buf[5] = 0x10 | control;
+    buf[6] = number;
+    buf[7] = index;
+    cdrom_toc_address(buf + 8, position, msf);
+    if (msf) {
+        buf[13] = relative / (60 * 75);
+        buf[14] = relative / 75 % 60;
+        buf[15] = relative % 75;
+    } else {
+        stl_be_p(buf + 12, relative);
+    }
+    ide_atapi_cmd_reply(s, 16, max_len);
+}
+
+/* MMC-1 5.1.4..5.1.6: end is exclusive, MSF includes the lead-in. */
+static bool cdrom_parse_msf(const uint8_t *p, uint32_t *lba)
+{
+    uint32_t value;
+    if (p[0] > 99 || p[1] > 59 || p[2] > 74) {
+        return false;
+    }
+    value = ((uint32_t)p[0] * 60 + p[1]) * 75 + p[2];
+    if (value < 150) {
+        return false;
+    }
+    *lba = value - 150;
+    return true;
+}
+
+static void cmd_play_audio(IDEState *s, uint8_t *buf)
+{
+    CdromImageInfo image;
+    uint32_t start, end, count;
+    bool current = false;
+
+    if (buf[1]) {
+        goto invalid;
+    }
+    if (buf[0] == 0x47) {
+        current = buf[3] == 0xff && buf[4] == 0xff && buf[5] == 0xff;
+        if (!cdrom_parse_msf(buf + 6, &end) ||
+            (!current && !cdrom_parse_msf(buf + 3, &start))) {
+            goto invalid;
+        }
+        if (current) {
+            start = s->cdrom_position;
+        }
+        if (start > end) {
+            goto invalid;
+        }
+    } else {
+        start = ldl_be_p(buf + 2);
+        current = start == UINT32_MAX;
+        if (current) {
+            start = s->cdrom_position;
+        }
+        count = buf[0] == 0x45 ? lduw_be_p(buf + 7) : ldl_be_p(buf + 6);
+        if (count > UINT32_MAX - start) {
+            goto range;
+        }
+        end = start + count;
+    }
+    if (start == end) {
+        ide_atapi_cmd_ok(s);
+        return;
+    }
+    if (blk_ioctl(s->blk, QEMU_CDROM_GET_INFO, &image) ||
+        start >= image.sectors || end > image.sectors) {
+        goto range;
+    }
+    for (unsigned i = 0; i < image.tracks; i++) {
+        uint32_t limit = i + 1 < image.tracks ? image.track[i + 1].index0 :
+                                               image.sectors;
+        if (start < limit && end > image.track[i].index0 &&
+            image.track[i].control) {
+            ide_atapi_cmd_error(s, ILLEGAL_REQUEST, 0x64);
+            return;
+        }
+    }
+    if (!ide_cd_audio_play(s, start, end,
+                           current ? s->cdrom_audio_offset : 0, false)) {
+        ide_atapi_cmd_error(s, HARDWARE_ERROR, 0x44);
+        return;
+    }
+    ide_atapi_cmd_ok(s);
+    return;
+invalid:
+    ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+    return;
+range:
+    ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_LOGICAL_BLOCK_OOR);
+}
+
+static void cmd_pause_resume(IDEState *s, uint8_t *buf)
+{
+    if (buf[8] & ~1) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, ASC_INV_FIELD_IN_CMD_PACKET);
+    } else if (s->cdrom_audio_status != 0x11 && s->cdrom_audio_status != 0x12) {
+        ide_atapi_cmd_error(s, ILLEGAL_REQUEST, 0x2c);
+    } else {
+        ide_cd_audio_pause(s, buf[8] & 1);
+        ide_atapi_cmd_ok(s);
+    }
+}
+
+static void cmd_stop_audio(IDEState *s, uint8_t *buf)
+{
+    ide_cd_audio_stop(s, 0x15);
     ide_atapi_cmd_ok(s);
 }
 
@@ -1063,6 +1381,10 @@ static void cmd_start_stop_unit(IDEState *s, uint8_t* buf)
         /* eject/load only happens for power condition == 0 */
         ide_atapi_cmd_ok(s);
         return;
+    }
+
+    if (!start) {
+        ide_cd_audio_stop(s, 0x15);
     }
 
     if (loej) {
@@ -1101,11 +1423,24 @@ static void cmd_read_toc_pma_atip(IDEState *s, uint8_t* buf)
     int format, msf, start_track, len;
     int max_len;
     uint64_t total_sectors = s->nb_sectors >> 2;
+    CdromImageInfo image;
 
     max_len = lduw_be_p(buf + 7);
-    format = buf[9] >> 6;
+    format = buf[2] & 0xf;
+    if (!format) {
+        format = buf[9] >> 6; /* Legacy ATAPI encoding. */
+    }
     msf = (buf[1] >> 1) & 1;
     start_track = buf[6];
+
+    if (!blk_ioctl(s->blk, QEMU_CDROM_GET_INFO, &image)) {
+        len = cdrom_image_toc(&image, buf, msf, start_track, format);
+        if (len < 0) {
+            goto error_cmd;
+        }
+        ide_atapi_cmd_reply(s, len, max_len);
+        return;
+    }
 
     switch(format) {
     case 0:
@@ -1149,6 +1484,7 @@ static void cmd_read_disc_information(IDEState *s, uint8_t* buf)
 {
     uint8_t type = buf[1] & 7;
     uint32_t max_len = lduw_be_p(buf + 7);
+    CdromImageInfo image;
 
     /* Types 1/2 are only defined for Blu-Ray.  */
     if (type != 0) {
@@ -1164,6 +1500,9 @@ static void cmd_read_disc_information(IDEState *s, uint8_t* buf)
     buf[4] = 1;   /* # of sessions */
     buf[5] = 1;   /* first track of last session */
     buf[6] = 1;   /* last track of last session */
+    if (!blk_ioctl(s->blk, QEMU_CDROM_GET_INFO, &image)) {
+        buf[6] = image.tracks;
+    }
     buf[7] = 0x20; /* unrestricted use */
     buf[8] = 0x00; /* CD-ROM or DVD-ROM */
     /* 9-10-11: most significant byte corresponding bytes 4-5-6 */
@@ -1277,10 +1616,17 @@ static const struct AtapiCmd {
     [ 0x25 ] = { cmd_read_cdvd_capacity,            CHECK_READY },
     [ 0x28 ] = { cmd_read, /* (10) */               CHECK_READY },
     [ 0x2b ] = { cmd_seek,                          CHECK_READY | NONDATA },
+    [ 0x42 ] = { cmd_read_subchannel,               CHECK_READY },
     [ 0x43 ] = { cmd_read_toc_pma_atip,             CHECK_READY },
+    [ 0x45 ] = { cmd_play_audio,                    CHECK_READY | NONDATA },
+    [ 0x47 ] = { cmd_play_audio,                    CHECK_READY | NONDATA },
+    [ 0x4b ] = { cmd_pause_resume,                  CHECK_READY | NONDATA },
+    [ 0x4e ] = { cmd_stop_audio,                    CHECK_READY | NONDATA },
+    [ 0xa5 ] = { cmd_play_audio,                    CHECK_READY | NONDATA },
     [ 0x46 ] = { cmd_get_configuration,             ALLOW_UA },
     [ 0x4a ] = { cmd_get_event_status_notification, ALLOW_UA },
     [ 0x51 ] = { cmd_read_disc_information,         CHECK_READY },
+    [ 0x55 ] = { cmd_mode_select, /* (10) */        CONDDATA },
     [ 0x5a ] = { cmd_mode_sense, /* (10) */         0 },
     [ 0xa8 ] = { cmd_read, /* (12) */               CHECK_READY },
     [ 0xad ] = { cmd_read_dvd_structure,            CHECK_READY },

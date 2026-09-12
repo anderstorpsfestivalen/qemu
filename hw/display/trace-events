@@ -226,3 +226,13 @@ apple_gfx_iosfc_unmap_memory(void *a, void *b, void *c, void *d, void *e, void *
 apple_gfx_iosfc_unmap_memory_region(void* mem, void *region) "unmapping @ %p from memory region %p"
 apple_gfx_iosfc_raise_irq(uint32_t vector) "vector=0x%x"
 
+
+# juke-retro-gpu.c
+juke_retro_gpu_submit(uint32_t sequence, uint32_t commands, uint64_t bytes, uint32_t inline_cap) "seq=%u commands=%u bytes=%"PRIu64" inline_cap=%u"
+juke_retro_gpu_work(uint32_t sequence, uint64_t bytes, uint32_t rows, uint64_t elapsed_us, bool inline_work) "seq=%u bytes=%"PRIu64" rows=%u elapsed_us=%"PRIu64" inline=%d"
+juke_retro_gpu_complete(uint32_t sequence, uint32_t error, uint32_t chunks, uint64_t elapsed_us) "seq=%u error=%u chunks=%u elapsed_us=%"PRIu64
+
+# juke-retro-gl.c / juke-retro-gpu.c (one record per batch, no per-call tracing)
+juke_retro_gl_submit(uint32_t sequence, uint32_t records, uint32_t bytes, uint64_t prepare_us) "seq=%u records=%u bytes=%u prepare_us=%"PRIu64
+juke_retro_gl_work(uint32_t sequence, uint32_t records, uint64_t bytes, uint64_t queue_us, uint64_t execute_us, uint32_t error) "seq=%u records=%u bytes=%"PRIu64" queue_us=%"PRIu64" execute_us=%"PRIu64" error=%u"
+juke_retro_gl_complete(uint32_t sequence, uint32_t error, uint64_t elapsed_us) "seq=%u error=%u elapsed_us=%"PRIu64

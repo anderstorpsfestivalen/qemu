@@ -924,6 +924,12 @@ static void audio_run_out(AudioMixengBackend *s)
             sw = hw->sw_head.lh_first;
 
             if (hw->pending_disable) {
+                if (k->run_buffer_out) {
+                    k->run_buffer_out(hw);
+                    if (hw->pending_emul) {
+                        continue;
+                    }
+                }
                 hw->enabled = false;
                 hw->pending_disable = false;
                 if (k->enable_out) {
@@ -976,6 +982,14 @@ static void audio_run_out(AudioMixengBackend *s)
         if (hw->pending_disable && !nb_live) {
             SWVoiceCap *sc;
 
+            /* Software voices may be empty while the generic backend queue
+             * still owns PCM. Keep its normal audio timer until it drains. */
+            if (k->run_buffer_out) {
+                k->run_buffer_out(hw);
+                if (hw->pending_emul) {
+                    continue;
+                }
+            }
             trace_audio_out_disable();
             hw->enabled = false;
             hw->pending_disable = false;

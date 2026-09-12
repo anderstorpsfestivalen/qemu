@@ -1196,6 +1196,9 @@ static void ide_cd_change_cb(void *opaque, bool load, Error **errp)
     IDEState *s = opaque;
     uint64_t nb_sectors;
 
+    ide_cd_audio_reset(s);
+    s->cdrom_raw_image = false;
+
     s->tray_open = !load;
     blk_get_geometry(s->blk, &nb_sectors);
     s->nb_sectors = nb_sectors;
@@ -1350,6 +1353,7 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 static void ide_reset(IDEState *s)
 {
     trace_ide_reset(s);
+    ide_cd_audio_reset(s);
 
     if (s->pio_aiocb) {
         blk_aio_cancel(s->pio_aiocb);
@@ -2383,7 +2387,8 @@ void ide_ctrl_write(void *opaque, uint32_t addr, uint32_t val)
 static bool ide_is_pio_out(IDEState *s)
 {
     if (s->end_transfer_func == ide_sector_write ||
-        s->end_transfer_func == ide_atapi_cmd) {
+        s->end_transfer_func == ide_atapi_cmd ||
+        s->end_transfer_func == ide_atapi_mode_select_end) {
         return false;
     } else if (s->end_transfer_func == ide_sector_read ||
                s->end_transfer_func == ide_transfer_stop ||
@@ -2817,6 +2822,7 @@ void ide_bus_set_irq(IDEBus *bus)
 
 void ide_exit(IDEState *s)
 {
+    ide_cd_audio_exit(s);
     timer_free(s->sector_write_timer);
     qemu_vfree(s->smart_selftest_data);
     qemu_vfree(s->io_buffer);
@@ -2836,6 +2842,7 @@ static EndTransferFunc* transfer_end_table[] = {
         ide_atapi_cmd_reply_end,
         ide_atapi_cmd,
         ide_dummy_transfer_stop,
+        ide_atapi_mode_select_end,
 };
 
 static int transfer_end_table_idx(EndTransferFunc *fn)
@@ -2847,6 +2854,14 @@ static int transfer_end_table_idx(EndTransferFunc *fn)
             return i;
 
     return -1;
+}
+
+static int ide_drive_pre_load(void *opaque)
+{
+    IDEState *s = opaque;
+    ide_cd_audio_reset(s);
+    s->cdrom_raw_image = false;
+    return 0;
 }
 
 static int ide_drive_post_load(void *opaque, int version_id)
@@ -2968,10 +2983,74 @@ static const VMStateDescription vmstate_ide_drive_pio_state = {
     }
 };
 
+static bool ide_cd_audio_needed(void *opaque)
+{
+    IDEState *s = opaque;
+    return s->drive_kind == IDE_CD &&
+        (s->cdrom_raw_image || s->cdrom_position ||
+         s->cdrom_audio_status != 0x15 ||
+         s->cdrom_audio_volume[0] != 255 || s->cdrom_audio_volume[1] != 255 ||
+         s->cdrom_audio_channel[0] != 1 || s->cdrom_audio_channel[1] != 2);
+}
+
+static int ide_cd_audio_post_load(void *opaque, int version_id)
+{
+    IDEState *s = opaque;
+    CdromImageInfo image;
+    bool active = s->cdrom_audio_status == 0x11 || s->cdrom_audio_status == 0x12;
+    if (!s->blk || s->drive_kind != IDE_CD ||
+        s->cdrom_audio_status < 0x11 || s->cdrom_audio_status > 0x15 ||
+        s->cdrom_audio_offset >= 2352 || (s->cdrom_audio_offset & 3) ||
+        (s->cdrom_audio_channel[0] != 0 && s->cdrom_audio_channel[0] != 1) ||
+        (s->cdrom_audio_channel[1] != 0 && s->cdrom_audio_channel[1] != 2)) {
+        return -EINVAL;
+    }
+    bdrv_graph_rdlock_main_loop();
+    s->cdrom_raw_image = bdrv_cdrom_get_info(blk_bs(s->blk), &image);
+    bdrv_graph_rdunlock_main_loop();
+    s->cdrom_raw_image = s->cdrom_raw_image && image.sector_bytes == 2352;
+    if (!active) {
+        return 0;
+    }
+    if (!s->cdrom_raw_image || s->cdrom_position >= s->cdrom_audio_end ||
+        s->cdrom_audio_end > image.sectors) {
+        return -EINVAL;
+    }
+    for (unsigned i = 0; i < image.tracks; i++) {
+        uint32_t limit = i + 1 < image.tracks ? image.track[i + 1].index0 :
+                                               image.sectors;
+        if (s->cdrom_position < limit && s->cdrom_audio_end > image.track[i].index0 &&
+            image.track[i].control) {
+            return -EINVAL;
+        }
+    }
+    return ide_cd_audio_play(s, s->cdrom_position, s->cdrom_audio_end,
+                             s->cdrom_audio_offset,
+                             s->cdrom_audio_status == 0x12) ? 0 : -EIO;
+}
+
+static const VMStateDescription vmstate_ide_cd_audio = {
+    .name = "ide_drive/cd_audio",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = ide_cd_audio_needed,
+    .post_load = ide_cd_audio_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(cdrom_position, IDEState),
+        VMSTATE_UINT32(cdrom_audio_end, IDEState),
+        VMSTATE_UINT16(cdrom_audio_offset, IDEState),
+        VMSTATE_UINT8(cdrom_audio_status, IDEState),
+        VMSTATE_UINT8_ARRAY(cdrom_audio_volume, IDEState, 2),
+        VMSTATE_UINT8_ARRAY(cdrom_audio_channel, IDEState, 2),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 const VMStateDescription vmstate_ide_drive = {
     .name = "ide_drive",
     .version_id = 3,
     .minimum_version_id = 0,
+    .pre_load = ide_drive_pre_load,
     .post_load = ide_drive_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_INT32(mult_sectors, IDEState),
@@ -3000,6 +3079,7 @@ const VMStateDescription vmstate_ide_drive = {
         &vmstate_ide_drive_pio_state,
         &vmstate_ide_tray_state,
         &vmstate_ide_atapi_gesn_state,
+        &vmstate_ide_cd_audio,
         NULL
     }
 };

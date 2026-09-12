@@ -31,6 +31,7 @@ int main(int argc, char **argv)
     static const char *devices[] = {
         "cirrus-vga",
         "VGA",
+        "qemu-retro-gpu",
         "secondary-vga",
         "virtio-gpu-pci",
         "virtio-vga"

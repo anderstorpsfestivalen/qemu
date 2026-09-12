@@ -238,6 +238,10 @@ static void apic_reset_common(DeviceState *dev)
     bsp = s->apicbase & MSR_IA32_APICBASE_BSP;
     s->apicbase = APIC_DEFAULT_ADDRESS | bsp | MSR_IA32_APICBASE_ENABLE;
     s->id = s->initial_apic_id;
+    /* Disabling IA32_APIC_BASE also hides CPUID.APIC until a hardware reset. */
+    if (s->initial_apic_feature) {
+        cpu_set_apic_feature(&s->cpu->env);
+    }
 
     kvm_reset_irq_delivered();
 
@@ -272,6 +276,7 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
 
     /* Normally initial APIC ID should be no more than hundreds */
     assert(instance_id != VMSTATE_INSTANCE_ID_ANY);
+    s->initial_apic_feature = s->cpu->env.features[FEAT_1_EDX] & CPUID_APIC;
 
     info = APIC_COMMON_GET_CLASS(s);
     info->realize(dev, errp);

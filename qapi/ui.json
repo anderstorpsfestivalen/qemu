@@ -1742,3 +1742,24 @@
 { 'command': 'client_migrate_info',
   'data': { 'protocol': 'str', 'hostname': 'str', '*port': 'int',
             '*tls-port': 'int', '*cert-subject': 'str' } }
+
+##
+# @JUKE_RETRO_GPU_FAULT:
+#
+# A display coherence failure stopped the guest in internal-error.
+# CPU access to an incoherent primary must not resume before a system
+# reset.
+#
+# @device: QOM path of the affected qemu-retro-gpu device
+#
+# @reason: Fault reason from the Juke retro GL ABI
+#
+# @operation: Last coherence-sensitive desktop operation, or zero
+#
+# @sequence: Guest GL submission sequence associated with the fault
+#
+# Since: 11.2
+##
+{ 'event': 'JUKE_RETRO_GPU_FAULT',
+  'data': { 'device': 'str', 'reason': 'uint32', 'operation': 'uint32',
+            'sequence': 'uint32' } }

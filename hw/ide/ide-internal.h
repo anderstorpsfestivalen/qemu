@@ -9,6 +9,15 @@
 
 #include "hw/ide/ide-bus.h"
 
+void ide_cd_audio_stop(IDEState *s, uint8_t status);
+bool ide_cd_audio_play(IDEState *s, uint32_t start, uint32_t end,
+                       unsigned offset, bool paused);
+void ide_cd_audio_pause(IDEState *s, bool resume);
+void ide_cd_audio_volume(IDEState *s);
+void ide_cd_audio_reset(IDEState *s);
+void ide_cd_audio_exit(IDEState *s);
+void ide_atapi_mode_select_end(IDEState *s);
+
 /* debug IDE devices */
 #define USE_DMA_CDROM
 

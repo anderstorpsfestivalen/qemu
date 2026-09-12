@@ -89,6 +89,7 @@ Emulated Devices
    devices/ccid.rst
    devices/cxl.rst
    devices/emmc.rst
+   devices/ide-cue.rst
    devices/igb.rst
    devices/ivshmem-flat.rst
    devices/ivshmem.rst
