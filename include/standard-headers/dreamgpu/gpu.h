@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * DreamGPU-authored protocol. Canonical file: guest/include/gpu.h;
+ * mirrored into vendor/qemu/include/standard-headers/dreamgpu/gpu.h.
  * DreamGPU guest GPU guest/host ABI. All fields are little endian uint32_t.
  * Keep this header usable by old Windows C compilers (no QEMU dependencies).
  */

@@ -1,4 +1,7 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * DreamGPU-authored protocol. Canonical file: guest/include/gl.h;
+ * mirrored into vendor/qemu/include/standard-headers/dreamgpu/gl.h.
+ */
 #ifndef DREAMGPU_GL_H
 #define DREAMGPU_GL_H
 

@@ -1,4 +1,7 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * DreamGPU-authored protocol. Canonical file: include/dreamgpu/transport.h;
+ * mirrored into vendor/qemu/include/standard-headers/dreamgpu/transport.h.
+ */
 #ifndef DREAMGPU_TRANSPORT_H
 #define DREAMGPU_TRANSPORT_H
 

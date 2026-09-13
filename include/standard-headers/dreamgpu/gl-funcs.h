@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * qemu-3dfx generated GL function vocabulary.
- * Source: startergo/qemu-3dfx-arch commit 5d40e054a1bc8c4b00c41c533c6b84afd9cdc30b.
+ * Source: vendor/qemu-3dfx/qemu-1/hw/mesa/mglfunci.h
+ * @5d40e054a1bc8c4b00c41c533c6b84afd9cdc30b (startergo/qemu-3dfx-arch).
+ * Copied with modifications: DreamGPU header guard, provenance and formatting;
+ * the upstream generated enum names and order are unchanged.
+ * Canonical file: guest/include/gl-funcs.h; mirrored into QEMU standard-headers.
  * Numeric values are part of the DreamGPU graphics protocol; append, never reorder.
  */
 #ifndef DREAMGPU_GL_FUNCS_H

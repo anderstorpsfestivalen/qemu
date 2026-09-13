@@ -1,4 +1,6 @@
-/* SPDX-License-Identifier: MIT
+/* SPDX-License-Identifier: GPL-2.0-or-later
+ * DreamGPU-authored protocol. Canonical file: include/dreamgpu/cursor.h;
+ * mirrored into guest/include/cursor.h and QEMU standard-headers/dreamgpu/cursor.h.
  * Native DreamGPU cursor ABI. All multibyte fields are little-endian.
  * No host pointers. Kept usable by Windows 9x/NT C toolchains.
  */
