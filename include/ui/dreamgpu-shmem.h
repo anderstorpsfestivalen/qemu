@@ -12,11 +12,9 @@ typedef struct DreamGpuNativeCursor {
 } DreamGpuNativeCursor;
 
 /* BQL only. shape=false updates position/flags without copying pixel data. */
-void dreamgpu_shmem_native_cursor(QemuConsole *con, const DreamGpuNativeCursor *cursor,
-                              bool shape);
+void dreamgpu_shmem_native_cursor(QemuConsole *con, const DreamGpuNativeCursor *cursor, bool shape);
 
 /* Called under BQL. Returns current immutable mapping epoch and the minimum
  * future CPU publication that can supersede an ordered ReturnCpu image. */
-bool dreamgpu_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
-                           uint64_t *generation);
+bool dreamgpu_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch, uint64_t *generation);
 #endif

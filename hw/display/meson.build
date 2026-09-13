@@ -20,11 +20,12 @@ system_ss.add(when: 'CONFIG_XEN_BUS', if_true: files('xenfb.c'))
 
 system_ss.add(when: 'CONFIG_VGA_PCI', if_true: files('vga-pci.c'))
 if config_all_devices.has_key('CONFIG_DREAMGPU')
-  # DreamGPU owns the host engine outside QEMU. A separate Cargo target directory
-  # prevents recursive locking when QEMU is itself built from a Cargo build script.
+  # Compile the dependency-free Rust engine directly, including when QEMU is
+  # invoked by Cargo build.rs. No recursive Cargo lock or Python build shim.
   dreamgpu_root = meson.project_source_root() / '../..'
   dreamgpu_host = dreamgpu_root / 'crates/dreamgpu-host'
-  dreamgpu_cargo = find_program('cargo', required: true)
+  dreamgpu_rustc = find_program(get_option('dreamgpu_rustc'), required: true)
+  dreamgpu_rustc_identity = run_command(dreamgpu_rustc, '--version', check: true).stdout().strip()
   dreamgpu_archive = custom_target('dreamgpu-host',
     input: [dreamgpu_host / 'Cargo.toml', dreamgpu_host / 'src/lib.rs',
             dreamgpu_host / 'src/desktop.rs',
@@ -38,11 +39,10 @@ if config_all_devices.has_key('CONFIG_DREAMGPU')
             dreamgpu_host / 'src/texture/names.rs',
             dreamgpu_root / 'Cargo.toml', dreamgpu_root / 'Cargo.lock'],
     output: 'libdreamgpu_host.a',
-    command: [python, files('../../scripts/dreamgpu-host-build.py'),
-              '--cargo', dreamgpu_cargo,
-              '--manifest', dreamgpu_host / 'Cargo.toml',
-              '--target-dir', meson.project_build_root() / 'dreamgpu-rust',
-              '--output', '@OUTPUT@'])
+    command: [dreamgpu_rustc, '--crate-name', 'dreamgpu_host', '--edition=2021',
+              '--crate-type=staticlib', '-C', 'opt-level=3', '-C', 'panic=abort',
+              '-C', 'metadata=' + dreamgpu_rustc_identity,
+              dreamgpu_host / 'src/lib.rs', '-o', '@OUTPUT@'])
   dreamgpu_dep = declare_dependency(link_with: dreamgpu_archive,
     include_directories: include_directories('../../../../crates/dreamgpu-host/include',
                                            '../../../../crates/dreamgpu-host/bindings'))

@@ -54,7 +54,6 @@
 
 typedef DreamGpuTexture DgTexture;
 
-
 struct DgGLPlatform {
     DreamGpuGlApi gl_api;
     uint64_t next_context_serial;
@@ -96,31 +95,44 @@ struct DgGLDrawable {
     DgGLPlatform *platform;
 };
 
-
-
 static DreamGpuTextureMemory texture_memory(DgGLPlatform *p);
 /* Pure command vocabulary and validation are owned by the Rust core. */
 
-uint32_t dg_gl_call_validate(uint32_t fn, const uint8_t *args)
-{ return dreamgpu_gl_call_validate(fn, args); }
-uint32_t dg_gl_data_validate(uint32_t fn, const uint8_t *args,
-                              const uint8_t *data, uint32_t bytes)
-{ return dreamgpu_gl_data_validate(fn, args, data, bytes); }
-uint32_t dg_gl_query_validate(uint32_t fn, const uint8_t *args)
-{ return dreamgpu_gl_query_validate(fn, args); }
-uint32_t dg_gl_query_result_bytes(uint32_t fn, const uint8_t *args)
-{ return dreamgpu_gl_query_result_bytes(fn, args); }
-uint32_t dg_gl_function_words(uint32_t fn)
-{ return dreamgpu_gl_function_words(fn); }
+uint32_t dg_gl_call_validate(uint32_t fn, const uint8_t *args) {
+    return dreamgpu_gl_call_validate(fn, args);
+}
+uint32_t dg_gl_data_validate(uint32_t fn, const uint8_t *args, const uint8_t *data,
+                             uint32_t bytes) {
+    return dreamgpu_gl_data_validate(fn, args, data, bytes);
+}
+uint32_t dg_gl_query_validate(uint32_t fn, const uint8_t *args) {
+    return dreamgpu_gl_query_validate(fn, args);
+}
+uint32_t dg_gl_query_result_bytes(uint32_t fn, const uint8_t *args) {
+    return dreamgpu_gl_query_result_bytes(fn, args);
+}
+uint32_t dg_gl_function_words(uint32_t fn) {
+    return dreamgpu_gl_function_words(fn);
+}
 
-DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
-{
+DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp) {
     DgGLPlatform *p = g_new0(DgGLPlatform, 1);
 #ifdef CONFIG_DARWIN
+    /* CGL requires attributes, integer values and a zero terminator in one enum array. */
+    // NOLINTBEGIN(clang-analyzer-optin.core.EnumCastOutOfRange)
     CGLPixelFormatAttribute attrs[] = {
-        kCGLPFAAccelerated, kCGLPFAColorSize, 24, kCGLPFAAlphaSize, 8,
-        kCGLPFADepthSize, 24, kCGLPFAStencilSize, 8, 0,
+        kCGLPFAAccelerated,
+        kCGLPFAColorSize,
+        24,
+        kCGLPFAAlphaSize,
+        8,
+        kCGLPFADepthSize,
+        24,
+        kCGLPFAStencilSize,
+        8,
+        0,
     };
+    // NOLINTEND(clang-analyzer-optin.core.EnumCastOutOfRange)
     GLint count;
     CGLError err = CGLChoosePixelFormat(attrs, &p->format, &count);
 
@@ -138,10 +150,23 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
 #else
     EGLint count;
     const EGLint attrs[] = {
-        EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT,
-        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
-        EGL_ALPHA_SIZE, 8, EGL_DEPTH_SIZE, 24, EGL_STENCIL_SIZE, 8, EGL_NONE,
+        EGL_SURFACE_TYPE,
+        EGL_PBUFFER_BIT,
+        EGL_RENDERABLE_TYPE,
+        EGL_OPENGL_BIT,
+        EGL_RED_SIZE,
+        8,
+        EGL_GREEN_SIZE,
+        8,
+        EGL_BLUE_SIZE,
+        8,
+        EGL_ALPHA_SIZE,
+        8,
+        EGL_DEPTH_SIZE,
+        24,
+        EGL_STENCIL_SIZE,
+        8,
+        EGL_NONE,
     };
 
     p->render_fd = open(render_node, O_RDWR | O_CLOEXEC);
@@ -149,8 +174,7 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
         p->gbm = gbm_create_device(p->render_fd);
     }
     if (p->render_fd < 0 || !p->gbm) {
-        error_setg_errno(errp, errno, "Opening GPU render node %s",
-                         render_node);
+        error_setg_errno(errp, errno, "Opening GPU render node %s", render_node);
         dg_gl_platform_free(p);
         return NULL;
     }
@@ -163,20 +187,16 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
         return NULL;
     }
     for (int i = 0; i < device_count; i++) {
-        const char *node =
-            eglQueryDeviceStringEXT(devices[i], EGL_DRM_RENDER_NODE_FILE_EXT);
+        const char *node = eglQueryDeviceStringEXT(devices[i], EGL_DRM_RENDER_NODE_FILE_EXT);
         if (node && !strcmp(node, render_node)) {
-            p->display = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT,
-                                                   devices[i], NULL);
+            p->display = eglGetPlatformDisplayEXT(EGL_PLATFORM_DEVICE_EXT, devices[i], NULL);
             break;
         }
     }
-    if (p->display == EGL_NO_DISPLAY ||
-        !eglInitialize(p->display, NULL, NULL) ||
-        !eglBindAPI(EGL_OPENGL_API) ||
-        !eglChooseConfig(p->display, attrs, &p->config, 1, &count) || !count) {
-        error_setg(errp, "EGL offscreen initialization failed: 0x%x",
-                    eglGetError());
+    if (p->display == EGL_NO_DISPLAY || !eglInitialize(p->display, NULL, NULL) ||
+        !eglBindAPI(EGL_OPENGL_API) || !eglChooseConfig(p->display, attrs, &p->config, 1, &count) ||
+        !count) {
+        error_setg(errp, "EGL offscreen initialization failed: 0x%x", eglGetError());
         dg_gl_platform_free(p);
         return NULL;
     }
@@ -191,8 +211,7 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
      * libepoxy's first-call resolver uses the current EGL display, which is
      * absent when a client destroys its context before its exported slots.
      */
-    p->destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)
-        eglGetProcAddress("eglDestroyImageKHR");
+    p->destroy_image = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
     if (!p->destroy_image) {
         error_setg(errp, "EGL image destruction is required");
         dg_gl_platform_free(p);
@@ -205,12 +224,11 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp)
         return NULL;
     }
 #endif
-    p->gl_api = (DreamGpuGlApi) { DREAMGPU_GL_API_INIT };
+    p->gl_api = (DreamGpuGlApi){DREAMGPU_GL_API_INIT};
     return p;
 }
 
-void dg_gl_platform_free(DgGLPlatform *p)
-{
+void dg_gl_platform_free(DgGLPlatform *p) {
     if (!p) {
         return;
     }
@@ -240,8 +258,7 @@ void dg_gl_platform_free(DgGLPlatform *p)
     g_free(p);
 }
 
-void dg_gl_clear_current(DgGLPlatform *p)
-{
+void dg_gl_clear_current(DgGLPlatform *p) {
     if (!p) {
         return;
     }
@@ -252,9 +269,7 @@ void dg_gl_clear_current(DgGLPlatform *p)
 #endif
 }
 
-DgGLContext *dg_gl_context_new(DgGLPlatform *p, DgGLContext *share,
-                                Error **errp)
-{
+DgGLContext *dg_gl_context_new(DgGLPlatform *p, DgGLContext *share, Error **errp) {
     DgGLContext *c = g_new0(DgGLContext, 1);
 
     if (p->next_context_serial == UINT64_MAX) {
@@ -294,8 +309,7 @@ DgGLContext *dg_gl_context_new(DgGLPlatform *p, DgGLContext *share,
     }
 #endif
     DreamGpuTextureMemory memory = texture_memory(p);
-    if (dreamgpu_context_state_init(&memory, &c->state,
-                                   share ? share->state.textures : NULL)) {
+    if (dreamgpu_context_state_init(&memory, &c->state, share ? share->state.textures : NULL)) {
         error_setg(errp, "Allocating bounded context texture state failed");
         dg_gl_context_free(c);
         return NULL;
@@ -303,8 +317,7 @@ DgGLContext *dg_gl_context_new(DgGLPlatform *p, DgGLContext *share,
     return c;
 }
 
-void dg_gl_context_free(DgGLContext *c)
-{
+void dg_gl_context_free(DgGLContext *c) {
     if (!c || !g_atomic_ref_count_dec(&c->refs)) {
         return;
     }
@@ -320,8 +333,7 @@ void dg_gl_context_free(DgGLContext *c)
         CGLSetCurrentContext(c->render);
         dgDeleteFramebuffers(1, &c->framebuffer);
     }
-    CGLSetCurrentContext(previous == c->render || previous == c->completion ?
-                         NULL : previous);
+    CGLSetCurrentContext(previous == c->render || previous == c->completion ? NULL : previous);
     if (c->completion) {
         CGLDestroyContext(c->completion);
     }
@@ -331,20 +343,18 @@ void dg_gl_context_free(DgGLContext *c)
 #else
     EGLContext previous = eglGetCurrentContext();
     eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                    c->render != EGL_NO_CONTEXT ?
-                    c->render : c->platform->root);
+                   c->render != EGL_NO_CONTEXT ? c->render : c->platform->root);
     if (c->in_begin) {
         glEnd();
     }
     DreamGpuTextureMemory memory = texture_memory(c->platform);
     dreamgpu_context_state_release(&memory, &c->state);
     if (c->framebuffer) {
-        eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        c->render);
+        eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE, c->render);
         dgDeleteFramebuffers(1, &c->framebuffer);
     }
     eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                    previous == c->render ? EGL_NO_CONTEXT : previous);
+                   previous == c->render ? EGL_NO_CONTEXT : previous);
     if (c->render != EGL_NO_CONTEXT) {
         eglDestroyContext(c->platform->display, c->render);
     }
@@ -352,9 +362,7 @@ void dg_gl_context_free(DgGLContext *c)
     g_free(c);
 }
 
-DgGLDrawable *dg_gl_drawable_new(DgGLPlatform *p, uint32_t width,
-                                  uint32_t height, Error **errp)
-{
+DgGLDrawable *dg_gl_drawable_new(DgGLPlatform *p, uint32_t width, uint32_t height, Error **errp) {
     DgGLDrawable *d = g_new0(DgGLDrawable, 1);
 
     d->platform = p;
@@ -375,13 +383,11 @@ DgGLDrawable *dg_gl_drawable_new(DgGLPlatform *p, uint32_t width,
     return d;
 }
 
-void dg_gl_flush_drawable(DgGLDrawable *d)
-{
+void dg_gl_flush_drawable(DgGLDrawable *d) {
     dreamgpu_drawable_flush(&d->platform->gl_api, &d->gpu);
 }
 
-void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d)
-{
+void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d) {
     if (!d) {
         return;
     }
@@ -395,14 +401,11 @@ void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d)
     g_free(d);
 }
 
-void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d)
-{
-    dreamgpu_drawable_exchange(&c->platform->gl_api, &d->gpu,
-                               c->framebuffer, &c->state);
+void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d) {
+    dreamgpu_drawable_exchange(&c->platform->gl_api, &d->gpu, c->framebuffer, &c->state);
 }
 
-bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp)
-{
+bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp) {
 #ifdef CONFIG_DARWIN
     CGLError err = CGLSetCurrentContext(c->render);
     if (err != kCGLNoError) {
@@ -410,8 +413,7 @@ bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp)
         return false;
     }
 #else
-    if (!eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                         c->render)) {
+    if (!eglMakeCurrent(c->platform->display, EGL_NO_SURFACE, EGL_NO_SURFACE, c->render)) {
         error_setg(errp, "EGL make current: 0x%x", eglGetError());
         return false;
     }
@@ -423,8 +425,8 @@ bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp)
         }
         return true;
     }
-    if (dreamgpu_drawable_bind(&c->platform->gl_api, &d->gpu,
-                               &c->framebuffer, &c->initialized, &c->state)) {
+    if (dreamgpu_drawable_bind(&c->platform->gl_api, &d->gpu, &c->framebuffer, &c->initialized,
+                               &c->state)) {
         error_setg(errp, "Internal drawable framebuffer is incomplete");
         return false;
     }
@@ -432,113 +434,100 @@ bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp)
     return true;
 }
 
-static void *host_texture_allocate(void *opaque, size_t bytes)
-{
+static void *host_texture_allocate(void *opaque, size_t bytes) {
     /* Rust initializes each object or copies the entire immutable payload. */
     return g_try_malloc(bytes);
 }
 
-static void host_texture_free(void *opaque, void *object)
-{
+static void host_texture_free(void *opaque, void *object) {
     g_free(object);
 }
 
-static void host_texture_forget_read(void *opaque, DreamGpuTexture *texture)
-{
+static void host_texture_forget_read(void *opaque, DreamGpuTexture *texture) {
     DgGLPlatform *p = opaque;
     DreamGpuTextureMemory memory = texture_memory(p);
     dreamgpu_read_cache_forget(&memory, &p->read_cache, texture);
 }
 
-static DreamGpuTextureMemory texture_memory(DgGLPlatform *p)
-{
-    return (DreamGpuTextureMemory) {
-        .api = &p->gl_api, .bytes = &p->texture_bytes, .count = &p->texture_count,
-        .opaque = p, .allocate = host_texture_allocate, .free = host_texture_free,
+static DreamGpuTextureMemory texture_memory(DgGLPlatform *p) {
+    return (DreamGpuTextureMemory){
+        .api = &p->gl_api,
+        .bytes = &p->texture_bytes,
+        .count = &p->texture_count,
+        .opaque = p,
+        .allocate = host_texture_allocate,
+        .free = host_texture_free,
         .forget_read = host_texture_forget_read,
     };
 }
 
-static DgTexture *bound_texture(DgGLContext *c, GLenum target)
-{
+static DgTexture *bound_texture(DgGLContext *c, GLenum target) {
     return target == GL_TEXTURE_1D ? c->state.bound_texture_1d : c->state.bound_texture;
 }
 
-static uint32_t copy_texture(DgGLContext *c, uint32_t fn, const uint8_t *args)
-{
+static uint32_t copy_texture(DgGLContext *c, uint32_t fn, const uint8_t *args) {
     return dreamgpu_texture_copy(&c->platform->gl_api, c->state.bound_texture,
-                                  &c->platform->texture_bytes,
-                                  &c->state.guest_errors, c->serial,
-                                  c->drawable != NULL, fn, args);
+                                 &c->platform->texture_bytes, &c->state.guest_errors, c->serial,
+                                 c->drawable != NULL, fn, args);
 }
 
-uint32_t dg_gl_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args,
-                          const uint8_t *data, uint32_t bytes)
-{
+uint32_t dg_gl_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args, const uint8_t *data,
+                         uint32_t bytes) {
     DreamGpuTextureMemory memory = texture_memory(c->platform);
-    return dreamgpu_gl_data(&memory, &c->state, c->in_begin, c->serial,
-                             fn, args, data, bytes);
+    return dreamgpu_gl_data(&memory, &c->state, c->in_begin, c->serial, fn, args, data, bytes);
 }
 
-bool dg_gl_context_in_begin(DgGLContext *c)
-{
+bool dg_gl_context_in_begin(DgGLContext *c) {
     return c->in_begin;
 }
 
-static uint32_t host_texture_read(void *opaque, uint32_t target,
-                                  uint32_t level, uint32_t first,
-                                  uint32_t capacity, uint8_t *result)
-{
+static uint32_t host_texture_read(void *opaque, uint32_t target, uint32_t level, uint32_t first,
+                                  uint32_t capacity, uint8_t *result) {
     DgGLContext *c = opaque;
     DreamGpuTextureMemory memory = texture_memory(c->platform);
-    return dreamgpu_texture_read(&memory, &c->platform->read_cache,
-                                  bound_texture(c, target),
-                                  &c->state.guest_errors, c->serial,
-                                  target, level, first, capacity, result);
+    return dreamgpu_texture_read(&memory, &c->platform->read_cache, bound_texture(c, target),
+                                 &c->state.guest_errors, c->serial, target, level, first, capacity,
+                                 result);
 }
 
-uint32_t dg_gl_query(DgGLContext *c, uint32_t fn, const uint8_t *args,
-                     uint8_t *result, uint32_t capacity, uint32_t *bytes,
-                     uint32_t *type)
-{
+uint32_t dg_gl_query(DgGLContext *c, uint32_t fn, const uint8_t *args, uint8_t *result,
+                     uint32_t capacity, uint32_t *bytes, uint32_t *type) {
     /* Stack snapshot is disjoint from callback-owned context/cache storage. */
     const DreamGpuQueryState state = {
-        .in_begin = c->in_begin, .has_drawable = c->drawable != NULL,
+        .in_begin = c->in_begin,
+        .has_drawable = c->drawable != NULL,
         .width = c->drawable ? c->drawable->gpu.width : 0,
         .height = c->drawable ? c->drawable->gpu.height : 0,
-        .draw_buffer = c->state.draw_buffer, .read_buffer = c->state.read_buffer,
+        .draw_buffer = c->state.draw_buffer,
+        .read_buffer = c->state.read_buffer,
         .binding_1d = c->state.bound_texture_1d->guest_name,
         .binding_2d = c->state.bound_texture->guest_name,
-        .attrib_depth = c->state.attrib_depth, .textures = c->state.textures,
+        .attrib_depth = c->state.attrib_depth,
+        .textures = c->state.textures,
     };
-    return dreamgpu_gl_query(&c->platform->gl_api, &state, &c->state.guest_errors,
-                              fn, args, result, capacity, host_texture_read, c,
-                              bytes, type);
+    return dreamgpu_gl_query(&c->platform->gl_api, &state, &c->state.guest_errors, fn, args, result,
+                             capacity, host_texture_read, c, bytes, type);
 }
 
 /* Remaining resource-side operations; scalar GL execution is Rust-owned. */
-static uint32_t host_copy_texture(void *opaque, uint32_t fn, const uint8_t *args)
-{
+static uint32_t host_copy_texture(void *opaque, uint32_t fn, const uint8_t *args) {
     return copy_texture(opaque, fn, args);
 }
 
-static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args)
-{
+static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args) {
     DgGLContext *c = opaque;
     DreamGpuTextureMemory memory = texture_memory(c->platform);
     return dreamgpu_context_resource(&memory, &c->state, c->serial, fn, args,
-                                     dg_gl_function_words(fn) * 4,
-                                     host_copy_texture, c);
+                                     dg_gl_function_words(fn) * 4, host_copy_texture, c);
 }
 
-uint32_t dg_gl_call(DgGLContext *c, uint32_t fn, const uint8_t *args)
-{
+uint32_t dg_gl_call(DgGLContext *c, uint32_t fn, const uint8_t *args) {
     uint32_t words = dg_gl_function_words(fn);
     if (words > 32) {
         return DG_GL_ERROR_UNSUPPORTED;
     }
-    return dreamgpu_gl_scalar(&c->platform->gl_api, &c->in_begin,
-                              scalar_resource, c, fn, args, words * 4);
+    return dreamgpu_gl_scalar(&c->platform->gl_api, &c->in_begin, scalar_resource, c, fn, args,
+                              words * 4);
 }
 
 typedef struct DgImageCall {
@@ -546,8 +535,7 @@ typedef struct DgImageCall {
     Error **errp;
 } DgImageCall;
 
-static uint32_t image_create(void *opaque, DreamGpuNativeImage *image)
-{
+static uint32_t image_create(void *opaque, DreamGpuNativeImage *image) {
     DgImageCall *call = opaque;
     DgGLPlatform *p G_GNUC_UNUSED = call->platform;
     Error **errp = call->errp;
@@ -558,11 +546,10 @@ static uint32_t image_create(void *opaque, DreamGpuNativeImage *image)
     CFNumberRef hn = CFNumberCreate(NULL, kCFNumberSInt64Type, &h);
     CFNumberRef bn = CFNumberCreate(NULL, kCFNumberSInt64Type, &bpp);
     CFNumberRef fn = CFNumberCreate(NULL, kCFNumberSInt64Type, &format);
-    const void *keys[] = { kIOSurfaceWidth, kIOSurfaceHeight,
-                           kIOSurfaceBytesPerElement, kIOSurfacePixelFormat };
-    const void *values[] = { wn, hn, bn, fn };
-    CFDictionaryRef dict = CFDictionaryCreate(NULL, keys, values, 4,
-                                              &kCFTypeDictionaryKeyCallBacks,
+    const void *keys[] = {kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement,
+                          kIOSurfacePixelFormat};
+    const void *values[] = {wn, hn, bn, fn};
+    CFDictionaryRef dict = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks,
                                               &kCFTypeDictionaryValueCallBacks);
 
     image->surface = IOSurfaceCreate(dict);
@@ -578,11 +565,10 @@ static uint32_t image_create(void *opaque, DreamGpuNativeImage *image)
     image->stride = IOSurfaceGetBytesPerRow(image->surface);
 #else
     image->fd = image->fence_fd = -1;
-    const uint64_t modifiers[] = { DRM_FORMAT_MOD_LINEAR };
+    const uint64_t modifiers[] = {DRM_FORMAT_MOD_LINEAR};
 
-    image->bo = gbm_bo_create_with_modifiers2(p->gbm, width, height,
-                                              GBM_FORMAT_ARGB8888, modifiers, 1,
-                                              GBM_BO_USE_RENDERING);
+    image->bo = gbm_bo_create_with_modifiers2(p->gbm, width, height, GBM_FORMAT_ARGB8888, modifiers,
+                                              1, GBM_BO_USE_RENDERING);
     if (!image->bo || gbm_bo_get_plane_count(image->bo) != 1) {
         error_setg(errp, "A single-plane BGRA GBM export buffer is required");
         return DG_GL_ERROR_HOST;
@@ -596,26 +582,31 @@ static uint32_t image_create(void *opaque, DreamGpuNativeImage *image)
         return DG_GL_ERROR_HOST;
     }
     const EGLint attrs[] = {
-        EGL_WIDTH, width, EGL_HEIGHT, height,
-        EGL_LINUX_DRM_FOURCC_EXT, DRM_FORMAT_ARGB8888,
-        EGL_DMA_BUF_PLANE0_FD_EXT, image->fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, image->offset,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, image->stride,
+        EGL_WIDTH,
+        width,
+        EGL_HEIGHT,
+        height,
+        EGL_LINUX_DRM_FOURCC_EXT,
+        DRM_FORMAT_ARGB8888,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        image->fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        image->offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        image->stride,
         EGL_NONE,
     };
-    image->native_image = eglCreateImageKHR(p->display, EGL_NO_CONTEXT,
-                                    EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
+    image->native_image =
+        eglCreateImageKHR(p->display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, attrs);
     if (image->native_image == EGL_NO_IMAGE_KHR) {
-        error_setg(errp, "Importing DMA-BUF to EGL failed: 0x%x",
-                    eglGetError());
+        error_setg(errp, "Importing DMA-BUF to EGL failed: 0x%x", eglGetError());
         return DG_GL_ERROR_HOST;
     }
 #endif
     return 0;
 }
 
-static void image_destroy(void *opaque, DreamGpuNativeImage *image)
-{
+static void image_destroy(void *opaque, DreamGpuNativeImage *image) {
     DgImageCall *call = opaque;
     DgGLPlatform *p G_GNUC_UNUSED = call->platform;
 #ifdef CONFIG_DARWIN
@@ -647,24 +638,21 @@ static void image_destroy(void *opaque, DreamGpuNativeImage *image)
 #endif
 }
 
-DgGLImage *dg_gl_image_new(DgGLPlatform *p, uint32_t width, uint32_t height,
-                            Error **errp)
-{
+DgGLImage *dg_gl_image_new(DgGLPlatform *p, uint32_t width, uint32_t height, Error **errp) {
     DreamGpuTextureMemory memory = texture_memory(p);
-    DgImageCall call = { .platform = p, .errp = errp };
+    DgImageCall call = {.platform = p, .errp = errp};
     uint32_t error;
-    DgGLImage *image = dreamgpu_image_new(&memory, width, height, image_create,
-                                          image_destroy, &call, &error);
+    DgGLImage *image =
+        dreamgpu_image_new(&memory, width, height, image_create, image_destroy, &call, &error);
     if (error && errp && !*errp) {
         error_setg(errp, "Allocating native image owner failed: %u", error);
     }
     return image;
 }
 
-void dg_gl_image_free(DgGLPlatform *p, DgGLImage *image)
-{
+void dg_gl_image_free(DgGLPlatform *p, DgGLImage *image) {
     DreamGpuTextureMemory memory = texture_memory(p);
-    DgImageCall call = { .platform = p };
+    DgImageCall call = {.platform = p};
     dreamgpu_image_free(&memory, image, image_destroy, &call);
 }
 
@@ -675,16 +663,12 @@ typedef struct DgExportCall {
     Error **errp;
 } DgExportCall;
 
-static uint32_t export_bind(void *opaque)
-{
+static uint32_t export_bind(void *opaque) {
     DgExportCall *call = opaque;
 #ifdef CONFIG_DARWIN
-    CGLError err = CGLTexImageIOSurface2D(call->context->render,
-                                         GL_TEXTURE_RECTANGLE_ARB, GL_RGBA8,
-                                         call->drawable->gpu.width,
-                                         call->drawable->gpu.height, GL_BGRA,
-                                         GL_UNSIGNED_INT_8_8_8_8_REV,
-                                         call->image->surface, 0);
+    CGLError err = CGLTexImageIOSurface2D(
+        call->context->render, GL_TEXTURE_RECTANGLE_ARB, GL_RGBA8, call->drawable->gpu.width,
+        call->drawable->gpu.height, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, call->image->surface, 0);
     if (err != kCGLNoError) {
         error_setg(call->errp, "Binding IOSurface to GL: %s", CGLErrorString(err));
         return DG_GL_ERROR_HOST;
@@ -695,8 +679,7 @@ static uint32_t export_bind(void *opaque)
     return 0;
 }
 
-static uint32_t export_fence(void *opaque)
-{
+static uint32_t export_fence(void *opaque) {
     DgExportCall *call = opaque;
     DgGLContext *c = call->context;
     DgGLImage *image = call->image;
@@ -713,8 +696,7 @@ static uint32_t export_fence(void *opaque)
     }
     glFlush();
 #else
-    EGLSyncKHR fence = eglCreateSyncKHR(c->platform->display,
-                                       EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
+    EGLSyncKHR fence = eglCreateSyncKHR(c->platform->display, EGL_SYNC_NATIVE_FENCE_ANDROID, NULL);
     glFlush();
     if (image->fence_fd >= 0) {
         close(image->fence_fd);
@@ -729,18 +711,14 @@ static uint32_t export_fence(void *opaque)
     return 0;
 }
 
-bool dg_gl_export(DgGLContext *c, DgGLDrawable *d, DgGLImage *image,
-                    bool exchange, Error **errp)
-{
-    DgExportCall call = { .context = c, .drawable = d, .image = image,
-                          .errp = errp };
+bool dg_gl_export(DgGLContext *c, DgGLDrawable *d, DgGLImage *image, bool exchange, Error **errp) {
+    DgExportCall call = {.context = c, .drawable = d, .image = image, .errp = errp};
     uint32_t rectangle = 0;
 #ifdef CONFIG_DARWIN
     rectangle = 1;
 #endif
-    uint32_t error = dreamgpu_export(&c->platform->gl_api, &d->gpu, &c->state,
-                                      c->framebuffer, exchange, rectangle,
-                                      export_bind, export_fence, &call);
+    uint32_t error = dreamgpu_export(&c->platform->gl_api, &d->gpu, &c->state, c->framebuffer,
+                                     exchange, rectangle, export_bind, export_fence, &call);
     if (error && errp && !*errp) {
         error_setg(errp, "Export framebuffer transaction failed: %u", error);
     }
@@ -748,25 +726,21 @@ bool dg_gl_export(DgGLContext *c, DgGLDrawable *d, DgGLImage *image,
 }
 
 #ifdef CONFIG_DARWIN
-static int64_t export_clock(void *opaque)
-{
+static int64_t export_clock(void *opaque) {
     return g_get_monotonic_time();
 }
 
-static void export_sleep(void *opaque, uint64_t microseconds)
-{
+static void export_sleep(void *opaque, uint64_t microseconds) {
     g_usleep(microseconds);
 }
 #endif
 
-bool dg_gl_image_ready(DgGLImage *image, Error **errp)
-{
+bool dg_gl_image_ready(DgGLImage *image, Error **errp) {
 #ifdef CONFIG_DARWIN
     DgGLContext *context = image->context;
     CGLSetCurrentContext(context->completion);
-    uint32_t result = dreamgpu_export_wait(&context->platform->gl_api,
-                                            image->fence, export_clock,
-                                            export_sleep, NULL);
+    uint32_t result = dreamgpu_export_wait(&context->platform->gl_api, image->fence, export_clock,
+                                           export_sleep, NULL);
     image->fence = NULL;
     CGLSetCurrentContext(NULL);
     if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) {
@@ -777,16 +751,14 @@ bool dg_gl_image_ready(DgGLImage *image, Error **errp)
     return true;
 }
 
-void dg_gl_image_metadata(DgGLImage *image, uint32_t *stride,
-                            uint32_t *offset, uint64_t *modifier)
-{
+void dg_gl_image_metadata(DgGLImage *image, uint32_t *stride, uint32_t *offset,
+                          uint64_t *modifier) {
     *stride = image->stride;
     *offset = image->offset;
     *modifier = image->modifier;
 }
 
-uint32_t dg_gl_image_port(DgGLImage *image)
-{
+uint32_t dg_gl_image_port(DgGLImage *image) {
 #ifdef CONFIG_DARWIN
     return IOSurfaceCreateMachPort(image->surface);
 #else
@@ -794,8 +766,7 @@ uint32_t dg_gl_image_port(DgGLImage *image)
 #endif
 }
 
-int dg_gl_image_fd(DgGLImage *image)
-{
+int dg_gl_image_fd(DgGLImage *image) {
 #ifdef CONFIG_DARWIN
     return -1;
 #else
@@ -803,8 +774,7 @@ int dg_gl_image_fd(DgGLImage *image)
 #endif
 }
 
-int dg_gl_image_fence_fd(DgGLImage *image)
-{
+int dg_gl_image_fence_fd(DgGLImage *image) {
 #ifdef CONFIG_DARWIN
     return -1;
 #else

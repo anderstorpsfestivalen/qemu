@@ -385,3 +385,6 @@ option('rust', type: 'feature', value: 'disabled',
        description: 'Rust support')
 option('strict_rust_lints', type: 'boolean', value: false,
        description: 'Enable stricter set of Rust warnings')
+
+option('dreamgpu_rustc', type: 'string', value: 'rustc',
+       description: 'Rust compiler for the DreamGPU host engine')

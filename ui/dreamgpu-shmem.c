@@ -43,10 +43,10 @@
 #endif
 
 /* Input event types - must match Rust side */
-#define DREAMGPU_INPUT_MOUSE_REL    1
-#define DREAMGPU_INPUT_MOUSE_ABS    2
-#define DREAMGPU_INPUT_MOUSE_BTN    3
-#define DREAMGPU_INPUT_KEY          4
+#define DREAMGPU_INPUT_MOUSE_REL 1
+#define DREAMGPU_INPUT_MOUSE_ABS 2
+#define DREAMGPU_INPUT_MOUSE_BTN 3
+#define DREAMGPU_INPUT_KEY 4
 #define DREAMGPU_INPUT_REFRESH_INTERVAL_MS 1
 #define DREAMGPU_INPUT_REFRESH_WINDOW_US 12000
 
@@ -101,8 +101,9 @@ G_STATIC_ASSERT(sizeof(DreamGpuInputEvent) == 24);
 G_STATIC_ASSERT(sizeof(DreamGpuMessage) == 24);
 G_STATIC_ASSERT(sizeof(DreamGpuShmemHeader) == 96);
 G_STATIC_ASSERT(sizeof(DreamGpuFrameMeta) == 16440);
-#define DREAMGPU_PIXEL_BASE QEMU_ALIGN_UP(sizeof(DreamGpuShmemHeader) + \
-    DREAMGPU_SLOT_COUNT * sizeof(DreamGpuFrameMeta), DREAMGPU_PLANE_ALIGNMENT)
+#define DREAMGPU_PIXEL_BASE                                                                        \
+    QEMU_ALIGN_UP(sizeof(DreamGpuShmemHeader) + DREAMGPU_SLOT_COUNT * sizeof(DreamGpuFrameMeta),   \
+                  DREAMGPU_PLANE_ALIGNMENT)
 G_STATIC_ASSERT(DREAMGPU_PIXEL_BASE == 65536);
 
 typedef struct DreamGpuShmemState {
@@ -136,9 +137,7 @@ typedef struct DreamGpuShmemState {
 /* The configured display has one default console. All access is under BQL. */
 static DreamGpuShmemState *dreamgpu_active_display;
 
-bool dreamgpu_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch,
-                           uint64_t *generation)
-{
+bool dreamgpu_shmem_cpu_anchor(QemuConsole *con, uint64_t *epoch, uint64_t *generation) {
     DreamGpuShmemState *s = dreamgpu_active_display;
 
     if (!s || s->dcl.con != con || !s->shmem) {
@@ -157,15 +156,13 @@ static void dreamgpu_shmem_input_ready(void *opaque);
 static void dreamgpu_shmem_ack_ready(void *opaque);
 static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s);
 
-static uint64_t dreamgpu_now_us(void)
-{
+static uint64_t dreamgpu_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
-static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all)
-{
+static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all) {
     for (int i = 0; i < 256; i++) {
         if (s->held_keys[i] || (all && qemu_input_key_number_to_linux(i))) {
             qemu_input_event_send_key_number(s->dcl.con, i, false);
@@ -181,8 +178,7 @@ static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all)
     qemu_input_event_sync();
 }
 
-static void dreamgpu_shmem_disconnect(DreamGpuShmemState *s)
-{
+static void dreamgpu_shmem_disconnect(DreamGpuShmemState *s) {
     if (s->client_fd >= 0) {
         qemu_set_fd_handler(s->client_fd, NULL, NULL, NULL);
         close(s->client_fd);
@@ -195,12 +191,13 @@ static void dreamgpu_shmem_disconnect(DreamGpuShmemState *s)
     dreamgpu_shmem_release_input(s, false);
 }
 
-static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind,
-                              uint64_t id, uint64_t timestamp)
-{
-    DreamGpuMessage msg = { .kind = kind, .id = id, .timestamp_us = timestamp };
+static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind, uint64_t id,
+                                  uint64_t timestamp) {
+    DreamGpuMessage msg = {.kind = kind, .id = id, .timestamp_us = timestamp};
     /* Reserved byte carries key edge for causal probe pairing. */
-    if (kind == 'A') { msg.padding[0] = s->input_bytes[0] == DREAMGPU_INPUT_KEY ? (s->input_bytes[2] ? 1 : 2) : 0; }
+    if (kind == 'A') {
+        msg.padding[0] = s->input_bytes[0] == DREAMGPU_INPUT_KEY ? (s->input_bytes[2] ? 1 : 2) : 0;
+    }
     if (s->client_fd < 0 || !s->fd_sent) {
         return;
     }
@@ -210,8 +207,8 @@ static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind,
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         if (kind == 'A' && (id & (1ULL << 63))) {
             s->deferred_ack = msg;
-            qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready,
-                                dreamgpu_shmem_ack_ready, s);
+            qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready, dreamgpu_shmem_ack_ready,
+                                s);
         }
         return;
     }
@@ -220,15 +217,13 @@ static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind,
     }
 }
 
-static void dreamgpu_shmem_ack_ready(void *opaque)
-{
+static void dreamgpu_shmem_ack_ready(void *opaque) {
     DreamGpuShmemState *s = opaque;
 
     if (s->deferred_ack.kind) {
-        ssize_t n = send(s->client_fd, &s->deferred_ack,
-                         sizeof(s->deferred_ack), MSG_DONTWAIT | MSG_NOSIGNAL);
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
-                     errno == EINTR)) {
+        ssize_t n = send(s->client_fd, &s->deferred_ack, sizeof(s->deferred_ack),
+                         MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
             return;
         }
         if (n != sizeof(s->deferred_ack)) {
@@ -242,16 +237,13 @@ static void dreamgpu_shmem_ack_ready(void *opaque)
 }
 
 /* Return 1 for sent, 0 for backpressure, -1 for a disconnected stream. */
-static int dreamgpu_shmem_cursor_send(DreamGpuShmemState *s, const uint8_t *packet,
-                                   int fd)
-{
+static int dreamgpu_shmem_cursor_send(DreamGpuShmemState *s, const uint8_t *packet, int fd) {
     union {
         struct cmsghdr align;
         uint8_t bytes[CMSG_SPACE(sizeof(int))];
-    } control = { 0 };
-    struct iovec iov = { .iov_base = (void *)packet,
-                         .iov_len = DG_CURSOR_TRANSPORT_PACKET_BYTES };
-    struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
+    } control = {0};
+    struct iovec iov = {.iov_base = (void *)packet, .iov_len = DG_CURSOR_TRANSPORT_PACKET_BYTES};
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1};
 
     if (fd >= 0) {
         msg.msg_control = control.bytes;
@@ -273,8 +265,7 @@ static int dreamgpu_shmem_cursor_send(DreamGpuShmemState *s, const uint8_t *pack
     return 1;
 }
 
-static void dreamgpu_shmem_cursor_new_mapping(DreamGpuShmemState *s)
-{
+static void dreamgpu_shmem_cursor_new_mapping(DreamGpuShmemState *s) {
     if (s->cursor_shmem) {
         qemu_memfd_free(s->cursor_shmem, DG_CURSOR_TRANSPORT_MAPPING_BYTES, s->cursor_fd);
     }
@@ -289,8 +280,7 @@ static void dreamgpu_shmem_cursor_new_mapping(DreamGpuShmemState *s)
     memset(s->cursor_shmem, 0, DG_CURSOR_TRANSPORT_MAPPING_BYTES);
     stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_MAGIC, DG_CURSOR_TRANSPORT_MAGIC);
     stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_VERSION, DG_CURSOR_TRANSPORT_VERSION);
-    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_MAX_DIMENSION,
-              DG_CURSOR_MAX_DIMENSION);
+    stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_MAX_DIMENSION, DG_CURSOR_MAX_DIMENSION);
     stl_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_SLOT_COUNT, DG_CURSOR_TRANSPORT_SLOT_COUNT);
     stq_le_p(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_EPOCH, ++s->cursor_epoch);
     s->cursor_generation = 0;
@@ -300,9 +290,8 @@ static void dreamgpu_shmem_cursor_new_mapping(DreamGpuShmemState *s)
     s->cursor_position_dirty = true;
 }
 
-static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s)
-{
-    uint8_t packet[DG_CURSOR_TRANSPORT_PACKET_BYTES] = { 0 };
+static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s) {
+    uint8_t packet[DG_CURSOR_TRANSPORT_PACKET_BYTES] = {0};
     bool writable = false;
     int sent;
 
@@ -323,8 +312,7 @@ static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s)
     if (s->cursor_shape_dirty) {
         bool published = false;
         for (unsigned i = 0; i < DG_CURSOR_TRANSPORT_SLOT_COUNT; i++) {
-            uint32_t *state = (uint32_t *)(s->cursor_shmem +
-                                          DG_CURSOR_TRANSPORT_HDR_SLOTS + i * 4);
+            uint32_t *state = (uint32_t *)(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_SLOTS + i * 4);
             uint32_t old = qatomic_load_acquire(state);
             if ((old == DG_CURSOR_TRANSPORT_FREE || old == DG_CURSOR_TRANSPORT_READY) &&
                 qatomic_cmpxchg(state, old, DG_CURSOR_TRANSPORT_WRITING) == old) {
@@ -340,15 +328,16 @@ static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s)
                 stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_HOT_Y, c->hot_y);
                 stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_FORMAT, c->format);
                 stq_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_POSITION_SEQUENCE,
-                          s->cursor_position_sequence);
+                         s->cursor_position_sequence);
                 stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_X, c->x);
                 stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_Y, c->y);
                 stl_le_p(slot + DG_CURSOR_TRANSPORT_SLOT_FLAGS, c->flags);
                 memcpy(slot + DG_CURSOR_TRANSPORT_SLOT_PIXELS, c->pixels,
-                        c->width * c->height * DG_CURSOR_PIXEL_BYTES);
+                       c->width * c->height * DG_CURSOR_PIXEL_BYTES);
                 qatomic_store_release(state, DG_CURSOR_TRANSPORT_READY);
-                qatomic_store_release((uint64_t *)(s->cursor_shmem +
-                                      DG_CURSOR_TRANSPORT_HDR_GENERATION), s->cursor_generation);
+                qatomic_store_release(
+                    (uint64_t *)(s->cursor_shmem + DG_CURSOR_TRANSPORT_HDR_GENERATION),
+                    s->cursor_generation);
                 s->cursor_shape_dirty = false;
                 s->cursor_notify_shape = true;
                 published = true;
@@ -387,13 +376,12 @@ static void dreamgpu_shmem_cursor_publish(DreamGpuShmemState *s)
 out:
     if (s->client_fd >= 0) {
         qemu_set_fd_handler(s->client_fd, dreamgpu_shmem_input_ready,
-            writable || s->deferred_ack.kind ? dreamgpu_shmem_ack_ready : NULL, s);
+                            writable || s->deferred_ack.kind ? dreamgpu_shmem_ack_ready : NULL, s);
     }
 }
 
 void dreamgpu_shmem_native_cursor(QemuConsole *con, const DreamGpuNativeCursor *cursor,
-                              bool shape)
-{
+                                  bool shape) {
     DreamGpuShmemState *s = dreamgpu_active_display;
 
     if (!s || s->dcl.con != con) {
@@ -419,18 +407,15 @@ void dreamgpu_shmem_native_cursor(QemuConsole *con, const DreamGpuNativeCursor *
     dreamgpu_shmem_cursor_publish(s);
 }
 
-static DreamGpuFrameMeta *dreamgpu_shmem_slot(DreamGpuShmemState *s, int i)
-{
+static DreamGpuFrameMeta *dreamgpu_shmem_slot(DreamGpuShmemState *s, int i) {
     return (DreamGpuFrameMeta *)(s->shmem + 1) + i;
 }
 
-static uint8_t *dreamgpu_shmem_pixels(DreamGpuShmemState *s, int i)
-{
+static uint8_t *dreamgpu_shmem_pixels(DreamGpuShmemState *s, int i) {
     return (uint8_t *)s->shmem + DREAMGPU_PIXEL_BASE + i * s->plane_size;
 }
 
-static void dreamgpu_shmem_publish(DreamGpuShmemState *s)
-{
+static void dreamgpu_shmem_publish(DreamGpuShmemState *s) {
     if (s->cpu_anchor_pending) {
         /* Input can publish between refreshes. Refresh the VGA surface first,
          * so a ReturnCpu/reset anchor cannot match stale converted pixels. */
@@ -443,8 +428,8 @@ static void dreamgpu_shmem_publish(DreamGpuShmemState *s)
     for (int i = 0; i < 3; i++) {
         uint32_t state = __atomic_load_n(&s->shmem->slots[i], __ATOMIC_ACQUIRE);
         if ((state == DREAMGPU_SLOT_FREE || state == DREAMGPU_SLOT_READY) &&
-            __atomic_compare_exchange_n(&s->shmem->slots[i], &state,
-                DREAMGPU_SLOT_WRITING, false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            __atomic_compare_exchange_n(&s->shmem->slots[i], &state, DREAMGPU_SLOT_WRITING, false,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
             DreamGpuFrameMeta *frame = dreamgpu_shmem_slot(s, i);
             *frame = s->cursor;
             frame->generation = ++s->generation;
@@ -457,8 +442,8 @@ static void dreamgpu_shmem_publish(DreamGpuShmemState *s)
                 memcpy(pixels, source, row_bytes * s->shmem->height);
             } else {
                 for (uint32_t y = 0; y < s->shmem->height; y++) {
-                    memcpy(pixels + y * (size_t)s->shmem->stride,
-                           source + y * source_stride, row_bytes);
+                    memcpy(pixels + y * (size_t)s->shmem->stride, source + y * source_stride,
+                           row_bytes);
                 }
             }
             frame->published_us = dreamgpu_now_us();
@@ -472,8 +457,7 @@ static void dreamgpu_shmem_publish(DreamGpuShmemState *s)
     /* All slots are leased. Keep dirty and retry next display deadline. */
 }
 
-static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEvent *ev)
-{
+static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEvent *ev) {
     bool guest_wants_abs = qemu_input_is_absolute(s->dcl.con);
     if (ev->type == DREAMGPU_INPUT_RESET || ev->type == DREAMGPU_INPUT_REFRESH) {
         if (ev->type == DREAMGPU_INPUT_RESET) {
@@ -500,7 +484,7 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
         }
         s->held_buttons[ev->button] = ev->pressed;
     }
-        switch (ev->type) {
+    switch (ev->type) {
         case DREAMGPU_INPUT_MOUSE_REL:
             /* Mark mouse as initialized on first movement - this prevents
              * gfx_switch from resetting position to center */
@@ -510,16 +494,16 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
                 /* Convert relative to absolute */
                 s->mouse_x += ev->x;
                 s->mouse_y += ev->y;
-                if (s->mouse_x < 0) s->mouse_x = 0;
-                if (s->mouse_y < 0) s->mouse_y = 0;
+                if (s->mouse_x < 0)
+                    s->mouse_x = 0;
+                if (s->mouse_y < 0)
+                    s->mouse_y = 0;
                 if (s->mouse_x >= (int32_t)s->shmem->width)
                     s->mouse_x = s->shmem->width - 1;
                 if (s->mouse_y >= (int32_t)s->shmem->height)
                     s->mouse_y = s->shmem->height - 1;
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X,
-                    s->mouse_x, 0, s->shmem->width);
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y,
-                    s->mouse_y, 0, s->shmem->height);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X, s->mouse_x, 0, s->shmem->width);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y, s->mouse_y, 0, s->shmem->height);
             } else {
                 qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, ev->x);
                 qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, ev->y);
@@ -531,16 +515,16 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
                 /* Clamp to framebuffer bounds before sending to guest */
                 int32_t abs_x = ev->x;
                 int32_t abs_y = ev->y;
-                if (abs_x < 0) abs_x = 0;
-                if (abs_y < 0) abs_y = 0;
+                if (abs_x < 0)
+                    abs_x = 0;
+                if (abs_y < 0)
+                    abs_y = 0;
                 if (abs_x >= (int32_t)s->shmem->width)
                     abs_x = s->shmem->width - 1;
                 if (abs_y >= (int32_t)s->shmem->height)
                     abs_y = s->shmem->height - 1;
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X,
-                    abs_x, 0, s->shmem->width);
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y,
-                    abs_y, 0, s->shmem->height);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X, abs_x, 0, s->shmem->width);
+                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y, abs_y, 0, s->shmem->height);
                 s->mouse_x = abs_x;
                 s->mouse_y = abs_y;
             } else {
@@ -568,13 +552,12 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
             /* ev->x contains the scancode */
             qemu_input_event_send_key_number(s->dcl.con, ev->x, ev->pressed);
             break;
-        }
+    }
 
     qemu_input_event_sync();
     s->input_id = ev->id;
     dreamgpu_shmem_notify(s, 'A', ev->id, dreamgpu_now_us());
-    if (ev->type >= DREAMGPU_INPUT_MOUSE_REL &&
-        ev->type <= DREAMGPU_INPUT_KEY) {
+    if (ev->type >= DREAMGPU_INPUT_MOUSE_REL && ev->type <= DREAMGPU_INPUT_KEY) {
         /* Service guest display work promptly after interaction. This is a
          * bounded timer burst, not a polling loop; idle keeps monitor pacing. */
         s->input_refresh_until_us = dreamgpu_now_us() + DREAMGPU_INPUT_REFRESH_WINDOW_US;
@@ -584,8 +567,7 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
 
 /* Main-loop socket readiness wakes input independently of display refresh.
  * A bounded batch gives emulation and other devices a turn during floods. */
-static void dreamgpu_shmem_input_ready(void *opaque)
-{
+static void dreamgpu_shmem_input_ready(void *opaque) {
     DreamGpuShmemState *s = opaque;
     for (int count = 0; count < 256; count++) {
         ssize_t n = recv(s->client_fd, s->input_bytes + s->input_used,
@@ -613,9 +595,7 @@ static void dreamgpu_shmem_input_ready(void *opaque)
     }
 }
 
-static void dreamgpu_shmem_gfx_update(DisplayChangeListener *dcl,
-                                   int x, int y, int w, int h)
-{
+static void dreamgpu_shmem_gfx_update(DisplayChangeListener *dcl, int x, int y, int w, int h) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
     if (!s->shmem || !s->surface) {
@@ -626,9 +606,7 @@ static void dreamgpu_shmem_gfx_update(DisplayChangeListener *dcl,
     s->dirty = true;
 }
 
-static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl,
-                                   DisplaySurface *new_surface)
-{
+static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl, DisplaySurface *new_surface) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
     s->surface = new_surface;
@@ -654,8 +632,7 @@ static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl,
         return;
     }
     stride = QEMU_ALIGN_UP((size_t)w * 4, DREAMGPU_ROW_ALIGNMENT);
-    if ((size_t)h > SIZE_MAX / stride ||
-        stride * h > SIZE_MAX - (DREAMGPU_PLANE_ALIGNMENT - 1)) {
+    if ((size_t)h > SIZE_MAX / stride || stride * h > SIZE_MAX - (DREAMGPU_PLANE_ALIGNMENT - 1)) {
         s->surface = NULL;
         error_report("dreamgpu-shmem: display plane size overflow");
         return;
@@ -710,10 +687,14 @@ static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl,
         s->mouse_y = h / 2;
     } else {
         /* Clamp existing position to new resolution bounds */
-        if (s->mouse_x >= w) s->mouse_x = w - 1;
-        if (s->mouse_y >= h) s->mouse_y = h - 1;
-        if (s->mouse_x < 0) s->mouse_x = 0;
-        if (s->mouse_y < 0) s->mouse_y = 0;
+        if (s->mouse_x >= w)
+            s->mouse_x = w - 1;
+        if (s->mouse_y >= h)
+            s->mouse_y = h - 1;
+        if (s->mouse_x < 0)
+            s->mouse_x = 0;
+        if (s->mouse_y < 0)
+            s->mouse_y = 0;
     }
 
     if (s->client_fd >= 0) {
@@ -722,12 +703,10 @@ static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl,
     dreamgpu_shmem_publish(s);
 }
 
-static void dreamgpu_shmem_refresh(DisplayChangeListener *dcl)
-{
+static void dreamgpu_shmem_refresh(DisplayChangeListener *dcl) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
-    if (s->input_refresh_until_us &&
-        dreamgpu_now_us() >= s->input_refresh_until_us) {
+    if (s->input_refresh_until_us && dreamgpu_now_us() >= s->input_refresh_until_us) {
         s->input_refresh_until_us = 0;
         qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
     }
@@ -751,8 +730,7 @@ static void dreamgpu_shmem_refresh(DisplayChangeListener *dcl)
  * Handle cursor shape change from guest
  * Like Cocoa, we read from console cursor storage for reliability
  */
-static void dreamgpu_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor)
-{
+static void dreamgpu_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor *cursor) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
     QEMUCursor *con_cursor = qemu_console_get_cursor(dcl->con);
     s->cursor.cursor_width = con_cursor ? MIN(con_cursor->width, DREAMGPU_CURSOR_MAX_SIZE) : 0;
@@ -770,8 +748,7 @@ static void dreamgpu_shmem_cursor_define(DisplayChangeListener *dcl, QEMUCursor 
     s->dirty = true;
 }
 
-static void dreamgpu_shmem_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on)
-{
+static void dreamgpu_shmem_mouse_set(DisplayChangeListener *dcl, int x, int y, bool on) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
     s->cursor.cursor_x = x;
     s->cursor.cursor_y = y;
@@ -780,24 +757,23 @@ static void dreamgpu_shmem_mouse_set(DisplayChangeListener *dcl, int x, int y, b
 }
 
 static const DisplayChangeListenerOps dreamgpu_shmem_ops = {
-    .dpy_name          = "dreamgpu-shmem",
-    .dpy_gfx_update    = dreamgpu_shmem_gfx_update,
-    .dpy_gfx_switch    = dreamgpu_shmem_gfx_switch,
-    .dpy_refresh       = dreamgpu_shmem_refresh,
+    .dpy_name = "dreamgpu-shmem",
+    .dpy_gfx_update = dreamgpu_shmem_gfx_update,
+    .dpy_gfx_switch = dreamgpu_shmem_gfx_switch,
+    .dpy_refresh = dreamgpu_shmem_refresh,
     .dpy_cursor_define = dreamgpu_shmem_cursor_define,
-    .dpy_mouse_set     = dreamgpu_shmem_mouse_set,
+    .dpy_mouse_set = dreamgpu_shmem_mouse_set,
 };
 
 /* Send shared memory fd to client via SCM_RIGHTS */
-static void dreamgpu_shmem_send_fd(DreamGpuShmemState *s)
-{
+static void dreamgpu_shmem_send_fd(DreamGpuShmemState *s) {
     if (s->client_fd < 0 || s->shmem_fd < 0 || s->fd_sent) {
         return;
     }
 
     struct msghdr msg = {0};
     struct iovec iov[1];
-    DreamGpuMessage buf = { .kind = 'D' };
+    DreamGpuMessage buf = {.kind = 'D'};
 
     /* Ancillary data buffer for fd */
     char cmsgbuf[CMSG_SPACE(sizeof(int))];
@@ -827,8 +803,7 @@ static void dreamgpu_shmem_send_fd(DreamGpuShmemState *s)
 }
 
 /* Connect to DreamGPU's socket and send fd (silent on failure for retry) */
-static int dreamgpu_shmem_connect(DreamGpuShmemState *s)
-{
+static int dreamgpu_shmem_connect(DreamGpuShmemState *s) {
     if (!s->socket_path) {
         return -1;
     }
@@ -884,8 +859,7 @@ static int dreamgpu_shmem_connect(DreamGpuShmemState *s)
  * macOS: Use CVDisplayLink to detect actual monitor refresh rate
  * Linux: Use libdrm to query the active display mode refresh rate
  */
-static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s)
-{
+static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s) {
     int interval_ms = 0;
 
 #ifdef __APPLE__
@@ -931,7 +905,8 @@ static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s)
                         if (htotal > 0 && vtotal > 0 && clock > 0) {
                             int refresh_hz = (clock * 1000) / (htotal * vtotal);
                             int this_interval = 1000 / refresh_hz;
-                            if (this_interval > 0 && (interval_ms == 0 || this_interval < interval_ms)) {
+                            if (this_interval > 0 &&
+                                (interval_ms == 0 || this_interval < interval_ms)) {
                                 interval_ms = this_interval;
                             }
                         }
@@ -951,8 +926,8 @@ static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s)
 #endif
 
     if (interval_ms > 0 && interval_ms < 100) {
-        error_report("dreamgpu-shmem: using monitor refresh rate: %dms (~%dHz)",
-                    interval_ms, 1000 / interval_ms);
+        error_report("dreamgpu-shmem: using monitor refresh rate: %dms (~%dHz)", interval_ms,
+                     1000 / interval_ms);
         s->normal_refresh_ms = interval_ms;
     } else {
         /* Fallback: 8ms (~120Hz) - fast enough for any common display */
@@ -960,12 +935,9 @@ static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s)
         s->normal_refresh_ms = 8;
     }
     qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
-
-
 }
 
-static void dreamgpu_shmem_init(DisplayState *ds, DisplayOptions *opts)
-{
+static void dreamgpu_shmem_init(DisplayState *ds, DisplayOptions *opts) {
     DreamGpuShmemState *s = g_new0(DreamGpuShmemState, 1);
 
     s->dcl.con = qemu_console_lookup_default();
@@ -992,8 +964,7 @@ static QemuDisplay qemu_display_dreamgpu_shmem = {
     .init = dreamgpu_shmem_init,
 };
 
-static void register_dreamgpu_shmem(void)
-{
+static void register_dreamgpu_shmem(void) {
     qemu_display_register(&qemu_display_dreamgpu_shmem);
 }
 

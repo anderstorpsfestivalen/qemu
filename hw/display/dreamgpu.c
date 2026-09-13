@@ -72,18 +72,14 @@ struct DreamGpu {
 #endif
 };
 
-
-static void dg_update_irq(DreamGpu *s)
-{
+static void dg_update_irq(DreamGpu *s) {
     pci_set_irq(&s->parent_obj, !!(s->irq_enable & s->irq_status));
 }
 
-static void dg_complete(DreamGpu *s, uint32_t error)
-{
+static void dg_complete(DreamGpu *s, uint32_t error) {
     if (s->trace_start_us) {
         uint64_t elapsed = g_get_monotonic_time() - s->trace_start_us;
-        trace_dreamgpu_gpu_complete(s->active_sequence, error,
-                                     s->trace_chunks, elapsed);
+        trace_dreamgpu_gpu_complete(s->active_sequence, error, s->trace_chunks, elapsed);
     }
     s->error = error;
     s->status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
@@ -96,49 +92,42 @@ static void dg_complete(DreamGpu *s, uint32_t error)
 }
 
 /* QEMU owns RAM translation and DMA; Rust owns snapshot transactions. */
-static uint8_t *dg_snapshot_allocate(void *opaque, uint32_t bytes)
-{
+static uint8_t *dg_snapshot_allocate(void *opaque, uint32_t bytes) {
     return g_try_malloc(bytes);
 }
-static void dg_snapshot_free(void *opaque, uint8_t *data)
-{
+static void dg_snapshot_free(void *opaque, uint8_t *data) {
     g_free(data);
 }
-static uint32_t dg_snapshot_read(void *opaque, uint64_t address,
-                                 uint8_t *data, uint32_t bytes)
-{
+static uint32_t dg_snapshot_read(void *opaque, uint64_t address, uint8_t *data, uint32_t bytes) {
     DreamGpu *s = opaque;
     return pci_dma_read(&s->parent_obj, address, data, bytes) == MEMTX_OK;
 }
-static uint32_t dg_snapshot_ram(void *opaque, uint64_t address,
-                                uint32_t bytes, uint32_t write)
-{
+static uint32_t dg_snapshot_ram(void *opaque, uint64_t address, uint32_t bytes, uint32_t write) {
     DreamGpu *s = opaque;
     hwaddr translated, length = bytes;
     MemoryRegion *mr;
     RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(pci_get_address_space(&s->parent_obj),
-                                 address, &translated, &length, write,
-                                 MEMTXATTRS_UNSPECIFIED);
-    return length >= bytes && memory_region_is_ram(mr) &&
-           !memory_region_is_rom(mr);
+    mr = address_space_translate(pci_get_address_space(&s->parent_obj), address, &translated,
+                                 &length, write, MEMTXATTRS_UNSPECIFIED);
+    return length >= bytes && memory_region_is_ram(mr) && !memory_region_is_rom(mr);
 }
-static DreamGpuDeviceMemory dg_snapshot_memory(DreamGpu *s)
-{
-    return (DreamGpuDeviceMemory) {
-        s, dg_snapshot_allocate, dg_snapshot_free,
-        dg_snapshot_read, dg_snapshot_ram,
+static DreamGpuDeviceMemory dg_snapshot_memory(DreamGpu *s) {
+    return (DreamGpuDeviceMemory){
+        s, dg_snapshot_allocate, dg_snapshot_free, dg_snapshot_read, dg_snapshot_ram,
     };
 }
-static void dg_cursor_submit(DreamGpu *s, uint32_t operation)
-{
+static void dg_cursor_submit(DreamGpu *s, uint32_t operation) {
     DreamGpuDeviceMemory memory = dg_snapshot_memory(s);
     DreamGpuCursorRequest request = {
         .address = ((uint64_t)s->cursor_addr_hi << 32) | s->cursor_addr_lo,
-        .operation = operation, .flags = s->cursor_flags,
-        .bytes = s->cursor_bytes, .width = s->cursor_width,
-        .height = s->cursor_height, .hot_x = s->cursor_hot_x,
-        .hot_y = s->cursor_hot_y, .format = s->cursor_format,
+        .operation = operation,
+        .flags = s->cursor_flags,
+        .bytes = s->cursor_bytes,
+        .width = s->cursor_width,
+        .height = s->cursor_height,
+        .hot_x = s->cursor_hot_x,
+        .hot_y = s->cursor_hot_y,
+        .format = s->cursor_format,
     };
     uint32_t error = dreamgpu_device_cursor(&memory, &request, s->cursor.pixels);
     if (!error) {
@@ -152,85 +141,99 @@ static void dg_cursor_submit(DreamGpu *s, uint32_t operation)
         s->cursor.x = s->cursor_x;
         s->cursor.y = s->cursor_y;
         s->cursor.flags = s->cursor_flags;
-        dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor,
-                                     operation == DG_CURSOR_SHAPE);
+        dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor, operation == DG_CURSOR_SHAPE);
     }
     s->cursor_status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
     s->cursor_error = error;
     s->cursor_completed = s->cursor_sequence;
 }
 
-static uint32_t dg_cursor_read(DreamGpu *s, uint32_t reg)
-{
+static uint32_t dg_cursor_read(DreamGpu *s, uint32_t reg) {
     switch (reg) {
-    case DG_CURSOR_REG_VERSION: return DG_CURSOR_ABI_VERSION;
-    case DG_CURSOR_REG_ADDR_LO: return s->cursor_addr_lo;
-    case DG_CURSOR_REG_ADDR_HI: return s->cursor_addr_hi;
-    case DG_CURSOR_REG_BYTES: return s->cursor_bytes;
-    case DG_CURSOR_REG_WIDTH: return s->cursor_width;
-    case DG_CURSOR_REG_HEIGHT: return s->cursor_height;
-    case DG_CURSOR_REG_HOT_X: return s->cursor_hot_x;
-    case DG_CURSOR_REG_HOT_Y: return s->cursor_hot_y;
-    case DG_CURSOR_REG_FORMAT: return s->cursor_format;
-    case DG_CURSOR_REG_X: return s->cursor_x;
-    case DG_CURSOR_REG_Y: return s->cursor_y;
-    case DG_CURSOR_REG_FLAGS: return s->cursor_flags;
-    case DG_CURSOR_REG_SEQUENCE: return s->cursor_sequence;
-    case DG_CURSOR_REG_STATUS: return s->cursor_status;
-    case DG_CURSOR_REG_COMPLETED: return s->cursor_completed;
-    case DG_CURSOR_REG_ERROR: return s->cursor_error;
-    case DG_CURSOR_REG_MAX_DIMENSION: return DG_CURSOR_MAX_DIMENSION;
-    default: return 0;
+        case DG_CURSOR_REG_VERSION:
+            return DG_CURSOR_ABI_VERSION;
+        case DG_CURSOR_REG_ADDR_LO:
+            return s->cursor_addr_lo;
+        case DG_CURSOR_REG_ADDR_HI:
+            return s->cursor_addr_hi;
+        case DG_CURSOR_REG_BYTES:
+            return s->cursor_bytes;
+        case DG_CURSOR_REG_WIDTH:
+            return s->cursor_width;
+        case DG_CURSOR_REG_HEIGHT:
+            return s->cursor_height;
+        case DG_CURSOR_REG_HOT_X:
+            return s->cursor_hot_x;
+        case DG_CURSOR_REG_HOT_Y:
+            return s->cursor_hot_y;
+        case DG_CURSOR_REG_FORMAT:
+            return s->cursor_format;
+        case DG_CURSOR_REG_X:
+            return s->cursor_x;
+        case DG_CURSOR_REG_Y:
+            return s->cursor_y;
+        case DG_CURSOR_REG_FLAGS:
+            return s->cursor_flags;
+        case DG_CURSOR_REG_SEQUENCE:
+            return s->cursor_sequence;
+        case DG_CURSOR_REG_STATUS:
+            return s->cursor_status;
+        case DG_CURSOR_REG_COMPLETED:
+            return s->cursor_completed;
+        case DG_CURSOR_REG_ERROR:
+            return s->cursor_error;
+        case DG_CURSOR_REG_MAX_DIMENSION:
+            return DG_CURSOR_MAX_DIMENSION;
+        default:
+            return 0;
     }
 }
 
-static void dg_cursor_write(DreamGpu *s, uint32_t reg, uint32_t value)
-{
+static void dg_cursor_write(DreamGpu *s, uint32_t reg, uint32_t value) {
     switch (reg) {
-    case DG_CURSOR_REG_ADDR_LO:
-        s->cursor_addr_lo = value;
-        break;
-    case DG_CURSOR_REG_ADDR_HI:
-        s->cursor_addr_hi = value;
-        break;
-    case DG_CURSOR_REG_BYTES:
-        s->cursor_bytes = value;
-        break;
-    case DG_CURSOR_REG_WIDTH:
-        s->cursor_width = value;
-        break;
-    case DG_CURSOR_REG_HEIGHT:
-        s->cursor_height = value;
-        break;
-    case DG_CURSOR_REG_HOT_X:
-        s->cursor_hot_x = value;
-        break;
-    case DG_CURSOR_REG_HOT_Y:
-        s->cursor_hot_y = value;
-        break;
-    case DG_CURSOR_REG_FORMAT:
-        s->cursor_format = value;
-        break;
-    case DG_CURSOR_REG_X:
-        s->cursor_x = value;
-        break;
-    case DG_CURSOR_REG_Y:
-        s->cursor_y = value;
-        break;
-    case DG_CURSOR_REG_FLAGS:
-        s->cursor_flags = value;
-        break;
-    case DG_CURSOR_REG_SEQUENCE:
-        s->cursor_sequence = value;
-        break;
-    case DG_CURSOR_REG_SUBMIT:
-        dg_cursor_submit(s, value);
-        break;
+        case DG_CURSOR_REG_ADDR_LO:
+            s->cursor_addr_lo = value;
+            break;
+        case DG_CURSOR_REG_ADDR_HI:
+            s->cursor_addr_hi = value;
+            break;
+        case DG_CURSOR_REG_BYTES:
+            s->cursor_bytes = value;
+            break;
+        case DG_CURSOR_REG_WIDTH:
+            s->cursor_width = value;
+            break;
+        case DG_CURSOR_REG_HEIGHT:
+            s->cursor_height = value;
+            break;
+        case DG_CURSOR_REG_HOT_X:
+            s->cursor_hot_x = value;
+            break;
+        case DG_CURSOR_REG_HOT_Y:
+            s->cursor_hot_y = value;
+            break;
+        case DG_CURSOR_REG_FORMAT:
+            s->cursor_format = value;
+            break;
+        case DG_CURSOR_REG_X:
+            s->cursor_x = value;
+            break;
+        case DG_CURSOR_REG_Y:
+            s->cursor_y = value;
+            break;
+        case DG_CURSOR_REG_FLAGS:
+            s->cursor_flags = value;
+            break;
+        case DG_CURSOR_REG_SEQUENCE:
+            s->cursor_sequence = value;
+            break;
+        case DG_CURSOR_REG_SUBMIT:
+            dg_cursor_submit(s, value);
+            break;
     }
 }
 
-static void dg_cursor_reset(DreamGpu *s)
-{
+static void dg_cursor_reset(DreamGpu *s) {
     s->cursor_addr_lo = s->cursor_addr_hi = s->cursor_bytes = 0;
     s->cursor_width = s->cursor_height = s->cursor_hot_x = s->cursor_hot_y = 0;
     s->cursor_format = s->cursor_x = s->cursor_y = s->cursor_flags = 0;
@@ -241,8 +244,7 @@ static void dg_cursor_reset(DreamGpu *s)
 }
 
 #ifdef CONFIG_DREAMGPU_GL
-static void dg_fault_stop(DreamGpu *s, uint32_t reason, uint32_t sequence)
-{
+static void dg_fault_stop(DreamGpu *s, uint32_t reason, uint32_t sequence) {
     if (!reason || reason > DG_GL_FAULT_DRIVER_INTERNAL || s->gl_fault) {
         return;
     }
@@ -252,36 +254,28 @@ static void dg_fault_stop(DreamGpu *s, uint32_t reason, uint32_t sequence)
     g_autofree char *path = object_get_canonical_path(OBJECT(s));
     error_report("DreamGPU graphics coherence fault %u "
                  "(operation %u, sequence %u); "
-                 "guest stopped, system reset required", reason,
-                 s->gl_fault_operation, s->gl_fault_sequence);
-    qapi_event_send_dreamgpu_fault(path, reason, s->gl_fault_operation,
-                                        s->gl_fault_sequence);
+                 "guest stopped, system reset required",
+                 reason, s->gl_fault_operation, s->gl_fault_sequence);
+    qapi_event_send_dreamgpu_fault(path, reason, s->gl_fault_operation, s->gl_fault_sequence);
     vm_stop(RUN_STATE_INTERNAL_ERROR);
 }
 
-static bool dg_result_ram(DreamGpu *s, uint64_t address, uint32_t bytes)
-{
+static bool dg_result_ram(DreamGpu *s, uint64_t address, uint32_t bytes) {
     hwaddr translated, length = bytes;
     MemoryRegion *mr;
 
-    if (!bytes || bytes > DG_GL_MAX_READBACK_BYTES ||
-        address > UINT64_MAX - bytes) {
+    if (!bytes || bytes > DG_GL_MAX_READBACK_BYTES || address > UINT64_MAX - bytes) {
         return false;
     }
     RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(pci_get_address_space(&s->parent_obj),
-                                  address, &translated, &length, true,
-                                  MEMTXATTRS_UNSPECIFIED);
-    return length >= bytes && memory_region_is_ram(mr) &&
-           !memory_region_is_rom(mr);
+    mr = address_space_translate(pci_get_address_space(&s->parent_obj), address, &translated,
+                                 &length, true, MEMTXATTRS_UNSPECIFIED);
+    return length >= bytes && memory_region_is_ram(mr) && !memory_region_is_rom(mr);
 }
 
-static void dg_gl_complete(DreamGpu *s, uint32_t sequence, uint32_t error)
-{
+static void dg_gl_complete(DreamGpu *s, uint32_t sequence, uint32_t error) {
     if (s->gl_trace_start_us) {
-        trace_dreamgpu_gl_complete(sequence, error,
-                                    g_get_monotonic_time() -
-                                    s->gl_trace_start_us);
+        trace_dreamgpu_gl_complete(sequence, error, g_get_monotonic_time() - s->gl_trace_start_us);
         s->gl_trace_start_us = 0;
     }
     if (error && s->gl_sensitive_op) {
@@ -294,8 +288,7 @@ static void dg_gl_complete(DreamGpu *s, uint32_t sequence, uint32_t error)
     dg_update_irq(s);
 }
 
-static void dg_gl_transfer_work(DreamGpu *s)
-{
+static void dg_gl_transfer_work(DreamGpu *s) {
     DgGLTransfer *t = &s->gl_transfer;
     uint32_t budget = DG_WORK_QUANTUM;
     uint32_t chunks = 0, error = 0;
@@ -315,8 +308,7 @@ static void dg_gl_transfer_work(DreamGpu *s)
         uint32_t row = s->gl_transfer_row;
         uint32_t column = s->gl_transfer_column;
         uint32_t count = MIN(budget, t->width * 4 - column);
-        uint64_t offset = (uint64_t)t->offset +
-                          (uint64_t)row * t->vram_stride + column;
+        uint64_t offset = (uint64_t)t->offset + (uint64_t)row * t->vram_stride + column;
         uint8_t *pixels = t->pixels + (size_t)row * t->stride + column;
         if (offset + count > s->vga.vram_size) {
             error = DG_GL_ERROR_DESKTOP;
@@ -350,8 +342,7 @@ static void dg_gl_transfer_work(DreamGpu *s)
     dg_gl_engine_transfer_done(s->gl, error, cpu_epoch, cpu_generation);
 }
 
-static void dg_gl_completed_bh(void *opaque)
-{
+static void dg_gl_completed_bh(void *opaque) {
     DreamGpu *s = opaque;
     DgGLCompletion done;
 
@@ -367,11 +358,10 @@ static void dg_gl_completed_bh(void *opaque)
             s->gl_present = done.present;
             if (!done.error && done.result_bytes) {
                 if (done.result_bytes > s->gl_active_result_capacity ||
-                    !dg_result_ram(s, s->gl_active_result_address,
-                                     done.result_bytes) ||
+                    !dg_result_ram(s, s->gl_active_result_address, done.result_bytes) ||
                     pci_dma_write(&s->parent_obj, s->gl_active_result_address,
-                                   done.bulk_result ? done.bulk_result : done.result, done.result_bytes) !=
-                    MEMTX_OK) {
+                                  done.bulk_result ? done.bulk_result : done.result,
+                                  done.result_bytes) != MEMTX_OK) {
                     done.error = DG_GL_ERROR_DMA;
                 } else {
                     s->gl_result_bytes = done.result_bytes;
@@ -387,48 +377,40 @@ static void dg_gl_completed_bh(void *opaque)
     }
 }
 
-static void dg_gl_notify(void *opaque)
-{
+static void dg_gl_notify(void *opaque) {
     DreamGpu *s = opaque;
 
     qemu_bh_schedule(s->gl_bh);
 }
 
-static void dg_gl_dimensions(DreamGpu *s, uint32_t *width, uint32_t *height)
-{
+static void dg_gl_dimensions(DreamGpu *s, uint32_t *width, uint32_t *height) {
     *width = *height = 0;
     if (s->vga.vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED) {
         *width = s->vga.vbe_regs[VBE_DISPI_INDEX_XRES];
         *height = s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
     }
 }
-static uint32_t dg_snapshot_gl_validate(void *opaque, const uint8_t *data,
-                                        uint32_t bytes, uint32_t *records)
-{
+static uint32_t dg_snapshot_gl_validate(void *opaque, const uint8_t *data, uint32_t bytes,
+                                        uint32_t *records) {
     DreamGpu *s = opaque;
     uint32_t width, height;
     dg_gl_dimensions(s, &width, &height);
-    return dg_gl_validate(data, bytes, s->generation, width, height,
-                           s->vga.vram_size, records);
+    return dg_gl_validate(data, bytes, s->generation, width, height, s->vga.vram_size, records);
 }
-static void dg_snapshot_diagnostics_begin(void *opaque, uint32_t bytes)
-{
+static void dg_snapshot_diagnostics_begin(void *opaque, uint32_t bytes) {
     DreamGpu *s = opaque;
     if (s->diagnostics_enabled) {
         s->diagnostics->batches++;
         s->diagnostics->bytes += bytes;
     }
 }
-static void dg_snapshot_diagnostic_record(void *opaque, const uint8_t *record)
-{
+static void dg_snapshot_diagnostic_record(void *opaque, const uint8_t *record) {
     DreamGpu *s = opaque;
     if (s->diagnostics_enabled) {
         dg_diagnostic_record(s->diagnostics, record);
     }
 }
-static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data,
-                                     uint32_t bytes, uint32_t records)
-{
+static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data, uint32_t bytes, uint32_t records) {
     DreamGpu *s = opaque;
     uint32_t width, height;
     Error *err = NULL;
@@ -436,8 +418,7 @@ static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data,
         return DG_GL_ERROR_TRANSPORT;
     }
     if (!s->gl_blocker) {
-        error_setg(&s->gl_blocker,
-                   "DreamGPU active OpenGL resources cannot be migrated or saved");
+        error_setg(&s->gl_blocker, "DreamGPU active OpenGL resources cannot be migrated or saved");
         if (migrate_add_blocker(&s->gl_blocker, &err) < 0) {
             error_report_err(err);
             return DG_GL_ERROR_HOST;
@@ -447,12 +428,12 @@ static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data,
         s->gl = dg_gl_engine_new(s->gpu_socket, dg_gl_notify, s);
     }
     dg_gl_dimensions(s, &width, &height);
-    return dg_gl_engine_submit(s->gl, data, bytes, s->gl_sequence,
-                                 s->generation, width, height, records) ?
-           0 : DG_GL_ERROR_LIMIT;
+    return dg_gl_engine_submit(s->gl, data, bytes, s->gl_sequence, s->generation, width, height,
+                               records)
+               ? 0
+               : DG_GL_ERROR_LIMIT;
 }
-static void dg_gl_submit(DreamGpu *s)
-{
+static void dg_gl_submit(DreamGpu *s) {
     DreamGpuDeviceGlCallbacks callbacks = {
         .memory = dg_snapshot_memory(s),
         .validate = dg_snapshot_gl_validate,
@@ -462,9 +443,9 @@ static void dg_gl_submit(DreamGpu *s)
     };
     DreamGpuDeviceGlRequest request = {
         .address = ((uint64_t)s->gl_addr_hi << 32) | s->gl_addr_lo,
-        .result_address = ((uint64_t)s->gl_result_addr_hi << 32) |
-                          s->gl_result_addr_lo,
-        .bytes = s->gl_bytes, .generation = s->gl_generation,
+        .result_address = ((uint64_t)s->gl_result_addr_hi << 32) | s->gl_result_addr_lo,
+        .bytes = s->gl_bytes,
+        .generation = s->gl_generation,
         .current_generation = s->generation,
         .bpp = s->vga.vbe_regs[VBE_DISPI_INDEX_BPP],
         .busy_2d = s->status & DG_STATUS_BUSY,
@@ -475,10 +456,10 @@ static void dg_gl_submit(DreamGpu *s)
     if ((s->gl_status & DG_STATUS_BUSY) || s->gl_fault) {
         return;
     }
-    s->gl_trace_start_us =
-        trace_event_get_state_backends(TRACE_DREAMGPU_GL_SUBMIT) ||
-        trace_event_get_state_backends(TRACE_DREAMGPU_GL_COMPLETE) ?
-        g_get_monotonic_time() : 0;
+    s->gl_trace_start_us = trace_event_get_state_backends(TRACE_DREAMGPU_GL_SUBMIT) ||
+                                   trace_event_get_state_backends(TRACE_DREAMGPU_GL_COMPLETE)
+                               ? g_get_monotonic_time()
+                               : 0;
     s->gl_sensitive_op = 0;
     s->gl_result_bytes = s->gl_result_type = 0;
     s->gl_active_result_capacity = 0;
@@ -496,94 +477,118 @@ static void dg_gl_submit(DreamGpu *s)
     s->gl_error = 0;
     if (s->gl_trace_start_us) {
         trace_dreamgpu_gl_submit(s->gl_sequence, result.records, s->gl_bytes,
-                                  g_get_monotonic_time() - s->gl_trace_start_us);
+                                 g_get_monotonic_time() - s->gl_trace_start_us);
     }
 }
 
-static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr)
-{
+static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr) {
     switch (addr) {
-    case DG_GL_REG_FAULT_STOP: return s->gl_fault;
-    case DG_GL_REG_FAULT_OPERATION: return s->gl_fault_operation;
-    case DG_GL_REG_FAULT_SEQUENCE: return s->gl_fault_sequence;
-    case DG_GL_REG_RESULT_ADDR_LO: return s->gl_result_addr_lo;
-    case DG_GL_REG_RESULT_ADDR_HI: return s->gl_result_addr_hi;
-    case DG_GL_REG_RESULT_CAPACITY: return s->gl_result_capacity;
-    case DG_GL_REG_RESULT_BYTES: return s->gl_result_bytes;
-    case DG_GL_REG_RESULT_TYPE: return s->gl_result_type;
-    case DG_GL_REG_PRESENT_SLOT: return s->gl_present.slot;
-    case DG_GL_REG_PRESENT_EPOCH_LO: return s->gl_present.epoch;
-    case DG_GL_REG_PRESENT_EPOCH_HI: return s->gl_present.epoch >> 32;
-    case DG_GL_REG_PRESENT_FRAME_LO: return s->gl_present.generation;
-    case DG_GL_REG_PRESENT_FRAME_HI: return s->gl_present.generation >> 32;
-    case DG_GL_REG_PRESENT_CLIENT: return s->gl_present.client;
-    case DG_GL_REG_PRESENT_DRAWABLE: return s->gl_present.drawable;
-    case DG_GL_REG_VERSION: return DG_GL_VERSION;
-    case DG_GL_REG_ADDR_LO: return s->gl_addr_lo;
-    case DG_GL_REG_ADDR_HI: return s->gl_addr_hi;
-    case DG_GL_REG_BYTES: return s->gl_bytes;
-    case DG_GL_REG_SEQUENCE: return s->gl_sequence;
-    case DG_GL_REG_GENERATION: return s->generation;
-    case DG_GL_REG_STATUS: return s->gl_status;
-    case DG_GL_REG_COMPLETED: return s->gl_completed;
-    case DG_GL_REG_ERROR: return s->gl_error;
-    case DG_GL_REG_MAX_BYTES: return DG_GL_MAX_BYTES;
-    case DG_GL_REG_MAX_RECORDS: return DG_GL_MAX_RECORDS;
-    case DG_GL_REG_QUERY_FUNCTION: return s->gl_query_function;
-    case DG_GL_REG_FUNCTION_WORDS:
-        return dg_gl_function_words(s->gl_query_function);
-    default: return 0;
+        case DG_GL_REG_FAULT_STOP:
+            return s->gl_fault;
+        case DG_GL_REG_FAULT_OPERATION:
+            return s->gl_fault_operation;
+        case DG_GL_REG_FAULT_SEQUENCE:
+            return s->gl_fault_sequence;
+        case DG_GL_REG_RESULT_ADDR_LO:
+            return s->gl_result_addr_lo;
+        case DG_GL_REG_RESULT_ADDR_HI:
+            return s->gl_result_addr_hi;
+        case DG_GL_REG_RESULT_CAPACITY:
+            return s->gl_result_capacity;
+        case DG_GL_REG_RESULT_BYTES:
+            return s->gl_result_bytes;
+        case DG_GL_REG_RESULT_TYPE:
+            return s->gl_result_type;
+        case DG_GL_REG_PRESENT_SLOT:
+            return s->gl_present.slot;
+        case DG_GL_REG_PRESENT_EPOCH_LO:
+            return s->gl_present.epoch;
+        case DG_GL_REG_PRESENT_EPOCH_HI:
+            return s->gl_present.epoch >> 32;
+        case DG_GL_REG_PRESENT_FRAME_LO:
+            return s->gl_present.generation;
+        case DG_GL_REG_PRESENT_FRAME_HI:
+            return s->gl_present.generation >> 32;
+        case DG_GL_REG_PRESENT_CLIENT:
+            return s->gl_present.client;
+        case DG_GL_REG_PRESENT_DRAWABLE:
+            return s->gl_present.drawable;
+        case DG_GL_REG_VERSION:
+            return DG_GL_VERSION;
+        case DG_GL_REG_ADDR_LO:
+            return s->gl_addr_lo;
+        case DG_GL_REG_ADDR_HI:
+            return s->gl_addr_hi;
+        case DG_GL_REG_BYTES:
+            return s->gl_bytes;
+        case DG_GL_REG_SEQUENCE:
+            return s->gl_sequence;
+        case DG_GL_REG_GENERATION:
+            return s->generation;
+        case DG_GL_REG_STATUS:
+            return s->gl_status;
+        case DG_GL_REG_COMPLETED:
+            return s->gl_completed;
+        case DG_GL_REG_ERROR:
+            return s->gl_error;
+        case DG_GL_REG_MAX_BYTES:
+            return DG_GL_MAX_BYTES;
+        case DG_GL_REG_MAX_RECORDS:
+            return DG_GL_MAX_RECORDS;
+        case DG_GL_REG_QUERY_FUNCTION:
+            return s->gl_query_function;
+        case DG_GL_REG_FUNCTION_WORDS:
+            return dg_gl_function_words(s->gl_query_function);
+        default:
+            return 0;
     }
 }
 
-static void dg_gl_write(DreamGpu *s, hwaddr addr, uint32_t value)
-{
+static void dg_gl_write(DreamGpu *s, hwaddr addr, uint32_t value) {
     switch (addr) {
-    case DG_GL_REG_FAULT_STOP:
-        dg_fault_stop(s, value, s->gl_sequence);
-        break;
-    case DG_GL_REG_RESULT_ADDR_LO:
-        s->gl_result_addr_lo = value;
-        break;
-    case DG_GL_REG_RESULT_ADDR_HI:
-        s->gl_result_addr_hi = value;
-        break;
-    case DG_GL_REG_RESULT_CAPACITY:
-        s->gl_result_capacity = value;
-        break;
-    case DG_GL_REG_ADDR_LO:
-        s->gl_addr_lo = value;
-        break;
-    case DG_GL_REG_ADDR_HI:
-        s->gl_addr_hi = value;
-        break;
-    case DG_GL_REG_BYTES:
-        s->gl_bytes = value;
-        break;
-    case DG_GL_REG_SEQUENCE:
-        s->gl_sequence = value;
-        break;
-    case DG_GL_REG_GENERATION:
-        s->gl_generation = value;
-        break;
-    case DG_GL_REG_QUERY_FUNCTION:
-        s->gl_query_function = value;
-        break;
-    case DG_GL_REG_SUBMIT:
-        if (value == 1) {
-            dg_gl_submit(s);
-        }
-        break;
+        case DG_GL_REG_FAULT_STOP:
+            dg_fault_stop(s, value, s->gl_sequence);
+            break;
+        case DG_GL_REG_RESULT_ADDR_LO:
+            s->gl_result_addr_lo = value;
+            break;
+        case DG_GL_REG_RESULT_ADDR_HI:
+            s->gl_result_addr_hi = value;
+            break;
+        case DG_GL_REG_RESULT_CAPACITY:
+            s->gl_result_capacity = value;
+            break;
+        case DG_GL_REG_ADDR_LO:
+            s->gl_addr_lo = value;
+            break;
+        case DG_GL_REG_ADDR_HI:
+            s->gl_addr_hi = value;
+            break;
+        case DG_GL_REG_BYTES:
+            s->gl_bytes = value;
+            break;
+        case DG_GL_REG_SEQUENCE:
+            s->gl_sequence = value;
+            break;
+        case DG_GL_REG_GENERATION:
+            s->gl_generation = value;
+            break;
+        case DG_GL_REG_QUERY_FUNCTION:
+            s->gl_query_function = value;
+            break;
+        case DG_GL_REG_SUBMIT:
+            if (value == 1) {
+                dg_gl_submit(s);
+            }
+            break;
     }
 }
 #endif
 
 /* The host Rust engine validates the complete immutable DMA snapshot. */
 
-static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp,
-                          uint64_t src, uint64_t dst, uint32_t bytes,
-                          uint32_t color)
-{
+static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp, uint64_t src, uint64_t dst,
+                        uint32_t bytes, uint32_t color) {
     DreamGpu *s = opaque;
     uint8_t *out = s->vga.vram_ptr + dst;
 
@@ -607,10 +612,11 @@ static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp,
     memory_region_set_dirty(&s->vga.vram, dst, bytes);
 }
 
-static void dg_run(DreamGpu *s, uint32_t budget)
-{
+static void dg_run(DreamGpu *s, uint32_t budget) {
     DreamGpuProgress progress = {
-        s->command_index, s->row, s->column,
+        s->command_index,
+        s->row,
+        s->column,
     };
     DreamGpuWork work;
     uint32_t error;
@@ -622,9 +628,8 @@ static void dg_run(DreamGpu *s, uint32_t budget)
     }
     /* The BQL remains held; Rust never stores VRAM pointers or invokes QEMU
      * asynchronously. Preserve the existing migratable progress fields. */
-    error = dreamgpu_2d_execute(s->commands, s->active_count,
-                               s->vga.vram_size,
-                               &progress, budget, dg_transfer, s, &work);
+    error = dreamgpu_2d_execute(s->commands, s->active_count, s->vga.vram_size, &progress, budget,
+                                dg_transfer, s, &work);
     if (error) {
         dg_complete(s, error);
         return;
@@ -634,8 +639,7 @@ static void dg_run(DreamGpu *s, uint32_t budget)
     s->column = progress.column;
     if (tracing) {
         trace_dreamgpu_gpu_work(s->active_sequence, work.bytes, work.chunks,
-                                 g_get_monotonic_time() - start_us,
-                                 budget == DG_INLINE_QUANTUM);
+                                g_get_monotonic_time() - start_us, budget == DG_INLINE_QUANTUM);
     }
     if (s->command_index == s->active_count) {
         dg_complete(s, DG_ERROR_NONE);
@@ -644,13 +648,11 @@ static void dg_run(DreamGpu *s, uint32_t budget)
     }
 }
 
-static void dg_work(void *opaque)
-{
+static void dg_work(void *opaque) {
     dg_run(opaque, DG_WORK_QUANTUM);
 }
 
-static void dg_submit(DreamGpu *s)
-{
+static void dg_submit(DreamGpu *s) {
     uint64_t addr = ((uint64_t)s->addr_hi << 32) | s->addr_lo;
     DreamGpuDeviceMemory memory = dg_snapshot_memory(s);
     uint32_t error;
@@ -660,22 +662,21 @@ static void dg_submit(DreamGpu *s)
         return;
     }
     s->trace_start_us =
-        trace_event_get_state_backends(TRACE_DREAMGPU_GPU_COMPLETE) ?
-        g_get_monotonic_time() : 0;
+        trace_event_get_state_backends(TRACE_DREAMGPU_GPU_COMPLETE) ? g_get_monotonic_time() : 0;
     s->trace_chunks = 0;
     s->validated_bytes = 0;
     s->active_sequence = s->sequence;
     s->active_count = s->count;
     s->command_index = s->row = s->column = 0;
     s->error = DG_ERROR_NONE;
-    error = dreamgpu_device_2d_capture(&memory, addr, s->count, s->commands,
-                                       s->vga.vram_size, &s->validated_bytes);
+    error = dreamgpu_device_2d_capture(&memory, addr, s->count, s->commands, s->vga.vram_size,
+                                       &s->validated_bytes);
     if (error) {
         dg_complete(s, error);
         return;
     }
-    trace_dreamgpu_gpu_submit(s->active_sequence, s->active_count,
-                               s->validated_bytes, DG_INLINE_QUANTUM);
+    trace_dreamgpu_gpu_submit(s->active_sequence, s->active_count, s->validated_bytes,
+                              DG_INLINE_QUANTUM);
     s->status = DG_STATUS_BUSY;
     /*
      * A full 1024x768x32 GDI blit fits in one bounded MMIO exit. Larger
@@ -685,8 +686,7 @@ static void dg_submit(DreamGpu *s)
     dg_run(s, DG_INLINE_QUANTUM);
 }
 
-static void dg_engine_reset(DreamGpu *s)
-{
+static void dg_engine_reset(DreamGpu *s) {
     qemu_bh_cancel(s->work_bh);
     s->trace_start_us = 0;
     s->addr_lo = s->addr_hi = s->count = s->sequence = 0;
@@ -716,8 +716,7 @@ static void dg_engine_reset(DreamGpu *s)
     dg_update_irq(s);
 }
 
-static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size)
-{
+static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
     DreamGpu *s = opaque;
     if (s->diagnostics_enabled && addr + DG_REG_MAGIC < DG_MMIO_SIZE) {
         s->diagnostics->reads[(addr + DG_REG_MAGIC) / 4]++;
@@ -734,36 +733,52 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size)
 #endif
 
     switch (addr + DG_REG_MAGIC) {
-    case DG_REG_MAGIC: return DG_MAGIC;
-    case DG_REG_VERSION: return DG_ABI_VERSION;
-    case DG_REG_CAPS:
-        return DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE |
-               DG_CAP_COMPLETION_IRQ | DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR
+        case DG_REG_MAGIC:
+            return DG_MAGIC;
+        case DG_REG_VERSION:
+            return DG_ABI_VERSION;
+        case DG_REG_CAPS:
+            return DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE | DG_CAP_COMPLETION_IRQ |
+                   DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR
 #ifdef CONFIG_DREAMGPU_GL
-               | (s->gpu_socket && *s->gpu_socket ?
-                  DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
-                  DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK : 0)
+                   | (s->gpu_socket && *s->gpu_socket
+                          ? DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
+                                DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK
+                          : 0)
 #endif
-               ;
-    case DG_REG_VRAM_SIZE: return s->vga.vram_size;
-    case DG_REG_BATCH_ADDR_LO: return s->addr_lo;
-    case DG_REG_BATCH_ADDR_HI: return s->addr_hi;
-    case DG_REG_BATCH_COUNT: return s->count;
-    case DG_REG_SUBMIT_SEQUENCE: return s->sequence;
-    case DG_REG_STATUS: return s->status;
-    case DG_REG_COMPLETED_SEQUENCE: return s->completed;
-    case DG_REG_ERROR: return s->error;
-    case DG_REG_IRQ_ENABLE: return s->irq_enable;
-    case DG_REG_IRQ_STATUS: return s->irq_status;
-    case DG_REG_GENERATION: return s->generation;
-    case DG_REG_MAX_COMMANDS: return DG_MAX_COMMANDS;
-    case DG_REG_MAX_WORK_BYTES: return DG_MAX_WORK_BYTES;
-    default: return 0;
+                ;
+        case DG_REG_VRAM_SIZE:
+            return s->vga.vram_size;
+        case DG_REG_BATCH_ADDR_LO:
+            return s->addr_lo;
+        case DG_REG_BATCH_ADDR_HI:
+            return s->addr_hi;
+        case DG_REG_BATCH_COUNT:
+            return s->count;
+        case DG_REG_SUBMIT_SEQUENCE:
+            return s->sequence;
+        case DG_REG_STATUS:
+            return s->status;
+        case DG_REG_COMPLETED_SEQUENCE:
+            return s->completed;
+        case DG_REG_ERROR:
+            return s->error;
+        case DG_REG_IRQ_ENABLE:
+            return s->irq_enable;
+        case DG_REG_IRQ_STATUS:
+            return s->irq_status;
+        case DG_REG_GENERATION:
+            return s->generation;
+        case DG_REG_MAX_COMMANDS:
+            return DG_MAX_COMMANDS;
+        case DG_REG_MAX_WORK_BYTES:
+            return DG_MAX_WORK_BYTES;
+        default:
+            return 0;
     }
 }
 
-static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
-{
+static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size) {
     DreamGpu *s = opaque;
     if (s->diagnostics_enabled && addr + DG_REG_MAGIC < DG_MMIO_SIZE) {
         s->diagnostics->writes[(addr + DG_REG_MAGIC) / 4]++;
@@ -782,46 +797,44 @@ static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
 #endif
 
     switch (addr + DG_REG_MAGIC) {
-    case DG_REG_BATCH_ADDR_LO:
-        s->addr_lo = value;
-        break;
-    case DG_REG_BATCH_ADDR_HI:
-        s->addr_hi = value;
-        break;
-    case DG_REG_BATCH_COUNT:
-        s->count = value;
-        break;
-    case DG_REG_SUBMIT_SEQUENCE:
-        s->sequence = value;
-        break;
-    case DG_REG_SUBMIT:
-        if (value == DG_SUBMIT_START ||
-            value == (DG_SUBMIT_START | DG_SUBMIT_INLINE_NO_IRQ)) {
-            /* Only this MMIO callback can suppress its own completion IRQ. */
-            s->inline_no_irq = value & DG_SUBMIT_INLINE_NO_IRQ;
-            dg_submit(s);
-            s->inline_no_irq = false;
-        }
-        break;
-    case DG_REG_IRQ_ENABLE:
-        s->irq_enable = value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
-        dg_update_irq(s);
-        break;
-    case DG_REG_IRQ_STATUS:
-        s->irq_status &= ~(value &
-                           (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION));
-        dg_update_irq(s);
-        break;
-    case DG_REG_RESET:
-        if (value == 1) {
-#ifdef CONFIG_DREAMGPU_GL
-            if (s->gl_fault) {
-                break;
+        case DG_REG_BATCH_ADDR_LO:
+            s->addr_lo = value;
+            break;
+        case DG_REG_BATCH_ADDR_HI:
+            s->addr_hi = value;
+            break;
+        case DG_REG_BATCH_COUNT:
+            s->count = value;
+            break;
+        case DG_REG_SUBMIT_SEQUENCE:
+            s->sequence = value;
+            break;
+        case DG_REG_SUBMIT:
+            if (value == DG_SUBMIT_START || value == (DG_SUBMIT_START | DG_SUBMIT_INLINE_NO_IRQ)) {
+                /* Only this MMIO callback can suppress its own completion IRQ. */
+                s->inline_no_irq = value & DG_SUBMIT_INLINE_NO_IRQ;
+                dg_submit(s);
+                s->inline_no_irq = false;
             }
+            break;
+        case DG_REG_IRQ_ENABLE:
+            s->irq_enable = value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
+            dg_update_irq(s);
+            break;
+        case DG_REG_IRQ_STATUS:
+            s->irq_status &= ~(value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION));
+            dg_update_irq(s);
+            break;
+        case DG_REG_RESET:
+            if (value == 1) {
+#ifdef CONFIG_DREAMGPU_GL
+                if (s->gl_fault) {
+                    break;
+                }
 #endif
-            dg_engine_reset(s);
-        }
-        break;
+                dg_engine_reset(s);
+            }
+            break;
     }
 }
 
@@ -829,30 +842,35 @@ static const MemoryRegionOps dg_ops = {
     .read = dg_read,
     .write = dg_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
-    .valid = { .min_access_size = 4, .max_access_size = 4 },
-    .impl = { .min_access_size = 4, .max_access_size = 4 },
+    .valid = {.min_access_size = 4, .max_access_size = 4},
+    .impl = {.min_access_size = 4, .max_access_size = 4},
 };
 
-static int dg_post_load(void *opaque, int version_id)
-{
+static int dg_post_load(void *opaque, int version_id) {
     DreamGpu *s = opaque;
 
     DreamGpuDeviceRestore restored = {
-        .cursor = {
-            .flags = s->cursor.flags, .width = s->cursor.width,
-            .height = s->cursor.height, .hot_x = s->cursor.hot_x,
-            .hot_y = s->cursor.hot_y, .format = s->cursor.format,
-        },
+        .cursor =
+            {
+                .flags = s->cursor.flags,
+                .width = s->cursor.width,
+                .height = s->cursor.height,
+                .hot_x = s->cursor.hot_x,
+                .hot_y = s->cursor.hot_y,
+                .format = s->cursor.format,
+            },
         .cursor_status = s->cursor_status,
 #ifdef CONFIG_DREAMGPU_GL
         .gl_status = s->gl_status,
 #endif
-        .status = s->status, .count = s->active_count,
-        .command = s->command_index, .row = s->row, .column = s->column,
+        .status = s->status,
+        .count = s->active_count,
+        .command = s->command_index,
+        .row = s->row,
+        .column = s->column,
         .vram = s->vga.vram_size,
     };
-    if (!dreamgpu_device_restore(&restored, s->cursor.pixels, s->commands,
-                                 &s->validated_bytes)) {
+    if (!dreamgpu_device_restore(&restored, s->cursor.pixels, s->commands, &s->validated_bytes)) {
         return -EINVAL;
     }
     if (s->status & DG_STATUS_BUSY) {
@@ -863,8 +881,7 @@ static int dg_post_load(void *opaque, int version_id)
     return 0;
 }
 
-static int dg_pre_load(void *opaque)
-{
+static int dg_pre_load(void *opaque) {
     DreamGpu *s = opaque;
 
     qemu_bh_cancel(s->work_bh);
@@ -893,18 +910,16 @@ static const VMStateDescription vmstate_dg_cursor = {
     .name = "dreamgpu-cursor",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (const VMStateField[]) {
-        VMSTATE_UINT32(width, DreamGpuNativeCursor),
-        VMSTATE_UINT32(height, DreamGpuNativeCursor),
-        VMSTATE_UINT32(format, DreamGpuNativeCursor),
-        VMSTATE_INT32(hot_x, DreamGpuNativeCursor),
-        VMSTATE_INT32(hot_y, DreamGpuNativeCursor),
-        VMSTATE_INT32(x, DreamGpuNativeCursor),
-        VMSTATE_INT32(y, DreamGpuNativeCursor),
-        VMSTATE_UINT32(flags, DreamGpuNativeCursor),
-        VMSTATE_UINT8_ARRAY(pixels, DreamGpuNativeCursor, DG_CURSOR_MAX_BYTES),
-        VMSTATE_END_OF_LIST()
-    },
+    .fields =
+        (const VMStateField[]){
+            VMSTATE_UINT32(width, DreamGpuNativeCursor),
+            VMSTATE_UINT32(height, DreamGpuNativeCursor),
+            VMSTATE_UINT32(format, DreamGpuNativeCursor),
+            VMSTATE_INT32(hot_x, DreamGpuNativeCursor), VMSTATE_INT32(hot_y, DreamGpuNativeCursor),
+            VMSTATE_INT32(x, DreamGpuNativeCursor), VMSTATE_INT32(y, DreamGpuNativeCursor),
+            VMSTATE_UINT32(flags, DreamGpuNativeCursor),
+            VMSTATE_UINT8_ARRAY(pixels, DreamGpuNativeCursor, DG_CURSOR_MAX_BYTES),
+            VMSTATE_END_OF_LIST()},
 };
 
 static const VMStateDescription vmstate_dg = {
@@ -913,66 +928,62 @@ static const VMStateDescription vmstate_dg = {
     .minimum_version_id = 1,
     .pre_load = dg_pre_load,
     .post_load = dg_post_load,
-    .fields = (const VMStateField[]) {
-        VMSTATE_PCI_DEVICE(parent_obj, DreamGpu),
-        VMSTATE_STRUCT(vga, DreamGpu, 0, vmstate_vga_common,
-                       VGACommonState),
-        VMSTATE_UINT32(addr_lo, DreamGpu),
-        VMSTATE_UINT32(addr_hi, DreamGpu),
-        VMSTATE_UINT32(count, DreamGpu),
-        VMSTATE_UINT32(sequence, DreamGpu),
-        VMSTATE_UINT32(status, DreamGpu),
-        VMSTATE_UINT32(completed, DreamGpu),
-        VMSTATE_UINT32(error, DreamGpu),
-        VMSTATE_UINT32(irq_enable, DreamGpu),
-        VMSTATE_UINT32(irq_status, DreamGpu),
-        VMSTATE_UINT32(generation, DreamGpu),
-        VMSTATE_UINT32(active_count, DreamGpu),
-        VMSTATE_UINT32(active_sequence, DreamGpu),
-        VMSTATE_UINT32(command_index, DreamGpu),
-        VMSTATE_UINT32(row, DreamGpu),
-        VMSTATE_UINT32(column, DreamGpu),
-        VMSTATE_UINT8_ARRAY(commands, DreamGpu,
-                           DG_MAX_COMMANDS * DG_COMMAND_BYTES),
-        VMSTATE_STRUCT(cursor, DreamGpu, 3, vmstate_dg_cursor,
-                        DreamGpuNativeCursor),
-        VMSTATE_UINT32_V(cursor_addr_lo, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_addr_hi, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_bytes, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_width, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_height, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_hot_x, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_hot_y, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_format, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_x, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_y, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_flags, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_sequence, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_status, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_completed, DreamGpu, 3),
-        VMSTATE_UINT32_V(cursor_error, DreamGpu, 3),
+    .fields =
+        (const VMStateField[]){
+            VMSTATE_PCI_DEVICE(parent_obj, DreamGpu),
+            VMSTATE_STRUCT(vga, DreamGpu, 0, vmstate_vga_common, VGACommonState),
+            VMSTATE_UINT32(addr_lo, DreamGpu),
+            VMSTATE_UINT32(addr_hi, DreamGpu),
+            VMSTATE_UINT32(count, DreamGpu),
+            VMSTATE_UINT32(sequence, DreamGpu),
+            VMSTATE_UINT32(status, DreamGpu),
+            VMSTATE_UINT32(completed, DreamGpu),
+            VMSTATE_UINT32(error, DreamGpu),
+            VMSTATE_UINT32(irq_enable, DreamGpu),
+            VMSTATE_UINT32(irq_status, DreamGpu),
+            VMSTATE_UINT32(generation, DreamGpu),
+            VMSTATE_UINT32(active_count, DreamGpu),
+            VMSTATE_UINT32(active_sequence, DreamGpu),
+            VMSTATE_UINT32(command_index, DreamGpu),
+            VMSTATE_UINT32(row, DreamGpu),
+            VMSTATE_UINT32(column, DreamGpu),
+            VMSTATE_UINT8_ARRAY(commands, DreamGpu, DG_MAX_COMMANDS *DG_COMMAND_BYTES),
+            VMSTATE_STRUCT(cursor, DreamGpu, 3, vmstate_dg_cursor, DreamGpuNativeCursor),
+            VMSTATE_UINT32_V(cursor_addr_lo, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_addr_hi, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_bytes, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_width, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_height, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_hot_x, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_hot_y, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_format, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_x, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_y, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_flags, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_sequence, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_status, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_completed, DreamGpu, 3),
+            VMSTATE_UINT32_V(cursor_error, DreamGpu, 3),
 #ifdef CONFIG_DREAMGPU_GL
-        VMSTATE_UINT32(gl_addr_lo, DreamGpu),
-        VMSTATE_UINT32(gl_addr_hi, DreamGpu),
-        VMSTATE_UINT32(gl_bytes, DreamGpu),
-        VMSTATE_UINT32(gl_sequence, DreamGpu),
-        VMSTATE_UINT32(gl_generation, DreamGpu),
-        VMSTATE_UINT32(gl_status, DreamGpu),
-        VMSTATE_UINT32(gl_completed, DreamGpu),
-        VMSTATE_UINT32(gl_error, DreamGpu),
-        VMSTATE_UINT32(gl_query_function, DreamGpu),
-        VMSTATE_UINT32_V(gl_result_addr_lo, DreamGpu, 2),
-        VMSTATE_UINT32_V(gl_result_addr_hi, DreamGpu, 2),
-        VMSTATE_UINT32_V(gl_result_capacity, DreamGpu, 2),
-        VMSTATE_UINT32_V(gl_result_bytes, DreamGpu, 2),
-        VMSTATE_UINT32_V(gl_result_type, DreamGpu, 2),
+            VMSTATE_UINT32(gl_addr_lo, DreamGpu),
+            VMSTATE_UINT32(gl_addr_hi, DreamGpu),
+            VMSTATE_UINT32(gl_bytes, DreamGpu),
+            VMSTATE_UINT32(gl_sequence, DreamGpu),
+            VMSTATE_UINT32(gl_generation, DreamGpu),
+            VMSTATE_UINT32(gl_status, DreamGpu),
+            VMSTATE_UINT32(gl_completed, DreamGpu),
+            VMSTATE_UINT32(gl_error, DreamGpu),
+            VMSTATE_UINT32(gl_query_function, DreamGpu),
+            VMSTATE_UINT32_V(gl_result_addr_lo, DreamGpu, 2),
+            VMSTATE_UINT32_V(gl_result_addr_hi, DreamGpu, 2),
+            VMSTATE_UINT32_V(gl_result_capacity, DreamGpu, 2),
+            VMSTATE_UINT32_V(gl_result_bytes, DreamGpu, 2),
+            VMSTATE_UINT32_V(gl_result_type, DreamGpu, 2),
 #endif
-        VMSTATE_END_OF_LIST()
-    },
+            VMSTATE_END_OF_LIST()},
 };
 
-static void dg_reset(DeviceState *dev)
-{
+static void dg_reset(DeviceState *dev) {
     DreamGpu *s = DREAMGPU(dev);
 
 #ifdef CONFIG_DREAMGPU_GL
@@ -982,44 +993,34 @@ static void dg_reset(DeviceState *dev)
     vga_common_reset(&s->vga);
 }
 
-static void dg_realize(PCIDevice *dev, Error **errp)
-{
+static void dg_realize(PCIDevice *dev, Error **errp) {
     DreamGpu *s = DREAMGPU(dev);
 
     if (!vga_common_init(&s->vga, OBJECT(dev), errp)) {
         return;
     }
-    vga_init(&s->vga, OBJECT(dev), pci_address_space(dev),
-             pci_address_space_io(dev), true);
-    s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0,
-                                            s->vga.hw_ops, &s->vga);
+    vga_init(&s->vga, OBJECT(dev), pci_address_space(dev), pci_address_space_io(dev), true);
+    s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0, s->vga.hw_ops, &s->vga);
     s->work_bh = qemu_bh_new(dg_work, s);
 #ifdef CONFIG_DREAMGPU_GL
     s->gl_bh = qemu_bh_new(dg_gl_completed_bh, s);
 #endif
-    pci_register_bar(dev, DG_VRAM_BAR, PCI_BASE_ADDRESS_MEM_PREFETCH,
-                     &s->vga.vram);
-    memory_region_init(&s->mmio, OBJECT(dev), "dreamgpu.mmio",
-                       DG_MMIO_SIZE);
-    pci_std_vga_mmio_region_init(&s->vga, OBJECT(dev), &s->mmio,
-                                 s->vga_regs, true, false);
-    memory_region_init_io(&s->regs, OBJECT(dev), &dg_ops, s,
-                          "dreamgpu.commands", 0x1000);
+    pci_register_bar(dev, DG_VRAM_BAR, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vga.vram);
+    memory_region_init(&s->mmio, OBJECT(dev), "dreamgpu.mmio", DG_MMIO_SIZE);
+    pci_std_vga_mmio_region_init(&s->vga, OBJECT(dev), &s->mmio, s->vga_regs, true, false);
+    memory_region_init_io(&s->regs, OBJECT(dev), &dg_ops, s, "dreamgpu.commands", 0x1000);
     memory_region_add_subregion(&s->mmio, DG_REG_MAGIC, &s->regs);
-    pci_register_bar(dev, DG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY,
-                     &s->mmio);
+    pci_register_bar(dev, DG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     pci_set_byte(dev->config + PCI_INTERRUPT_PIN, 1);
 }
 
 /* Diagnostics are host control state, deliberately not part of VM migration.
  * Enabling starts a fresh bounded window; disabling freezes it for inspection. */
-static bool dg_diagnostics_get(Object *obj, Error **errp)
-{
+static bool dg_diagnostics_get(Object *obj, Error **errp) {
     return DREAMGPU(obj)->diagnostics_enabled;
 }
 
-static void dg_diagnostics_set(Object *obj, bool enabled, Error **errp)
-{
+static void dg_diagnostics_set(Object *obj, bool enabled, Error **errp) {
     DreamGpu *s = DREAMGPU(obj);
     if (enabled) {
         if (!s->diagnostics) {
@@ -1034,32 +1035,38 @@ static void dg_diagnostics_set(Object *obj, bool enabled, Error **errp)
     s->diagnostics_enabled = enabled;
 }
 
-static char *dg_diagnostics_stats(Object *obj, Error **errp)
-{
+static char *dg_diagnostics_stats(Object *obj, Error **errp) {
     DreamGpu *s = DREAMGPU(obj);
     const DgDiagnostics *d = s->diagnostics;
     GString *out = g_string_new(NULL);
     bool comma = false;
-    g_string_append_printf(out, "{\"schema\":1,\"enabled\":%s,\"elapsed_us\":%" PRIu64 ",\"mmio\":[",
-        s->diagnostics_enabled ? "true" : "false", d ? (s->diagnostics_enabled ?
-            (uint64_t)g_get_monotonic_time() - d->start_us : d->elapsed_us) : 0);
+    g_string_append_printf(
+        out, "{\"schema\":1,\"enabled\":%s,\"elapsed_us\":%" PRIu64 ",\"mmio\":[",
+        s->diagnostics_enabled ? "true" : "false",
+        d ? (s->diagnostics_enabled ? (uint64_t)g_get_monotonic_time() - d->start_us
+                                    : d->elapsed_us)
+          : 0);
     if (d) {
         for (unsigned i = 0; i < G_N_ELEMENTS(d->reads); i++) {
             if (!d->reads[i] && !d->writes[i]) {
                 continue;
             }
-            g_string_append_printf(out, "%s{\"offset\":%u,\"reads\":%" PRIu64 ",\"writes\":%" PRIu64 "}",
-                comma ? "," : "", i * 4, d->reads[i], d->writes[i]);
+            g_string_append_printf(out,
+                                   "%s{\"offset\":%u,\"reads\":%" PRIu64 ",\"writes\":%" PRIu64 "}",
+                                   comma ? "," : "", i * 4, d->reads[i], d->writes[i]);
             comma = true;
         }
     }
-    g_string_append_printf(out, "],\"gl\":{\"batches\":%" PRIu64 ",\"bytes\":%" PRIu64 ",\"records\":%" PRIu64 ",\"operations\":[",
-        d ? d->batches : 0, d ? d->bytes : 0, d ? d->records : 0);
+    g_string_append_printf(out,
+                           "],\"gl\":{\"batches\":%" PRIu64 ",\"bytes\":%" PRIu64
+                           ",\"records\":%" PRIu64 ",\"operations\":[",
+                           d ? d->batches : 0, d ? d->bytes : 0, d ? d->records : 0);
     comma = false;
     if (d) {
         for (unsigned i = 0; i < G_N_ELEMENTS(d->operations); i++) {
             if (d->operations[i]) {
-                g_string_append_printf(out, "%s{\"op\":%u,\"count\":%" PRIu64 "}", comma ? "," : "", i, d->operations[i]);
+                g_string_append_printf(out, "%s{\"op\":%u,\"count\":%" PRIu64 "}", comma ? "," : "",
+                                       i, d->operations[i]);
                 comma = true;
             }
         }
@@ -1069,7 +1076,8 @@ static char *dg_diagnostics_stats(Object *obj, Error **errp)
     if (d) {
         for (unsigned i = 0; i < G_N_ELEMENTS(d->functions); i++) {
             if (d->functions[i]) {
-                g_string_append_printf(out, "%s{\"function\":%u,\"count\":%" PRIu64 "}", comma ? "," : "", i, d->functions[i]);
+                g_string_append_printf(out, "%s{\"function\":%u,\"count\":%" PRIu64 "}",
+                                       comma ? "," : "", i, d->functions[i]);
                 comma = true;
             }
         }
@@ -1079,7 +1087,8 @@ static char *dg_diagnostics_stats(Object *obj, Error **errp)
     if (d) {
         for (unsigned i = 0; i < G_N_ELEMENTS(d->desktop); i++) {
             if (d->desktop[i]) {
-                g_string_append_printf(out, "%s{\"op\":%u,\"count\":%" PRIu64 ",\"rectangle_bytes\":%" PRIu64 "}",
+                g_string_append_printf(
+                    out, "%s{\"op\":%u,\"count\":%" PRIu64 ",\"rectangle_bytes\":%" PRIu64 "}",
                     comma ? "," : "", i, d->desktop[i], d->desktop_bytes[i]);
                 comma = true;
             }
@@ -1089,17 +1098,18 @@ static char *dg_diagnostics_stats(Object *obj, Error **errp)
     if (d) {
         for (unsigned i = 0; i < d->query_count; i++) {
             const DgDiagnosticQuery *q = &d->queries[i];
-            g_string_append_printf(out, "%s{\"function\":%u,\"arg0\":%u,\"arg1\":%u,\"count\":%" PRIu64 "}",
+            g_string_append_printf(
+                out, "%s{\"function\":%u,\"arg0\":%u,\"arg1\":%u,\"count\":%" PRIu64 "}",
                 i ? "," : "", q->function, q->arg0, q->arg1, q->count);
         }
     }
-    g_string_append_printf(out, "],\"query_overflow\":%" PRIu64 ",\"function_overflow\":%" PRIu64 "}}",
-        d ? d->query_overflow : 0, d ? d->function_overflow : 0);
+    g_string_append_printf(out,
+                           "],\"query_overflow\":%" PRIu64 ",\"function_overflow\":%" PRIu64 "}}",
+                           d ? d->query_overflow : 0, d ? d->function_overflow : 0);
     return g_string_free(out, false);
 }
 
-static void dg_instance_init(Object *obj)
-{
+static void dg_instance_init(Object *obj) {
     object_property_add_bool(obj, "diagnostic-counters", dg_diagnostics_get, dg_diagnostics_set);
     object_property_add_str(obj, "diagnostic-stats", dg_diagnostics_stats, NULL);
 }
@@ -1109,8 +1119,7 @@ static const Property dg_properties[] = {
     DEFINE_PROP_STRING("gpu-socket", DreamGpu, gpu_socket),
 };
 
-static void dg_class_init(ObjectClass *klass, const void *data)
-{
+static void dg_class_init(ObjectClass *klass, const void *data) {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
     AcpiDevAmlIfClass *ac = ACPI_DEV_AML_IF_CLASS(klass);
@@ -1130,8 +1139,7 @@ static void dg_class_init(ObjectClass *klass, const void *data)
     ac->build_dev_aml = build_vga_aml;
 }
 
-static void dg_finalize(Object *obj)
-{
+static void dg_finalize(Object *obj) {
     DreamGpu *s = DREAMGPU(obj);
 
 #ifdef CONFIG_DREAMGPU_GL
@@ -1158,15 +1166,15 @@ static const TypeInfo dg_info = {
     .instance_init = dg_instance_init,
     .instance_finalize = dg_finalize,
     .class_init = dg_class_init,
-    .interfaces = (const InterfaceInfo[]) {
-        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
-        { TYPE_ACPI_DEV_AML_IF },
-        { },
-    },
+    .interfaces =
+        (const InterfaceInfo[]){
+            {INTERFACE_CONVENTIONAL_PCI_DEVICE},
+            {TYPE_ACPI_DEV_AML_IF},
+            {},
+        },
 };
 
-static void dg_register_types(void)
-{
+static void dg_register_types(void) {
     type_register_static(&dg_info);
 }
 type_init(dg_register_types)

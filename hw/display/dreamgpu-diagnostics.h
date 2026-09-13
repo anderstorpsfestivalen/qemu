@@ -22,8 +22,7 @@ typedef struct {
     DgDiagnosticQuery queries[DG_DIAGNOSTIC_QUERIES];
 } DgDiagnostics;
 
-static void dg_diagnostic_record(DgDiagnostics *d, const uint8_t *r)
-{
+static void dg_diagnostic_record(DgDiagnostics *d, const uint8_t *r) {
     uint32_t op = ldl_le_p(r + DG_GL_OFF_OP);
     d->records++;
     if (op < G_N_ELEMENTS(d->operations)) {
@@ -33,7 +32,8 @@ static void dg_diagnostic_record(DgDiagnostics *d, const uint8_t *r)
         uint32_t operation = ldl_le_p(r + DG_GL_HEADER_BYTES);
         if (operation < G_N_ELEMENTS(d->desktop)) {
             d->desktop[operation]++;
-            d->desktop_bytes[operation] += (uint64_t)ldl_le_p(r + DG_GL_HEADER_BYTES + DG_DESKTOP_WIDTH) *
+            d->desktop_bytes[operation] +=
+                (uint64_t)ldl_le_p(r + DG_GL_HEADER_BYTES + DG_DESKTOP_WIDTH) *
                 ldl_le_p(r + DG_GL_HEADER_BYTES + DG_DESKTOP_HEIGHT) * 4;
         }
     }
@@ -54,8 +54,11 @@ static void dg_diagnostic_record(DgDiagnostics *d, const uint8_t *r)
                 }
             }
             if (d->query_count < G_N_ELEMENTS(d->queries)) {
-                d->queries[d->query_count++] = (DgDiagnosticQuery) {
-                    .function = function, .arg0 = a0, .arg1 = a1, .count = 1,
+                d->queries[d->query_count++] = (DgDiagnosticQuery){
+                    .function = function,
+                    .arg0 = a0,
+                    .arg1 = a1,
+                    .count = 1,
                 };
             } else {
                 d->query_overflow++;

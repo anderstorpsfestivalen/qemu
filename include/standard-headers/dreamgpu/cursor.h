@@ -5,41 +5,41 @@
 #ifndef DREAMGPU_CURSOR_H
 #define DREAMGPU_CURSOR_H
 
-#define DG_CURSOR_ABI_VERSION       0x00010000
-#define DG_CURSOR_REG_VERSION       0x1080
-#define DG_CURSOR_REG_ADDR_LO       0x1084
-#define DG_CURSOR_REG_ADDR_HI       0x1088
-#define DG_CURSOR_REG_BYTES         0x108c
-#define DG_CURSOR_REG_WIDTH         0x1090
-#define DG_CURSOR_REG_HEIGHT        0x1094
-#define DG_CURSOR_REG_HOT_X         0x1098
-#define DG_CURSOR_REG_HOT_Y         0x109c
-#define DG_CURSOR_REG_FORMAT        0x10a0
-#define DG_CURSOR_REG_X             0x10a4
-#define DG_CURSOR_REG_Y             0x10a8
-#define DG_CURSOR_REG_FLAGS         0x10ac
-#define DG_CURSOR_REG_SEQUENCE      0x10b0
-#define DG_CURSOR_REG_SUBMIT        0x10b4
-#define DG_CURSOR_REG_STATUS        0x10b8
-#define DG_CURSOR_REG_COMPLETED     0x10bc
-#define DG_CURSOR_REG_ERROR         0x10c0
+#define DG_CURSOR_ABI_VERSION 0x00010000
+#define DG_CURSOR_REG_VERSION 0x1080
+#define DG_CURSOR_REG_ADDR_LO 0x1084
+#define DG_CURSOR_REG_ADDR_HI 0x1088
+#define DG_CURSOR_REG_BYTES 0x108c
+#define DG_CURSOR_REG_WIDTH 0x1090
+#define DG_CURSOR_REG_HEIGHT 0x1094
+#define DG_CURSOR_REG_HOT_X 0x1098
+#define DG_CURSOR_REG_HOT_Y 0x109c
+#define DG_CURSOR_REG_FORMAT 0x10a0
+#define DG_CURSOR_REG_X 0x10a4
+#define DG_CURSOR_REG_Y 0x10a8
+#define DG_CURSOR_REG_FLAGS 0x10ac
+#define DG_CURSOR_REG_SEQUENCE 0x10b0
+#define DG_CURSOR_REG_SUBMIT 0x10b4
+#define DG_CURSOR_REG_STATUS 0x10b8
+#define DG_CURSOR_REG_COMPLETED 0x10bc
+#define DG_CURSOR_REG_ERROR 0x10c0
 #define DG_CURSOR_REG_MAX_DIMENSION 0x10c4
 
-#define DG_CURSOR_SHAPE             1
-#define DG_CURSOR_MOVE              2
-#define DG_CURSOR_VISIBLE           1
-#define DG_CURSOR_NATIVE_ENABLED    2
-#define DG_CURSOR_FLAGS_MASK        3
+#define DG_CURSOR_SHAPE 1
+#define DG_CURSOR_MOVE 2
+#define DG_CURSOR_VISIBLE 1
+#define DG_CURSOR_NATIVE_ENABLED 2
+#define DG_CURSOR_FLAGS_MASK 3
 #define DG_CURSOR_ARGB_PREMULTIPLIED 1
-#define DG_CURSOR_AND_XOR           2
-#define DG_CURSOR_MAX_DIMENSION     64
-#define DG_CURSOR_MAX_PIXELS        4096
-#define DG_CURSOR_PIXEL_BYTES       8
-#define DG_CURSOR_MAX_BYTES         32768
-#define DG_CURSOR_ERROR_NONE        0
-#define DG_CURSOR_ERROR_SHAPE       1
-#define DG_CURSOR_ERROR_DMA         2
-#define DG_CURSOR_ERROR_FLAGS       3
+#define DG_CURSOR_AND_XOR 2
+#define DG_CURSOR_MAX_DIMENSION 64
+#define DG_CURSOR_MAX_PIXELS 4096
+#define DG_CURSOR_PIXEL_BYTES 8
+#define DG_CURSOR_MAX_BYTES 32768
+#define DG_CURSOR_ERROR_NONE 0
+#define DG_CURSOR_ERROR_SHAPE 1
+#define DG_CURSOR_ERROR_DMA 2
+#define DG_CURSOR_ERROR_FLAGS 3
 
 /*
  * SHAPE snapshots all registers and exactly width*height*8 DMA bytes; MOVE
@@ -75,36 +75,36 @@
  * Producer coalesces unsent shape/position updates to the latest state.
  * Cursor-only changes do not publish or dirty a desktop framebuffer.
  */
-#define DG_CURSOR_TRANSPORT_MSG_MAPPING             'C'
-#define DG_CURSOR_TRANSPORT_MSG_SHAPE               'S'
-#define DG_CURSOR_TRANSPORT_MSG_POSITION            'P'
-#define DG_CURSOR_TRANSPORT_PACKET_BYTES            24
-#define DG_CURSOR_TRANSPORT_PACKET_FLAGS            1
-#define DG_CURSOR_TRANSPORT_PACKET_SEQUENCE         8
-#define DG_CURSOR_TRANSPORT_PACKET_X                16
-#define DG_CURSOR_TRANSPORT_PACKET_Y                20
+#define DG_CURSOR_TRANSPORT_MSG_MAPPING 'C'
+#define DG_CURSOR_TRANSPORT_MSG_SHAPE 'S'
+#define DG_CURSOR_TRANSPORT_MSG_POSITION 'P'
+#define DG_CURSOR_TRANSPORT_PACKET_BYTES 24
+#define DG_CURSOR_TRANSPORT_PACKET_FLAGS 1
+#define DG_CURSOR_TRANSPORT_PACKET_SEQUENCE 8
+#define DG_CURSOR_TRANSPORT_PACKET_X 16
+#define DG_CURSOR_TRANSPORT_PACKET_Y 20
 
-#define DG_CURSOR_TRANSPORT_MAGIC                   0x5255434a /* fixed wire signature */
-#define DG_CURSOR_TRANSPORT_VERSION                 1
-#define DG_CURSOR_TRANSPORT_HEADER_BYTES            64
-#define DG_CURSOR_TRANSPORT_SLOT_COUNT              3
-#define DG_CURSOR_TRANSPORT_SLOT_BYTES              32832
-#define DG_CURSOR_TRANSPORT_MAPPING_BYTES           98560
-#define DG_CURSOR_TRANSPORT_SLOT_META_BYTES         64
-#define DG_CURSOR_TRANSPORT_FREE                    0
-#define DG_CURSOR_TRANSPORT_WRITING                 1
-#define DG_CURSOR_TRANSPORT_READY                   2
-#define DG_CURSOR_TRANSPORT_READING                 3
+#define DG_CURSOR_TRANSPORT_MAGIC 0x5255434a /* fixed wire signature */
+#define DG_CURSOR_TRANSPORT_VERSION 1
+#define DG_CURSOR_TRANSPORT_HEADER_BYTES 64
+#define DG_CURSOR_TRANSPORT_SLOT_COUNT 3
+#define DG_CURSOR_TRANSPORT_SLOT_BYTES 32832
+#define DG_CURSOR_TRANSPORT_MAPPING_BYTES 98560
+#define DG_CURSOR_TRANSPORT_SLOT_META_BYTES 64
+#define DG_CURSOR_TRANSPORT_FREE 0
+#define DG_CURSOR_TRANSPORT_WRITING 1
+#define DG_CURSOR_TRANSPORT_READY 2
+#define DG_CURSOR_TRANSPORT_READING 3
 
 /* Header offsets. All reserved bytes must be zero. */
-#define DG_CURSOR_TRANSPORT_HDR_MAGIC               0
-#define DG_CURSOR_TRANSPORT_HDR_VERSION             4
-#define DG_CURSOR_TRANSPORT_HDR_MAX_DIMENSION       8
-#define DG_CURSOR_TRANSPORT_HDR_SLOT_COUNT          12
-#define DG_CURSOR_TRANSPORT_HDR_EPOCH               16 /* immutable u64 */
-#define DG_CURSOR_TRANSPORT_HDR_GENERATION          24 /* atomic u64, release published */
-#define DG_CURSOR_TRANSPORT_HDR_SLOTS               32 /* three atomic u32 slot states */
-#define DG_CURSOR_TRANSPORT_HDR_RESERVED            44 /* zero through byte63 */
+#define DG_CURSOR_TRANSPORT_HDR_MAGIC 0
+#define DG_CURSOR_TRANSPORT_HDR_VERSION 4
+#define DG_CURSOR_TRANSPORT_HDR_MAX_DIMENSION 8
+#define DG_CURSOR_TRANSPORT_HDR_SLOT_COUNT 12
+#define DG_CURSOR_TRANSPORT_HDR_EPOCH 16      /* immutable u64 */
+#define DG_CURSOR_TRANSPORT_HDR_GENERATION 24 /* atomic u64, release published */
+#define DG_CURSOR_TRANSPORT_HDR_SLOTS 32      /* three atomic u32 slot states */
+#define DG_CURSOR_TRANSPORT_HDR_RESERVED 44   /* zero through byte63 */
 
 /* Slot offsets: HEADER_BYTES + slot*SLOT_BYTES. Producer claims FREE or READY
  * with CAS -> WRITING, writes metadata/pixels, then release-stores READY and
@@ -112,18 +112,18 @@
  * copies a complete shape, then release-stores FREE. Never hold a slot for
  * cursor movement. Unused pixel and reserved metadata bytes are zero.
  */
-#define DG_CURSOR_TRANSPORT_SLOT_GENERATION         0 /* u64 */
-#define DG_CURSOR_TRANSPORT_SLOT_WIDTH              8
-#define DG_CURSOR_TRANSPORT_SLOT_HEIGHT             12
-#define DG_CURSOR_TRANSPORT_SLOT_HOT_X              16
-#define DG_CURSOR_TRANSPORT_SLOT_HOT_Y              20
-#define DG_CURSOR_TRANSPORT_SLOT_FORMAT             24
-#define DG_CURSOR_TRANSPORT_SLOT_RESERVED           28
-#define DG_CURSOR_TRANSPORT_SLOT_POSITION_SEQUENCE  32 /* u64 */
-#define DG_CURSOR_TRANSPORT_SLOT_X                  40
-#define DG_CURSOR_TRANSPORT_SLOT_Y                  44
-#define DG_CURSOR_TRANSPORT_SLOT_FLAGS              48
-#define DG_CURSOR_TRANSPORT_SLOT_RESERVED_END       52 /* zero through byte63 */
-#define DG_CURSOR_TRANSPORT_SLOT_PIXELS             64 /* canonical packed pixel pairs */
+#define DG_CURSOR_TRANSPORT_SLOT_GENERATION 0 /* u64 */
+#define DG_CURSOR_TRANSPORT_SLOT_WIDTH 8
+#define DG_CURSOR_TRANSPORT_SLOT_HEIGHT 12
+#define DG_CURSOR_TRANSPORT_SLOT_HOT_X 16
+#define DG_CURSOR_TRANSPORT_SLOT_HOT_Y 20
+#define DG_CURSOR_TRANSPORT_SLOT_FORMAT 24
+#define DG_CURSOR_TRANSPORT_SLOT_RESERVED 28
+#define DG_CURSOR_TRANSPORT_SLOT_POSITION_SEQUENCE 32 /* u64 */
+#define DG_CURSOR_TRANSPORT_SLOT_X 40
+#define DG_CURSOR_TRANSPORT_SLOT_Y 44
+#define DG_CURSOR_TRANSPORT_SLOT_FLAGS 48
+#define DG_CURSOR_TRANSPORT_SLOT_RESERVED_END 52 /* zero through byte63 */
+#define DG_CURSOR_TRANSPORT_SLOT_PIXELS 64       /* canonical packed pixel pairs */
 
 #endif

@@ -39,19 +39,19 @@
  * Audio shared memory header - must match Rust JukeAudioHeader
  */
 typedef struct JukeAudioHeader {
-    uint32_t magic;           /* JUKE_AUDIO_MAGIC */
-    uint32_t version;         /* Protocol version */
-    uint32_t sample_rate;     /* e.g., 48000 */
-    uint32_t channels;        /* 1 or 2 */
-    uint32_t format;          /* JUKE_AUDIO_FMT_* */
-    uint32_t ring_frames;     /* Buffer size in frames */
-    uint32_t write_idx;       /* Written by QEMU (frame index) */
-    uint32_t read_idx;        /* Written by Juke (frame index) */
-    uint32_t enabled;         /* 1 = playing, 0 = paused */
-    uint32_t muted;           /* 1 = muted by guest, 0 = not muted (v2) */
-    uint32_t volume_left;     /* Left channel volume 0-255 (v2) */
-    uint32_t volume_right;    /* Right channel volume 0-255 (v2) */
-    uint32_t padding[4];      /* Pad to 64 bytes */
+    uint32_t magic;        /* JUKE_AUDIO_MAGIC */
+    uint32_t version;      /* Protocol version */
+    uint32_t sample_rate;  /* e.g., 48000 */
+    uint32_t channels;     /* 1 or 2 */
+    uint32_t format;       /* JUKE_AUDIO_FMT_* */
+    uint32_t ring_frames;  /* Buffer size in frames */
+    uint32_t write_idx;    /* Written by QEMU (frame index) */
+    uint32_t read_idx;     /* Written by Juke (frame index) */
+    uint32_t enabled;      /* 1 = playing, 0 = paused */
+    uint32_t muted;        /* 1 = muted by guest, 0 = not muted (v2) */
+    uint32_t volume_left;  /* Left channel volume 0-255 (v2) */
+    uint32_t volume_right; /* Right channel volume 0-255 (v2) */
+    uint32_t padding[4];   /* Pad to 64 bytes */
     /* Audio samples follow (ring_frames * channels * bytes_per_sample) */
 } JukeAudioHeader;
 
@@ -79,8 +79,7 @@ typedef struct JukeVoiceOut {
 /*
  * Send shared memory fd to Juke via SCM_RIGHTS
  */
-static void juke_audio_send_fd(JukeAudioState *s)
-{
+static void juke_audio_send_fd(JukeAudioState *s) {
     if (s->client_fd < 0 || s->shmem_fd < 0 || s->fd_sent) {
         return;
     }
@@ -115,8 +114,7 @@ static void juke_audio_send_fd(JukeAudioState *s)
 /*
  * Try to connect to Juke's socket (Juke is the server)
  */
-static int juke_audio_connect(JukeAudioState *s)
-{
+static int juke_audio_connect(JukeAudioState *s) {
     if (!s->socket_path || s->client_fd >= 0) {
         return s->client_fd >= 0 ? 0 : -1;
     }
@@ -150,8 +148,7 @@ static int juke_audio_connect(JukeAudioState *s)
 /*
  * Write audio samples to ring buffer
  */
-static size_t juke_write(HWVoiceOut *hw, void *buf, size_t len)
-{
+static size_t juke_write(HWVoiceOut *hw, void *buf, size_t len) {
     JukeVoiceOut *juke = (JukeVoiceOut *)hw;
     JukeAudioState *s = juke->state;
 
@@ -184,7 +181,7 @@ static size_t juke_write(HWVoiceOut *hw, void *buf, size_t len)
 
     /* Calculate available space in frames */
     uint32_t used = (write_idx - read_idx) & (ring_frames - 1);
-    uint32_t free_frames = ring_frames - used - 1;  /* -1 to distinguish full from empty */
+    uint32_t free_frames = ring_frames - used - 1; /* -1 to distinguish full from empty */
 
     /* Calculate frame size and convert len to frames */
     size_t frame_size = hw->info.bytes_per_frame;
@@ -221,8 +218,7 @@ static size_t juke_write(HWVoiceOut *hw, void *buf, size_t len)
     return bytes_to_write;
 }
 
-static int juke_init_out(HWVoiceOut *hw, struct audsettings *as)
-{
+static int juke_init_out(HWVoiceOut *hw, struct audsettings *as) {
     JukeVoiceOut *juke = (JukeVoiceOut *)hw;
     JukeAudioState *s = AUDIO_JUKE(hw->s);
 
@@ -248,18 +244,19 @@ static int juke_init_out(HWVoiceOut *hw, struct audsettings *as)
         s->shmem->version = JUKE_AUDIO_VERSION;
         s->shmem->sample_rate = as->freq;
         s->shmem->channels = as->nchannels;
-        s->shmem->format = (as->fmt == AUDIO_FORMAT_F32) ? JUKE_AUDIO_FMT_F32LE : JUKE_AUDIO_FMT_S16LE;
+        s->shmem->format =
+            (as->fmt == AUDIO_FORMAT_F32) ? JUKE_AUDIO_FMT_F32LE : JUKE_AUDIO_FMT_S16LE;
         s->shmem->ring_frames = JUKE_AUDIO_RING_FRAMES;
         s->shmem->write_idx = 0;
         s->shmem->read_idx = 0;
-        s->shmem->enabled = 0;  /* Juke will enable when ready */
+        s->shmem->enabled = 0; /* Juke will enable when ready */
         s->shmem->muted = 0;
-        s->shmem->volume_left = 255;   /* Full volume */
+        s->shmem->volume_left = 255; /* Full volume */
         s->shmem->volume_right = 255;
 
         error_report("juke-audio: initialized %uHz %uch format=%u ring=%u frames",
-                     s->shmem->sample_rate, s->shmem->channels,
-                     s->shmem->format, s->shmem->ring_frames);
+                     s->shmem->sample_rate, s->shmem->channels, s->shmem->format,
+                     s->shmem->ring_frames);
 
         /* Try to connect and send fd */
         juke_audio_connect(s);
@@ -271,8 +268,7 @@ static int juke_init_out(HWVoiceOut *hw, struct audsettings *as)
     return 0;
 }
 
-static void juke_fini_out(HWVoiceOut *hw)
-{
+static void juke_fini_out(HWVoiceOut *hw) {
     /* Cleanup handled in juke_audio_finalize */
 }
 
@@ -280,8 +276,7 @@ static void juke_fini_out(HWVoiceOut *hw)
  * Handle volume changes from guest OS
  * This is called when the guest's mixer settings change
  */
-static void juke_volume_out(HWVoiceOut *hw, Volume *vol)
-{
+static void juke_volume_out(HWVoiceOut *hw, Volume *vol) {
     JukeVoiceOut *juke = (JukeVoiceOut *)hw;
     JukeAudioState *s = juke->state;
 
@@ -302,8 +297,7 @@ static void juke_volume_out(HWVoiceOut *hw, Volume *vol)
     __atomic_store_n(&hdr->volume_right, vol_r, __ATOMIC_RELEASE);
 }
 
-static void juke_enable_out(HWVoiceOut *hw, bool enable)
-{
+static void juke_enable_out(HWVoiceOut *hw, bool enable) {
     JukeVoiceOut *juke = (JukeVoiceOut *)hw;
 
     if (enable) {
@@ -313,16 +307,14 @@ static void juke_enable_out(HWVoiceOut *hw, bool enable)
     /* Note: s->shmem->enabled is controlled by Juke (reader), not QEMU */
 }
 
-static void juke_audio_instance_init(Object *obj)
-{
+static void juke_audio_instance_init(Object *obj) {
     JukeAudioState *s = AUDIO_JUKE(obj);
 
     s->shmem_fd = -1;
     s->client_fd = -1;
 }
 
-static bool juke_audio_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
-{
+static bool juke_audio_realize(AudioBackend *abe, Audiodev *dev, Error **errp) {
     JukeAudioState *s = AUDIO_JUKE(abe);
 
     s->socket_path = g_strdup(dev->u.juke.path);
@@ -331,8 +323,7 @@ static bool juke_audio_realize(AudioBackend *abe, Audiodev *dev, Error **errp)
     return audio_juke_parent_class->realize(abe, dev, errp);
 }
 
-static void juke_audio_finalize(Object *obj)
-{
+static void juke_audio_finalize(Object *obj) {
     JukeAudioState *s = AUDIO_JUKE(obj);
 
     if (s->client_fd >= 0) {
@@ -344,8 +335,7 @@ static void juke_audio_finalize(Object *obj)
     g_free(s->socket_path);
 }
 
-static void audio_juke_class_init(ObjectClass *klass, const void *data)
-{
+static void audio_juke_class_init(ObjectClass *klass, const void *data) {
     AudioBackendClass *b = AUDIO_BACKEND_CLASS(klass);
     AudioMixengBackendClass *k = AUDIO_MIXENG_BACKEND_CLASS(klass);
 

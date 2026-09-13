@@ -17,51 +17,43 @@ typedef struct Fixture {
     uint32_t sequence;
 } Fixture;
 
-static void found_device(QPCIDevice *dev, int devfn, void *opaque)
-{
+static void found_device(QPCIDevice *dev, int devfn, void *opaque) {
     *(QPCIDevice **)opaque = dev;
 }
 
-static uint32_t reg_read(Fixture *f, unsigned reg)
-{
+static uint32_t reg_read(Fixture *f, unsigned reg) {
     return qpci_io_readl(f->dev, f->regs, reg);
 }
 
-static void reg_write(Fixture *f, unsigned reg, uint32_t value)
-{
+static void reg_write(Fixture *f, unsigned reg, uint32_t value) {
     qpci_io_writel(f->dev, f->regs, reg, value);
 }
 
-static void setup(Fixture *f, gconstpointer unused)
-{
+static void setup(Fixture *f, gconstpointer unused) {
     uint64_t size;
 
     f->qs = qtest_pc_boot("-machine pc -m 64 -vga none "
                           "-device dreamgpu,id=retro");
-    qpci_device_foreach(f->qs->pcibus, DG_PCI_VENDOR_ID,
-                        DG_PCI_DEVICE_ID, found_device, &f->dev);
+    qpci_device_foreach(f->qs->pcibus, DG_PCI_VENDOR_ID, DG_PCI_DEVICE_ID, found_device, &f->dev);
     g_assert_nonnull(f->dev);
     f->vram = qpci_iomap(f->dev, DG_VRAM_BAR, &size);
     g_assert_cmpuint(size, ==, 16 * 1024 * 1024);
     f->regs = qpci_iomap(f->dev, DG_MMIO_BAR, &size);
     g_assert_cmpuint(size, ==, DG_MMIO_SIZE);
     qpci_device_enable(f->dev);
-    f->batch = qmalloc(f->qs, MAX(DG_MAX_COMMANDS * DG_COMMAND_BYTES,
-                                 (DG_GL_MAX_RECORDS + 1) * 52));
+    f->batch =
+        qmalloc(f->qs, MAX(DG_MAX_COMMANDS * DG_COMMAND_BYTES, (DG_GL_MAX_RECORDS + 1) * 52));
     f->sequence = 0;
 }
 
-static void teardown(Fixture *f, gconstpointer unused)
-{
+static void teardown(Fixture *f, gconstpointer unused) {
     qfree(f->qs, f->batch);
     g_free(f->dev);
     qtest_shutdown(f->qs);
 }
 
-static void make_cmd(uint8_t *c, uint32_t op, uint32_t bpp,
-                     uint32_t src, uint32_t dst, uint32_t stride,
-                     uint32_t width, uint32_t height, uint32_t color)
-{
+static void make_cmd(uint8_t *c, uint32_t op, uint32_t bpp, uint32_t src, uint32_t dst,
+                     uint32_t stride, uint32_t width, uint32_t height, uint32_t color) {
     memset(c, 0, DG_COMMAND_BYTES);
     stl_le_p(c + DG_CMD_OPCODE, op);
     stl_le_p(c + DG_CMD_BPP, bpp);
@@ -74,9 +66,7 @@ static void make_cmd(uint8_t *c, uint32_t op, uint32_t bpp,
     stl_le_p(c + DG_CMD_COLOR, color);
 }
 
-static void submit_flags(Fixture *f, const uint8_t *cmds, uint32_t count,
-                         uint32_t flags)
-{
+static void submit_flags(Fixture *f, const uint8_t *cmds, uint32_t count, uint32_t flags) {
     if (cmds && count <= DG_MAX_COMMANDS) {
         qtest_memwrite(f->qs->qts, f->batch, cmds, count * DG_COMMAND_BYTES);
     }
@@ -87,13 +77,11 @@ static void submit_flags(Fixture *f, const uint8_t *cmds, uint32_t count,
     reg_write(f, DG_REG_SUBMIT, flags);
 }
 
-static void submit(Fixture *f, const uint8_t *cmds, uint32_t count)
-{
+static void submit(Fixture *f, const uint8_t *cmds, uint32_t count) {
     submit_flags(f, cmds, count, DG_SUBMIT_START);
 }
 
-static void await_completion(Fixture *f, uint32_t error)
-{
+static void await_completion(Fixture *f, uint32_t error) {
     int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
     uint32_t status;
 
@@ -104,27 +92,22 @@ static void await_completion(Fixture *f, uint32_t error)
             g_usleep(100);
         }
     } while (status & DG_STATUS_BUSY);
-    g_assert_cmpuint(status, ==,
-                     DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0));
+    g_assert_cmpuint(status, ==, DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0));
     g_assert_cmpuint(reg_read(f, DG_REG_ERROR), ==, error);
     g_assert_cmpuint(reg_read(f, DG_REG_COMPLETED_SEQUENCE), ==, f->sequence);
 }
 
-static void test_identity(Fixture *f, gconstpointer unused)
-{
+static void test_identity(Fixture *f, gconstpointer unused) {
     g_assert_cmphex(reg_read(f, DG_REG_MAGIC), ==, DG_MAGIC);
     g_assert_cmphex(reg_read(f, DG_REG_VERSION), ==, DG_ABI_VERSION);
     g_assert_cmphex(reg_read(f, DG_REG_CAPS), ==,
-                    DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE |
-                    DG_CAP_COMPLETION_IRQ | DG_CAP_INLINE_NO_IRQ |
-                    DG_CAP_CURSOR);
+                    DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE | DG_CAP_COMPLETION_IRQ |
+                        DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR);
     g_assert_cmpuint(reg_read(f, DG_REG_STATUS), ==, 0);
-    g_assert_cmpuint(qpci_io_readw(f->dev, f->regs,
-                                 PCI_VGA_BOCHS_OFFSET), >=, VBE_DISPI_ID0);
+    g_assert_cmpuint(qpci_io_readw(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET), >=, VBE_DISPI_ID0);
 }
 
-static void test_fill(Fixture *f, gconstpointer unused)
-{
+static void test_fill(Fixture *f, gconstpointer unused) {
     uint8_t cmd[DG_COMMAND_BYTES];
     uint8_t actual[512], expected[512];
     unsigned bpp, x, y;
@@ -145,11 +128,10 @@ static void test_fill(Fixture *f, gconstpointer unused)
     }
 }
 
-static void test_copy_overlap(Fixture *f, gconstpointer unused)
-{
+static void test_copy_overlap(Fixture *f, gconstpointer unused) {
     uint8_t cmd[DG_COMMAND_BYTES];
     uint8_t actual[1024], expected[1024], source[1024];
-    const uint32_t offsets[][2] = { {0, 4}, {4, 0}, {0, 68}, {68, 0} };
+    const uint32_t offsets[][2] = {{0, 4}, {4, 0}, {0, 68}, {68, 0}};
     unsigned n, i, y;
 
     for (i = 0; i < sizeof(source); i++) {
@@ -171,8 +153,7 @@ static void test_copy_overlap(Fixture *f, gconstpointer unused)
     }
 }
 
-static void test_invalid(Fixture *f, gconstpointer unused)
-{
+static void test_invalid(Fixture *f, gconstpointer unused) {
     uint8_t cmds[DG_COMMAND_BYTES * 5], actual[64], initial[64];
     unsigned i;
 
@@ -193,8 +174,7 @@ static void test_invalid(Fixture *f, gconstpointer unused)
     make_cmd(cmds, DG_CMD_FILL, 4, 0, UINT32_MAX - 3, 64, 16, 1, 0);
     submit(f, cmds, 1);
     await_completion(f, DG_ERROR_BOUNDS);
-    make_cmd(cmds, DG_CMD_FILL, 4, 0, 0, UINT32_MAX, UINT32_MAX,
-             UINT32_MAX, 0);
+    make_cmd(cmds, DG_CMD_FILL, 4, 0, 0, UINT32_MAX, UINT32_MAX, UINT32_MAX, 0);
     submit(f, cmds, 1);
     await_completion(f, DG_ERROR_BOUNDS);
     make_cmd(cmds, DG_CMD_FILL, 0, 0, 0, 64, 16, 1, 0);
@@ -205,8 +185,7 @@ static void test_invalid(Fixture *f, gconstpointer unused)
     await_completion(f, DG_ERROR_BOUNDS);
 
     for (i = 0; i < 5; i++) {
-        make_cmd(cmds + i * DG_COMMAND_BYTES, DG_CMD_FILL,
-                 4, 0, 0, 4096 * 4, 4096, 1024, 0);
+        make_cmd(cmds + i * DG_COMMAND_BYTES, DG_CMD_FILL, 4, 0, 0, 4096 * 4, 4096, 1024, 0);
     }
     submit(f, cmds, 5);
     await_completion(f, DG_ERROR_WORK_LIMIT);
@@ -219,8 +198,7 @@ static void test_invalid(Fixture *f, gconstpointer unused)
     await_completion(f, DG_ERROR_DMA);
 }
 
-static void test_irq_reset(Fixture *f, gconstpointer unused)
-{
+static void test_irq_reset(Fixture *f, gconstpointer unused) {
     uint8_t cmd[DG_COMMAND_BYTES];
     uint32_t generation = reg_read(f, DG_REG_GENERATION);
 
@@ -228,27 +206,23 @@ static void test_irq_reset(Fixture *f, gconstpointer unused)
     submit(f, cmd, 1);
     await_completion(f, 0);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, DG_IRQ_COMPLETION);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     reg_write(f, DG_REG_IRQ_ENABLE, DG_IRQ_COMPLETION);
     g_assert_true(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     reg_write(f, DG_REG_IRQ_STATUS, DG_IRQ_COMPLETION);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     submit(f, cmd, 1);
     await_completion(f, 0);
     reg_write(f, DG_REG_RESET, 1);
     g_assert_cmpuint(reg_read(f, DG_REG_GENERATION), ==, generation + 1);
     g_assert_cmpuint(reg_read(f, DG_REG_STATUS), ==, 0);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, 0);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     submit(f, cmd, 1);
     await_completion(f, 0);
 }
 
-static void test_inline_irq(Fixture *f, gconstpointer unused)
-{
+static void test_inline_irq(Fixture *f, gconstpointer unused) {
     uint8_t commands[4 * DG_COMMAND_BYTES];
     const uint32_t flags = DG_SUBMIT_START | DG_SUBMIT_INLINE_NO_IRQ;
 
@@ -257,8 +231,7 @@ static void test_inline_irq(Fixture *f, gconstpointer unused)
     submit_flags(f, commands, 1, flags);
     await_completion(f, 0);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, 0);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     g_assert_cmphex(qpci_io_readl(f->dev, f->vram, 0), ==, 0x12345678);
 
     /* Immediate validation failures also have a final result on return. */
@@ -282,14 +255,13 @@ static void test_inline_irq(Fixture *f, gconstpointer unused)
      */
     reg_write(f, DG_REG_IRQ_ENABLE, 0);
     for (unsigned i = 0; i < 4; i++) {
-        make_cmd(commands + i * DG_COMMAND_BYTES, DG_CMD_FILL,
-                 4, 0, 0, 4096 * 4, 4096, 1024, 0x11223344);
+        make_cmd(commands + i * DG_COMMAND_BYTES, DG_CMD_FILL, 4, 0, 0, 4096 * 4, 4096, 1024,
+                 0x11223344);
     }
     submit_flags(f, commands, 4, flags);
     await_completion(f, 0);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, DG_IRQ_COMPLETION);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     reg_write(f, DG_REG_IRQ_ENABLE, DG_IRQ_COMPLETION);
     g_assert_true(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     reg_write(f, DG_REG_IRQ_STATUS, DG_IRQ_COMPLETION);
@@ -303,41 +275,34 @@ static void test_inline_irq(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, 0);
 }
 
-static void test_scanout(Fixture *f, gconstpointer unused)
-{
+static void test_scanout(Fixture *f, gconstpointer unused) {
     uint8_t cmd[DG_COMMAND_BYTES];
     g_autofree char *name = NULL;
     g_autofree char *contents = NULL;
     gsize size;
     int fd = g_file_open_tmp("dreamgpu-XXXXXX.ppm", &name, NULL);
-    const uint8_t color[] = { 0x12, 0x34, 0x56 };
+    const uint8_t color[] = {0x12, 0x34, 0x56};
 
     g_assert_cmpint(fd, >=, 0);
     close(fd);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_XRES, 640);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_YRES, 480);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_BPP, 32);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_ENABLE,
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_XRES, 640);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_YRES, 480);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_BPP, 32);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_ENABLE,
                    VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
     qtest_outb(f->qs->qts, 0x3c0, 0x20);
     make_cmd(cmd, DG_CMD_FILL, 4, 0, 0, 640 * 4, 640, 480, 0x00123456);
     submit(f, cmd, 1);
     await_completion(f, 0);
-    qtest_qmp_assert_success(f->qs->qts,
-        "{'execute':'screendump','arguments':{'filename':%s}}", name);
+    qtest_qmp_assert_success(f->qs->qts, "{'execute':'screendump','arguments':{'filename':%s}}",
+                             name);
     g_assert_true(g_file_get_contents(name, &contents, &size, NULL));
     g_assert_cmpuint(size, >=, 640 * 480 * 3);
-    g_assert_cmpmem(contents + size - sizeof(color), sizeof(color),
-                    color, sizeof(color));
+    g_assert_cmpmem(contents + size - sizeof(color), sizeof(color), color, sizeof(color));
     unlink(name);
 }
 
-static void cursor_submit(Fixture *f, uint32_t operation, uint32_t error)
-{
+static void cursor_submit(Fixture *f, uint32_t operation, uint32_t error) {
     reg_write(f, DG_CURSOR_REG_SEQUENCE, ++f->sequence);
     reg_write(f, DG_CURSOR_REG_SUBMIT, operation);
     g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_STATUS), ==,
@@ -345,19 +310,15 @@ static void cursor_submit(Fixture *f, uint32_t operation, uint32_t error)
     g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_ERROR), ==, error);
     g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_COMPLETED), ==, f->sequence);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, 0);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
 }
 
-static void test_cursor(Fixture *f, gconstpointer unused)
-{
-    uint8_t pixels[16] = { 0 };
+static void test_cursor(Fixture *f, gconstpointer unused) {
+    uint8_t pixels[16] = {0};
 
-    g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_VERSION), ==,
-                     DG_CURSOR_ABI_VERSION);
+    g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_VERSION), ==, DG_CURSOR_ABI_VERSION);
     g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_MAX_DIMENSION), ==, 64);
-    reg_write(f, DG_REG_IRQ_ENABLE,
-               DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
+    reg_write(f, DG_REG_IRQ_ENABLE, DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
     reg_write(f, DG_CURSOR_REG_X, (uint32_t)-123);
     reg_write(f, DG_CURSOR_REG_Y, INT32_MIN);
     reg_write(f, DG_CURSOR_REG_FLAGS, DG_CURSOR_NATIVE_ENABLED);
@@ -366,8 +327,7 @@ static void test_cursor(Fixture *f, gconstpointer unused)
     }
     reg_write(f, DG_CURSOR_REG_FLAGS, 4);
     cursor_submit(f, DG_CURSOR_MOVE, DG_CURSOR_ERROR_FLAGS);
-    reg_write(f, DG_CURSOR_REG_FLAGS,
-               DG_CURSOR_NATIVE_ENABLED | DG_CURSOR_VISIBLE);
+    reg_write(f, DG_CURSOR_REG_FLAGS, DG_CURSOR_NATIVE_ENABLED | DG_CURSOR_VISIBLE);
     reg_write(f, DG_CURSOR_REG_ADDR_LO, f->batch);
     reg_write(f, DG_CURSOR_REG_ADDR_HI, f->batch >> 32);
     reg_write(f, DG_CURSOR_REG_WIDTH, 2);
@@ -402,7 +362,7 @@ static void test_cursor(Fixture *f, gconstpointer unused)
     cursor_submit(f, DG_CURSOR_SHAPE, DG_CURSOR_ERROR_SHAPE);
     stl_le_p(pixels, 0x00ffffff);
     stl_le_p(pixels + 4, 0x00ffffff); /* exact invert */
-    stl_le_p(pixels + 8, 0); /* opaque white */
+    stl_le_p(pixels + 8, 0);          /* opaque white */
     stl_le_p(pixels + 12, 0x00ffffff);
     qtest_memwrite(f->qs->qts, f->batch, pixels, sizeof(pixels));
     cursor_submit(f, DG_CURSOR_SHAPE, 0);
@@ -417,16 +377,15 @@ static void test_cursor(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_CURSOR_REG_WIDTH), ==, 0);
 }
 
-static void test_batch_snapshot(Fixture *f, gconstpointer unused)
-{
+static void test_batch_snapshot(Fixture *f, gconstpointer unused) {
     uint8_t cmds[2 * DG_COMMAND_BYTES];
     g_autofree uint8_t *actual = g_malloc(8 * 1024 * 1024);
     unsigned i;
 
     /* Mix bpp at a work-quantum boundary, then mutate the guest batch. */
     make_cmd(cmds, DG_CMD_FILL, 1, 0, 8 * 1024 * 1024, 1, 1, 1, 0x42);
-    make_cmd(cmds + DG_COMMAND_BYTES, DG_CMD_FILL, 4, 0, 0,
-             8 * 1024 * 1024, 2 * 1024 * 1024, 1, 0x12345678);
+    make_cmd(cmds + DG_COMMAND_BYTES, DG_CMD_FILL, 4, 0, 0, 8 * 1024 * 1024, 2 * 1024 * 1024, 1,
+             0x12345678);
     submit(f, cmds, 2);
     memset(cmds, 0, sizeof(cmds));
     qtest_memwrite(f->qs->qts, f->batch, cmds, sizeof(cmds));
@@ -439,8 +398,7 @@ static void test_batch_snapshot(Fixture *f, gconstpointer unused)
     g_assert_cmphex(qpci_io_readb(f->dev, f->vram, 8 * 1024 * 1024), ==, 0x42);
 }
 
-static void test_migration(Fixture *f, gconstpointer unused)
-{
+static void test_migration(Fixture *f, gconstpointer unused) {
     g_autofree char *dir = g_dir_make_tmp("dreamgpu-migrate-XXXXXX", NULL);
     g_autofree char *socket = g_build_filename(dir, "migration.sock", NULL);
     g_autofree char *uri = g_strdup_printf("unix:%s", socket);
@@ -450,8 +408,8 @@ static void test_migration(Fixture *f, gconstpointer unused)
     uint8_t cmd[DG_COMMAND_BYTES];
     uint64_t size;
     uint32_t generation;
-    uint8_t cursor[32] = { 0 };
-    uint8_t gl_record[40] = { 0 };
+    uint8_t cursor[32] = {0};
+    uint8_t gl_record[40] = {0};
     bool native_gl;
 
     g_assert_nonnull(dir);
@@ -485,8 +443,7 @@ static void test_migration(Fixture *f, gconstpointer unused)
         stl_le_p(gl_record + DG_GL_OFF_GENERATION, generation);
         stl_le_p(gl_record + 32, FEnum_glClear);
         stl_le_p(gl_record + 36, 0x4000);
-        qtest_memwrite(f->qs->qts, f->batch + 128, gl_record,
-                       sizeof(gl_record));
+        qtest_memwrite(f->qs->qts, f->batch + 128, gl_record, sizeof(gl_record));
         reg_write(f, DG_GL_REG_ADDR_LO, f->batch + 128);
         reg_write(f, DG_GL_REG_ADDR_HI, (f->batch + 128) >> 32);
         reg_write(f, DG_GL_REG_BYTES, sizeof(gl_record));
@@ -496,62 +453,51 @@ static void test_migration(Fixture *f, gconstpointer unused)
         reg_write(f, DG_GL_REG_RESULT_CAPACITY, 512);
     }
     to = qtest_pc_boot("-machine pc -m 64 -vga none "
-                       "-device dreamgpu,id=retro -incoming %s", uri);
+                       "-device dreamgpu,id=retro -incoming %s",
+                       uri);
     migrate(f->qs, to, uri);
-    qpci_device_foreach(to->pcibus, DG_PCI_VENDOR_ID,
-                        DG_PCI_DEVICE_ID, found_device, &dev);
+    qpci_device_foreach(to->pcibus, DG_PCI_VENDOR_ID, DG_PCI_DEVICE_ID, found_device, &dev);
     g_assert_nonnull(dev);
     vram = qpci_iomap(dev, DG_VRAM_BAR, &size);
     regs = qpci_iomap(dev, DG_MMIO_BAR, &size);
     qpci_device_enable(dev);
     g_assert_cmphex(qpci_io_readl(dev, vram, 0), ==, 0x31415926);
-    g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_COMPLETED_SEQUENCE),
-                     ==, f->sequence);
-    g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_GENERATION),
-                     ==, generation);
+    g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_COMPLETED_SEQUENCE), ==, f->sequence);
+    g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_GENERATION), ==, generation);
     g_assert_cmpuint(qpci_io_readl(dev, regs, DG_CURSOR_REG_COMPLETED), ==, 1);
     g_assert_cmpuint(qpci_io_readl(dev, regs, DG_CURSOR_REG_FLAGS), ==, 3);
     g_assert_cmpuint(qpci_io_readl(dev, regs, DG_CURSOR_REG_WIDTH), ==, 2);
-    g_assert_cmphex(qpci_io_readl(dev, regs, DG_CURSOR_REG_X), ==,
-                    (uint32_t)-11);
+    g_assert_cmphex(qpci_io_readl(dev, regs, DG_CURSOR_REG_X), ==, (uint32_t)-11);
     g_assert_true(qpci_config_readw(dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     qpci_io_writel(dev, regs, DG_REG_IRQ_STATUS, DG_IRQ_COMPLETION);
     g_assert_false(qpci_config_readw(dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     if (native_gl) {
         g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ADDR_LO), ==,
                          (uint32_t)(f->batch + 128));
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ADDR_HI), ==,
-                         (f->batch + 128) >> 32);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_LO),
-                         ==, (uint32_t)(f->batch + 512));
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_HI),
-                         ==, (f->batch + 512) >> 32);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_CAPACITY),
-                         ==, 512);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ADDR_HI), ==, (f->batch + 128) >> 32);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_LO), ==,
+                         (uint32_t)(f->batch + 512));
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_HI), ==,
+                         (f->batch + 512) >> 32);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_CAPACITY), ==, 512);
         /* Only sequence/doorbell change: retained byte count, GPA and the
          * programmed generation must still validate on the destination. */
         for (unsigned seq = 71; seq < 73; seq++) {
             qpci_io_writel(dev, regs, DG_GL_REG_SEQUENCE, seq);
             qpci_io_writel(dev, regs, DG_GL_REG_SUBMIT, 1);
-            g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ERROR), ==,
-                             DG_GL_ERROR_TRANSPORT);
-            g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_COMPLETED),
-                             ==, seq);
+            g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ERROR), ==, DG_GL_ERROR_TRANSPORT);
+            g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_COMPLETED), ==, seq);
         }
         qpci_io_writel(dev, regs, DG_REG_RESET, 1);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_GENERATION), !=,
-                         generation);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_REG_GENERATION), !=, generation);
         g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ADDR_LO), ==, 0);
         g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ADDR_HI), ==, 0);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_LO),
-                         ==, 0);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_CAPACITY),
-                         ==, 0);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_ADDR_LO), ==, 0);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_RESULT_CAPACITY), ==, 0);
         qpci_io_writel(dev, regs, DG_GL_REG_BYTES, sizeof(gl_record));
         qpci_io_writel(dev, regs, DG_GL_REG_SEQUENCE, 73);
         qpci_io_writel(dev, regs, DG_GL_REG_SUBMIT, 1);
-        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ERROR), ==,
-                         DG_GL_ERROR_GENERATION);
+        g_assert_cmpuint(qpci_io_readl(dev, regs, DG_GL_REG_ERROR), ==, DG_GL_ERROR_GENERATION);
     }
     qfree(to, f->batch);
     f->batch = 0;
@@ -561,9 +507,8 @@ static void test_migration(Fixture *f, gconstpointer unused)
     rmdir(dir);
 }
 
-static void test_gl_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t record[40] = { 0 };
+static void test_gl_validation(Fixture *f, gconstpointer unused) {
+    uint8_t record[40] = {0};
     uint32_t generation = reg_read(f, DG_REG_GENERATION);
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
@@ -587,16 +532,13 @@ static void test_gl_validation(Fixture *f, gconstpointer unused)
     stl_le_p(record + 32, UINT32_MAX);
     qtest_memwrite(f->qs->qts, f->batch, record, sizeof(record));
     reg_write(f, DG_GL_REG_SUBMIT, 1);
-    g_assert_cmpuint(reg_read(f, DG_GL_REG_ERROR), ==,
-                     DG_GL_ERROR_UNSUPPORTED);
+    g_assert_cmpuint(reg_read(f, DG_GL_REG_ERROR), ==, DG_GL_ERROR_UNSUPPORTED);
     g_assert_cmpuint(reg_read(f, DG_GL_REG_COMPLETED), ==, 41);
-    g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==,
-                     DG_IRQ_GL_COMPLETION);
+    g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, DG_IRQ_GL_COMPLETION);
     reg_write(f, DG_REG_IRQ_ENABLE, DG_IRQ_GL_COMPLETION);
     g_assert_true(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
     reg_write(f, DG_REG_IRQ_STATUS, DG_IRQ_GL_COMPLETION);
-    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) &
-                   PCI_STATUS_INTERRUPT);
+    g_assert_false(qpci_config_readw(f->dev, PCI_STATUS) & PCI_STATUS_INTERRUPT);
 
     stl_le_p(record + 32, FEnum_glClear);
     stl_le_p(record + 36, 0x4000);
@@ -611,16 +553,13 @@ static void test_gl_validation(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_GL_REG_ERROR), ==, DG_GL_ERROR_BATCH);
     reg_write(f, DG_GL_REG_GENERATION, generation - 1);
     reg_write(f, DG_GL_REG_SUBMIT, 1);
-    g_assert_cmpuint(reg_read(f, DG_GL_REG_ERROR), ==,
-                     DG_GL_ERROR_GENERATION);
+    g_assert_cmpuint(reg_read(f, DG_GL_REG_ERROR), ==, DG_GL_ERROR_GENERATION);
     reg_write(f, DG_REG_RESET, 1);
     g_assert_cmpuint(reg_read(f, DG_GL_REG_STATUS), ==, 0);
     g_assert_cmpuint(reg_read(f, DG_REG_IRQ_STATUS), ==, 0);
 }
 
-static void gl_submit_error(Fixture *f, uint8_t *records, size_t bytes,
-                             uint32_t error)
-{
+static void gl_submit_error(Fixture *f, uint8_t *records, size_t bytes, uint32_t error) {
     qtest_memwrite(f->qs->qts, f->batch, records, bytes);
     reg_write(f, DG_GL_REG_ADDR_LO, f->batch);
     reg_write(f, DG_GL_REG_BYTES, bytes);
@@ -631,16 +570,15 @@ static void gl_submit_error(Fixture *f, uint8_t *records, size_t bytes,
     g_assert_cmpuint(reg_read(f, DG_GL_REG_COMPLETED), ==, f->sequence);
 }
 
-static void test_gl_record_limit(Fixture *f, gconstpointer unused)
-{
+static void test_gl_record_limit(Fixture *f, gconstpointer unused) {
     const unsigned bytes = 52;
-    g_autofree uint8_t *records = g_malloc0((DG_GL_MAX_RECORDS + 1) * bytes);
     uint32_t generation = reg_read(f, DG_REG_GENERATION);
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
         return;
     }
+    g_autofree uint8_t *records = g_malloc0((DG_GL_MAX_RECORDS + 1) * bytes);
     g_assert_cmpuint(reg_read(f, DG_GL_REG_MAX_RECORDS), ==, 1024);
     g_assert_cmpuint(reg_read(f, DG_GL_REG_MAX_BYTES), ==, DG_GL_MAX_BYTES);
     for (unsigned i = 0; i < DG_GL_MAX_RECORDS + 1; i++) {
@@ -661,30 +599,24 @@ static void test_gl_record_limit(Fixture *f, gconstpointer unused)
     gl_submit_error(f, records, 1024 * bytes, DG_GL_ERROR_BATCH);
 }
 
-static void test_desktop_validation(Fixture *f, gconstpointer unused)
-{
+static void test_desktop_validation(Fixture *f, gconstpointer unused) {
     enum { BYTES = DG_GL_HEADER_BYTES + DG_DESKTOP_BYTES };
-    uint8_t records[17 * BYTES] = { 0 };
+    uint8_t records[17 * BYTES] = {0};
     uint8_t *r = records + DG_GL_HEADER_BYTES;
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
         return;
     }
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_XRES, 1024);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_YRES, 1024);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_BPP, 32);
-    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET +
-                   2 * VBE_DISPI_INDEX_ENABLE,
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_XRES, 1024);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_YRES, 1024);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_BPP, 32);
+    qpci_io_writew(f->dev, f->regs, PCI_VGA_BOCHS_OFFSET + 2 * VBE_DISPI_INDEX_ENABLE,
                    VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED);
     stl_le_p(records + DG_GL_OFF_OP, DG_GL_DESKTOP);
     stl_le_p(records + DG_GL_OFF_SIZE, BYTES);
     stl_le_p(records + DG_GL_OFF_CLIENT, 1);
-    stl_le_p(records + DG_GL_OFF_GENERATION,
-             reg_read(f, DG_REG_GENERATION));
+    stl_le_p(records + DG_GL_OFF_GENERATION, reg_read(f, DG_REG_GENERATION));
     stl_le_p(r + DG_DESKTOP_OP, DG_DESKTOP_SEED);
     stl_le_p(r + DG_DESKTOP_WIDTH, 1024);
     stl_le_p(r + DG_DESKTOP_HEIGHT, 1024);
@@ -725,9 +657,8 @@ static void test_desktop_validation(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_GL_REG_STATUS), ==, 0);
 }
 
-static void test_texture_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t record[88] = { 0 };
+static void test_texture_validation(Fixture *f, gconstpointer unused) {
+    uint8_t record[88] = {0};
     uint8_t *args = record + DG_GL_DATA_ARGS;
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
@@ -735,8 +666,7 @@ static void test_texture_validation(Fixture *f, gconstpointer unused)
         return;
     }
     reg_write(f, DG_GL_REG_QUERY_FUNCTION, FEnum_glTexImage2D);
-    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                    DG_GL_FUNCTION_INLINE_DATA | 8);
+    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, DG_GL_FUNCTION_INLINE_DATA | 8);
     stl_le_p(record + DG_GL_OFF_OP, DG_GL_DATA_CALL);
     stl_le_p(record + DG_GL_OFF_SIZE, sizeof(record));
     stl_le_p(record + DG_GL_OFF_CLIENT, 1);
@@ -744,7 +674,7 @@ static void test_texture_validation(Fixture *f, gconstpointer unused)
     stl_le_p(record + DG_GL_OFF_GENERATION, reg_read(f, DG_REG_GENERATION));
     stl_le_p(record + DG_GL_DATA_FUNCTION, FEnum_glTexImage2D);
     stl_le_p(record + DG_GL_DATA_BYTES, 16);
-    stl_le_p(args, 0x0de1); /* GL_TEXTURE_2D */
+    stl_le_p(args, 0x0de1);     /* GL_TEXTURE_2D */
     stl_le_p(args + 8, 0x1908); /* GL_RGBA */
     stl_le_p(args + 12, 2);
     stl_le_p(args + 16, 2);
@@ -797,9 +727,8 @@ static void test_texture_validation(Fixture *f, gconstpointer unused)
     gl_submit_error(f, record, 52, DG_GL_ERROR_BATCH);
 }
 
-static void test_array_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t record[40 + 20 + 3 * DG_GL_VERTEX_BYTES + 12] = { 0 };
+static void test_array_validation(Fixture *f, gconstpointer unused) {
+    uint8_t record[40 + 20 + 3 * DG_GL_VERTEX_BYTES + 12] = {0};
     uint8_t *args = record + DG_GL_DATA_ARGS;
     uint8_t *vertices = args + 20;
     uint8_t *indices = vertices + 3 * DG_GL_VERTEX_BYTES;
@@ -809,11 +738,9 @@ static void test_array_validation(Fixture *f, gconstpointer unused)
         return;
     }
     reg_write(f, DG_GL_REG_QUERY_FUNCTION, FEnum_glDrawArrays);
-    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                    DG_GL_FUNCTION_INLINE_DATA | 4);
+    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, DG_GL_FUNCTION_INLINE_DATA | 4);
     reg_write(f, DG_GL_REG_QUERY_FUNCTION, FEnum_glDrawElements);
-    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                    DG_GL_FUNCTION_INLINE_DATA | 5);
+    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, DG_GL_FUNCTION_INLINE_DATA | 5);
     stl_le_p(record + DG_GL_OFF_OP, DG_GL_DATA_CALL);
     stl_le_p(record + DG_GL_OFF_SIZE, sizeof(record));
     stl_le_p(record + DG_GL_OFF_CLIENT, 1);
@@ -872,9 +799,8 @@ static void test_array_validation(Fixture *f, gconstpointer unused)
     gl_submit_error(f, record, 56, DG_GL_ERROR_TRANSPORT);
 }
 
-static void test_copy_texture_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t record[68] = { 0 };
+static void test_copy_texture_validation(Fixture *f, gconstpointer unused) {
+    uint8_t record[68] = {0};
     uint8_t *args = record + 36;
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
@@ -928,9 +854,8 @@ static void test_copy_texture_validation(Fixture *f, gconstpointer unused)
     }
 }
 
-static void test_query_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t record[2 * DG_GL_QUERY_BYTES] = { 0 };
+static void test_query_validation(Fixture *f, gconstpointer unused) {
+    uint8_t record[2 * DG_GL_QUERY_BYTES] = {0};
     uint64_t result_address = f->batch + 1024;
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
@@ -938,8 +863,7 @@ static void test_query_validation(Fixture *f, gconstpointer unused)
         return;
     }
     reg_write(f, DG_GL_REG_QUERY_FUNCTION, FEnum_glGetDoublev);
-    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                    DG_GL_FUNCTION_QUERY | 1);
+    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, DG_GL_FUNCTION_QUERY | 1);
     stl_le_p(record + DG_GL_OFF_OP, DG_GL_QUERY);
     stl_le_p(record + DG_GL_OFF_SIZE, DG_GL_QUERY_BYTES);
     stl_le_p(record + DG_GL_OFF_CLIENT, 1);
@@ -959,8 +883,7 @@ static void test_query_validation(Fixture *f, gconstpointer unused)
     reg_write(f, DG_GL_REG_RESULT_ADDR_HI, UINT32_MAX);
     gl_submit_error(f, record, DG_GL_QUERY_BYTES, DG_GL_ERROR_DMA);
     reg_write(f, DG_GL_REG_RESULT_ADDR_HI, 0);
-    reg_write(f, DG_GL_REG_RESULT_ADDR_LO,
-               qpci_config_readl(f->dev, PCI_BASE_ADDRESS_2) & ~0xf);
+    reg_write(f, DG_GL_REG_RESULT_ADDR_LO, qpci_config_readl(f->dev, PCI_BASE_ADDRESS_2) & ~0xf);
     gl_submit_error(f, record, DG_GL_QUERY_BYTES, DG_GL_ERROR_DMA);
     reg_write(f, DG_GL_REG_RESULT_ADDR_LO, result_address);
     stl_le_p(record + 40, 1);
@@ -980,9 +903,8 @@ static void test_query_validation(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_GL_REG_RESULT_BYTES), ==, 0);
 }
 
-static void test_buffer_validation(Fixture *f, gconstpointer unused)
-{
-    uint8_t r[DG_GL_QUERY_BYTES] = { 0 };
+static void test_buffer_validation(Fixture *f, gconstpointer unused) {
+    uint8_t r[DG_GL_QUERY_BYTES] = {0};
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
         return;
@@ -1002,8 +924,7 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
         stl_le_p(r + 36, 0x0401); /* unsupported FRONT_RIGHT */
         gl_submit_error(f, r, 40, DG_GL_ERROR_UNSUPPORTED);
         stl_le_p(r + 36, 0); /* NONE is only a draw selection */
-        gl_submit_error(f, r, 40, read ? DG_GL_ERROR_UNSUPPORTED :
-                                        DG_GL_ERROR_TRANSPORT);
+        gl_submit_error(f, r, 40, read ? DG_GL_ERROR_UNSUPPORTED : DG_GL_ERROR_TRANSPORT);
     }
     stl_le_p(r + DG_GL_OFF_SIZE, 44);
     stl_le_p(r + 32, FEnum_glHint);
@@ -1017,11 +938,9 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
     stl_le_p(r + DG_GL_OFF_SIZE, 32);
     stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_NO_EXPORT);
     gl_submit_error(f, r, 32, DG_GL_ERROR_TRANSPORT);
-    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_NO_EXPORT |
-                                   DG_GL_PRESENT_FRONT_ONLY);
+    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_NO_EXPORT | DG_GL_PRESENT_FRONT_ONLY);
     gl_submit_error(f, r, 32, DG_GL_ERROR_BATCH);
-    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_RETAIN |
-                                   DG_GL_PRESENT_FRONT_ONLY);
+    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_RETAIN | DG_GL_PRESENT_FRONT_ONLY);
     gl_submit_error(f, r, 32, DG_GL_ERROR_TRANSPORT);
 
     stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_BOUNDED);
@@ -1030,8 +949,7 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
     stl_le_p(r + 32, 16);
     stl_le_p(r + 36, 8);
     gl_submit_error(f, r, 40, DG_GL_ERROR_TRANSPORT);
-    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_BOUNDED |
-                                   DG_GL_PRESENT_NO_EXPORT);
+    stl_le_p(r + DG_GL_OFF_FLAGS, DG_GL_PRESENT_BOUNDED | DG_GL_PRESENT_NO_EXPORT);
     gl_submit_error(f, r, 40, DG_GL_ERROR_TRANSPORT);
     stl_le_p(r + 32, 0);
     gl_submit_error(f, r, 40, DG_GL_ERROR_DRAWABLE);
@@ -1046,8 +964,7 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
     stl_le_p(r + 40, 0);
     stl_le_p(r + 44, 16 | (8 << 16));
     reg_write(f, DG_GL_REG_QUERY_FUNCTION, FEnum_glReadPixels);
-    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                    DG_GL_FUNCTION_QUERY | 3);
+    g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, DG_GL_FUNCTION_QUERY | 3);
     reg_write(f, DG_GL_REG_RESULT_ADDR_LO, f->batch + 1024);
     reg_write(f, DG_GL_REG_RESULT_CAPACITY, DG_GL_MAX_RESULT_BYTES);
     gl_submit_error(f, r, sizeof(r), DG_GL_ERROR_TRANSPORT);
@@ -1055,7 +972,7 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
     gl_submit_error(f, r, sizeof(r), DG_GL_ERROR_BATCH);
     reg_write(f, DG_GL_REG_RESULT_CAPACITY, DG_GL_MAX_RESULT_BYTES);
     for (unsigned i = 0; i < 4; i++) {
-        const uint32_t sizes[] = { 129 | (1 << 16), 1, 1 << 16, UINT32_MAX };
+        const uint32_t sizes[] = {129 | (1 << 16), 1, 1 << 16, UINT32_MAX};
         stl_le_p(r + 44, sizes[i]);
         gl_submit_error(f, r, sizeof(r), DG_GL_ERROR_UNSUPPORTED);
     }
@@ -1064,19 +981,18 @@ static void test_buffer_validation(Fixture *f, gconstpointer unused)
     gl_submit_error(f, r, sizeof(r), DG_GL_ERROR_UNSUPPORTED);
 }
 
-static void test_raster_validation(Fixture *f, gconstpointer unused)
-{
-    const struct { uint32_t function, words; } functions[] = {
-        { FEnum_glAlphaFunc, 2 }, { FEnum_glColorMask, 4 },
-        { FEnum_glDepthMask, 1 }, { FEnum_glDepthRange, 4 },
-        { FEnum_glClearStencil, 1 }, { FEnum_glStencilFunc, 3 },
-        { FEnum_glStencilMask, 1 }, { FEnum_glStencilOp, 3 },
-        { FEnum_glCullFace, 1 }, { FEnum_glFrontFace, 1 },
-        { FEnum_glPolygonMode, 2 }, { FEnum_glPolygonOffset, 2 },
-        { FEnum_glLineWidth, 1 }, { FEnum_glLineStipple, 2 },
-        { FEnum_glPointSize, 1 }, { FEnum_glShadeModel, 1 },
+static void test_raster_validation(Fixture *f, gconstpointer unused) {
+    const struct {
+        uint32_t function, words;
+    } functions[] = {
+        {FEnum_glAlphaFunc, 2},   {FEnum_glColorMask, 4},    {FEnum_glDepthMask, 1},
+        {FEnum_glDepthRange, 4},  {FEnum_glClearStencil, 1}, {FEnum_glStencilFunc, 3},
+        {FEnum_glStencilMask, 1}, {FEnum_glStencilOp, 3},    {FEnum_glCullFace, 1},
+        {FEnum_glFrontFace, 1},   {FEnum_glPolygonMode, 2},  {FEnum_glPolygonOffset, 2},
+        {FEnum_glLineWidth, 1},   {FEnum_glLineStipple, 2},  {FEnum_glPointSize, 1},
+        {FEnum_glShadeModel, 1},
     };
-    uint8_t record[DG_GL_HEADER_BYTES + 24] = { 0 };
+    uint8_t record[DG_GL_HEADER_BYTES + 24] = {0};
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
@@ -1090,8 +1006,7 @@ static void test_raster_validation(Fixture *f, gconstpointer unused)
         uint32_t bytes = DG_GL_HEADER_BYTES + 4 + functions[i].words * 4;
 
         reg_write(f, DG_GL_REG_QUERY_FUNCTION, functions[i].function);
-        g_assert_cmpuint(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
-                          functions[i].words);
+        g_assert_cmpuint(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==, functions[i].words);
         stl_le_p(record + DG_GL_HEADER_BYTES, functions[i].function);
         stl_le_p(record + DG_GL_OFF_SIZE, bytes);
         gl_submit_error(f, record, bytes, DG_GL_ERROR_TRANSPORT);
@@ -1100,22 +1015,23 @@ static void test_raster_validation(Fixture *f, gconstpointer unused)
     }
 }
 
-static void test_vector_validation(Fixture *f, gconstpointer unused)
-{
-    const struct { uint32_t fn, words, a, b, bytes; } vectors[] = {
-        { FEnum_glLightfv, 2, 0x4000, 0x1203, 16 },
-        { FEnum_glMaterialfv, 2, 0x408, 0x1201, 16 },
-        { FEnum_glFogfv, 1, 0x0b66, 0, 16 },
-        { FEnum_glLightModelfv, 1, 0x0b53, 0, 16 },
-        { FEnum_glTexGenfv, 2, 0x2000, 0x2501, 16 },
-        { FEnum_glTexGendv, 2, 0x2000, 0x2501, 32 },
-        { FEnum_glClipPlane, 1, 0x3000, 0, 32 },
-        { FEnum_glTexParameterfv, 2, 0x0de1, 0x1004, 16 },
-        { FEnum_glTexParameteriv, 2, 0x0de1, 0x2801, 4 },
-        { FEnum_glTexEnvfv, 2, 0x2300, 0x2201, 16 },
-        { FEnum_glTexEnviv, 2, 0x2300, 0x2200, 4 },
+static void test_vector_validation(Fixture *f, gconstpointer unused) {
+    const struct {
+        uint32_t fn, words, a, b, bytes;
+    } vectors[] = {
+        {FEnum_glLightfv, 2, 0x4000, 0x1203, 16},
+        {FEnum_glMaterialfv, 2, 0x408, 0x1201, 16},
+        {FEnum_glFogfv, 1, 0x0b66, 0, 16},
+        {FEnum_glLightModelfv, 1, 0x0b53, 0, 16},
+        {FEnum_glTexGenfv, 2, 0x2000, 0x2501, 16},
+        {FEnum_glTexGendv, 2, 0x2000, 0x2501, 32},
+        {FEnum_glClipPlane, 1, 0x3000, 0, 32},
+        {FEnum_glTexParameterfv, 2, 0x0de1, 0x1004, 16},
+        {FEnum_glTexParameteriv, 2, 0x0de1, 0x2801, 4},
+        {FEnum_glTexEnvfv, 2, 0x2300, 0x2201, 16},
+        {FEnum_glTexEnviv, 2, 0x2300, 0x2200, 4},
     };
-    uint8_t record[80] = { 0 };
+    uint8_t record[80] = {0};
 
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
@@ -1126,8 +1042,7 @@ static void test_vector_validation(Fixture *f, gconstpointer unused)
     stl_le_p(record + DG_GL_OFF_CONTEXT, 1);
     stl_le_p(record + DG_GL_OFF_GENERATION, reg_read(f, DG_REG_GENERATION));
     for (unsigned i = 0; i < G_N_ELEMENTS(vectors); i++) {
-        uint32_t bytes = DG_GL_DATA_ARGS + vectors[i].words * 4 +
-                         vectors[i].bytes;
+        uint32_t bytes = DG_GL_DATA_ARGS + vectors[i].words * 4 + vectors[i].bytes;
 
         reg_write(f, DG_GL_REG_QUERY_FUNCTION, vectors[i].fn);
         g_assert_cmphex(reg_read(f, DG_GL_REG_FUNCTION_WORDS), ==,
@@ -1148,18 +1063,15 @@ static void test_vector_validation(Fixture *f, gconstpointer unused)
     }
 }
 
-static void assert_fault_stopped(Fixture *f, uint32_t reason, uint32_t op)
-{
+static void assert_fault_stopped(Fixture *f, uint32_t reason, uint32_t op) {
     QTestState *qts = f->qs->qts;
     QDict *event = qtest_qmp_eventwait_ref(qts, "DREAMGPU_FAULT");
     QDict *data = qdict_get_qdict(event, "data");
     g_assert_cmpuint(qdict_get_int(data, "reason"), ==, reason);
     g_assert_cmpuint(qdict_get_int(data, "operation"), ==, op);
     qobject_unref(event);
-    QDict *status = qtest_qmp_assert_success_ref(qts,
-                                                "{'execute':'query-status'}");
-    g_assert_cmpstr(qdict_get_str(status, "status"),
-                     ==, "internal-error");
+    QDict *status = qtest_qmp_assert_success_ref(qts, "{'execute':'query-status'}");
+    g_assert_cmpstr(qdict_get_str(status, "status"), ==, "internal-error");
     qobject_unref(status);
     QDict *error = qtest_qmp_assert_failure_ref(qts, "{'execute':'cont'}");
     g_assert_nonnull(strstr(qdict_get_str(error, "desc"), "Resetting"));
@@ -1169,8 +1081,7 @@ static void assert_fault_stopped(Fixture *f, uint32_t reason, uint32_t op)
     g_assert_cmpuint(reg_read(f, DG_GL_REG_FAULT_STOP), ==, reason);
 }
 
-static void test_fault_stop(Fixture *f, gconstpointer unused)
-{
+static void test_fault_stop(Fixture *f, gconstpointer unused) {
     if (!reg_read(f, DG_GL_REG_VERSION)) {
         g_test_skip("Native GL transport is not built on this host");
         return;
@@ -1188,61 +1099,44 @@ static void test_fault_stop(Fixture *f, gconstpointer unused)
     g_assert_cmpuint(reg_read(f, DG_GL_REG_FAULT_STOP), ==, 0);
     qtest_qmp_assert_success(f->qs->qts, "{'execute':'cont'}");
 
-    uint8_t record[DG_GL_HEADER_BYTES + DG_DESKTOP_BYTES] = { 0 };
+    uint8_t record[DG_GL_HEADER_BYTES + DG_DESKTOP_BYTES] = {0};
     stl_le_p(record + DG_GL_OFF_OP, DG_GL_DESKTOP);
     stl_le_p(record + DG_GL_OFF_SIZE, sizeof(record));
     stl_le_p(record + DG_GL_OFF_CLIENT, 1);
     stl_le_p(record + DG_GL_OFF_GENERATION, reg_read(f, DG_REG_GENERATION));
-    stl_le_p(record + DG_GL_HEADER_BYTES + DG_DESKTOP_OP,
-              DG_DESKTOP_READBACK);
+    stl_le_p(record + DG_GL_HEADER_BYTES + DG_DESKTOP_OP, DG_DESKTOP_READBACK);
     gl_submit_error(f, record, sizeof(record), DG_GL_ERROR_DESKTOP);
     assert_fault_stopped(f, DG_GL_FAULT_HOST_COHERENCE, DG_DESKTOP_READBACK);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     g_test_init(&argc, &argv, NULL);
-    g_test_add("/dreamgpu/identity", Fixture, NULL,
-               setup, test_identity, teardown);
-    g_test_add("/dreamgpu/fill", Fixture, NULL,
-               setup, test_fill, teardown);
-    g_test_add("/dreamgpu/copy-overlap", Fixture, NULL,
-               setup, test_copy_overlap, teardown);
-    g_test_add("/dreamgpu/invalid-batches", Fixture, NULL,
-               setup, test_invalid, teardown);
-    g_test_add("/dreamgpu/irq-reset", Fixture, NULL,
-               setup, test_irq_reset, teardown);
-    g_test_add("/dreamgpu/inline-irq", Fixture, NULL,
-               setup, test_inline_irq, teardown);
-    g_test_add("/dreamgpu/scanout", Fixture, NULL,
-               setup, test_scanout, teardown);
-    g_test_add("/dreamgpu/cursor", Fixture, NULL,
-               setup, test_cursor, teardown);
-    g_test_add("/dreamgpu/batch-snapshot", Fixture, NULL,
-               setup, test_batch_snapshot, teardown);
-    g_test_add("/dreamgpu/migration", Fixture, NULL,
-               setup, test_migration, teardown);
-    g_test_add("/dreamgpu/gl-validation", Fixture, NULL,
-               setup, test_gl_validation, teardown);
-    g_test_add("/dreamgpu/gl-record-limit", Fixture, NULL,
-               setup, test_gl_record_limit, teardown);
-    g_test_add("/dreamgpu/desktop-validation", Fixture, NULL,
-               setup, test_desktop_validation, teardown);
-    g_test_add("/dreamgpu/texture-validation", Fixture, NULL,
-               setup, test_texture_validation, teardown);
-    g_test_add("/dreamgpu/copy-texture-validation", Fixture, NULL,
-               setup, test_copy_texture_validation, teardown);
-    g_test_add("/dreamgpu/array-validation", Fixture, NULL,
-               setup, test_array_validation, teardown);
-    g_test_add("/dreamgpu/query-validation", Fixture, NULL,
-               setup, test_query_validation, teardown);
-    g_test_add("/dreamgpu/raster-validation", Fixture, NULL,
-               setup, test_raster_validation, teardown);
-    g_test_add("/dreamgpu/buffer-validation", Fixture, NULL,
-               setup, test_buffer_validation, teardown);
-    g_test_add("/dreamgpu/vector-validation", Fixture, NULL,
-               setup, test_vector_validation, teardown);
-    g_test_add("/dreamgpu/fault-stop", Fixture, NULL,
-               setup, test_fault_stop, teardown);
+    g_test_add("/dreamgpu/identity", Fixture, NULL, setup, test_identity, teardown);
+    g_test_add("/dreamgpu/fill", Fixture, NULL, setup, test_fill, teardown);
+    g_test_add("/dreamgpu/copy-overlap", Fixture, NULL, setup, test_copy_overlap, teardown);
+    g_test_add("/dreamgpu/invalid-batches", Fixture, NULL, setup, test_invalid, teardown);
+    g_test_add("/dreamgpu/irq-reset", Fixture, NULL, setup, test_irq_reset, teardown);
+    g_test_add("/dreamgpu/inline-irq", Fixture, NULL, setup, test_inline_irq, teardown);
+    g_test_add("/dreamgpu/scanout", Fixture, NULL, setup, test_scanout, teardown);
+    g_test_add("/dreamgpu/cursor", Fixture, NULL, setup, test_cursor, teardown);
+    g_test_add("/dreamgpu/batch-snapshot", Fixture, NULL, setup, test_batch_snapshot, teardown);
+    g_test_add("/dreamgpu/migration", Fixture, NULL, setup, test_migration, teardown);
+    g_test_add("/dreamgpu/gl-validation", Fixture, NULL, setup, test_gl_validation, teardown);
+    g_test_add("/dreamgpu/gl-record-limit", Fixture, NULL, setup, test_gl_record_limit, teardown);
+    g_test_add("/dreamgpu/desktop-validation", Fixture, NULL, setup, test_desktop_validation,
+               teardown);
+    g_test_add("/dreamgpu/texture-validation", Fixture, NULL, setup, test_texture_validation,
+               teardown);
+    g_test_add("/dreamgpu/copy-texture-validation", Fixture, NULL, setup,
+               test_copy_texture_validation, teardown);
+    g_test_add("/dreamgpu/array-validation", Fixture, NULL, setup, test_array_validation, teardown);
+    g_test_add("/dreamgpu/query-validation", Fixture, NULL, setup, test_query_validation, teardown);
+    g_test_add("/dreamgpu/raster-validation", Fixture, NULL, setup, test_raster_validation,
+               teardown);
+    g_test_add("/dreamgpu/buffer-validation", Fixture, NULL, setup, test_buffer_validation,
+               teardown);
+    g_test_add("/dreamgpu/vector-validation", Fixture, NULL, setup, test_vector_validation,
+               teardown);
+    g_test_add("/dreamgpu/fault-stop", Fixture, NULL, setup, test_fault_stop, teardown);
     return g_test_run();
 }
