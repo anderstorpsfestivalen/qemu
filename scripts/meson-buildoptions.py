@@ -86,7 +86,9 @@ LINE_WIDTH = 76
 # Convert the default value of an option to the string used in
 # the help message
 def get_help(opt):
-    if opt["name"] == "libdir":
+    # Built-in directory defaults depend on the build host (for example Homebrew).
+    # Keep generated, tracked configure help portable across developer machines.
+    if opt["name"] in {"libdir", "prefix", "localstatedir"}:
         return 'system default'
     value = opt["value"]
     if isinstance(value, list):
