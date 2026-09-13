@@ -72,10 +72,6 @@ struct DreamGpu {
 #endif
 };
 
-static uint32_t cmd_word(const uint8_t *cmd, unsigned offset)
-{
-    return ldl_le_p(cmd + offset);
-}
 
 static void dg_update_irq(DreamGpu *s)
 {
@@ -99,55 +95,52 @@ static void dg_complete(DreamGpu *s, uint32_t error)
     dg_update_irq(s);
 }
 
-static bool dg_cursor_source_ram(DreamGpu *s, uint64_t address,
-                                  uint32_t bytes)
+/* QEMU owns RAM translation and DMA; Rust owns snapshot transactions. */
+static uint8_t *dg_snapshot_allocate(void *opaque, uint32_t bytes)
 {
+    return g_try_malloc(bytes);
+}
+static void dg_snapshot_free(void *opaque, uint8_t *data)
+{
+    g_free(data);
+}
+static uint32_t dg_snapshot_read(void *opaque, uint64_t address,
+                                 uint8_t *data, uint32_t bytes)
+{
+    DreamGpu *s = opaque;
+    return pci_dma_read(&s->parent_obj, address, data, bytes) == MEMTX_OK;
+}
+static uint32_t dg_snapshot_ram(void *opaque, uint64_t address,
+                                uint32_t bytes, uint32_t write)
+{
+    DreamGpu *s = opaque;
     hwaddr translated, length = bytes;
     MemoryRegion *mr;
-
-    if (address > UINT64_MAX - bytes) {
-        return false;
-    }
     RCU_READ_LOCK_GUARD();
     mr = address_space_translate(pci_get_address_space(&s->parent_obj),
-                                  address, &translated, &length, false,
-                                  MEMTXATTRS_UNSPECIFIED);
+                                 address, &translated, &length, write,
+                                 MEMTXATTRS_UNSPECIFIED);
     return length >= bytes && memory_region_is_ram(mr) &&
            !memory_region_is_rom(mr);
 }
-
+static DreamGpuDeviceMemory dg_snapshot_memory(DreamGpu *s)
+{
+    return (DreamGpuDeviceMemory) {
+        s, dg_snapshot_allocate, dg_snapshot_free,
+        dg_snapshot_read, dg_snapshot_ram,
+    };
+}
 static void dg_cursor_submit(DreamGpu *s, uint32_t operation)
 {
-    g_autofree uint8_t *data = NULL;
-    uint32_t error = 0;
-    uint64_t address = ((uint64_t)s->cursor_addr_hi << 32) | s->cursor_addr_lo;
-
-    if (s->cursor_flags & ~DG_CURSOR_FLAGS_MASK) {
-        error = DG_CURSOR_ERROR_FLAGS;
-    } else if (operation == DG_CURSOR_SHAPE) {
-        if (!s->cursor_width || s->cursor_width > DG_CURSOR_MAX_DIMENSION ||
-            !s->cursor_height || s->cursor_height > DG_CURSOR_MAX_DIMENSION ||
-            s->cursor_hot_x >= s->cursor_width ||
-            s->cursor_hot_y >= s->cursor_height ||
-            (s->cursor_format != DG_CURSOR_ARGB_PREMULTIPLIED &&
-             s->cursor_format != DG_CURSOR_AND_XOR) ||
-            s->cursor_bytes != s->cursor_width * s->cursor_height * 8) {
-            error = DG_CURSOR_ERROR_SHAPE;
-        } else if (!dg_cursor_source_ram(s, address, s->cursor_bytes)) {
-            error = DG_CURSOR_ERROR_DMA;
-        } else {
-            data = g_malloc(s->cursor_bytes);
-            if (pci_dma_read(&s->parent_obj, address, data,
-                              s->cursor_bytes) != MEMTX_OK) {
-                error = DG_CURSOR_ERROR_DMA;
-            } else if (!dreamgpu_cursor_validate(data,
-                        s->cursor_width * s->cursor_height, s->cursor_format)) {
-                error = DG_CURSOR_ERROR_SHAPE;
-            }
-        }
-    } else if (operation != DG_CURSOR_MOVE) {
-        error = DG_CURSOR_ERROR_SHAPE;
-    }
+    DreamGpuDeviceMemory memory = dg_snapshot_memory(s);
+    DreamGpuCursorRequest request = {
+        .address = ((uint64_t)s->cursor_addr_hi << 32) | s->cursor_addr_lo,
+        .operation = operation, .flags = s->cursor_flags,
+        .bytes = s->cursor_bytes, .width = s->cursor_width,
+        .height = s->cursor_height, .hot_x = s->cursor_hot_x,
+        .hot_y = s->cursor_hot_y, .format = s->cursor_format,
+    };
+    uint32_t error = dreamgpu_device_cursor(&memory, &request, s->cursor.pixels);
     if (!error) {
         if (operation == DG_CURSOR_SHAPE) {
             s->cursor.width = s->cursor_width;
@@ -155,14 +148,12 @@ static void dg_cursor_submit(DreamGpu *s, uint32_t operation)
             s->cursor.hot_x = s->cursor_hot_x;
             s->cursor.hot_y = s->cursor_hot_y;
             s->cursor.format = s->cursor_format;
-            memset(s->cursor.pixels, 0, sizeof(s->cursor.pixels));
-            memcpy(s->cursor.pixels, data, s->cursor_bytes);
         }
         s->cursor.x = s->cursor_x;
         s->cursor.y = s->cursor_y;
         s->cursor.flags = s->cursor_flags;
         dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor,
-                                  operation == DG_CURSOR_SHAPE);
+                                     operation == DG_CURSOR_SHAPE);
     }
     s->cursor_status = DG_STATUS_DONE | (error ? DG_STATUS_ERROR : 0);
     s->cursor_error = error;
@@ -403,13 +394,84 @@ static void dg_gl_notify(void *opaque)
     qemu_bh_schedule(s->gl_bh);
 }
 
+static void dg_gl_dimensions(DreamGpu *s, uint32_t *width, uint32_t *height)
+{
+    *width = *height = 0;
+    if (s->vga.vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED) {
+        *width = s->vga.vbe_regs[VBE_DISPI_INDEX_XRES];
+        *height = s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
+    }
+}
+static uint32_t dg_snapshot_gl_validate(void *opaque, const uint8_t *data,
+                                        uint32_t bytes, uint32_t *records)
+{
+    DreamGpu *s = opaque;
+    uint32_t width, height;
+    dg_gl_dimensions(s, &width, &height);
+    return dg_gl_validate(data, bytes, s->generation, width, height,
+                           s->vga.vram_size, records);
+}
+static void dg_snapshot_diagnostics_begin(void *opaque, uint32_t bytes)
+{
+    DreamGpu *s = opaque;
+    if (s->diagnostics_enabled) {
+        s->diagnostics->batches++;
+        s->diagnostics->bytes += bytes;
+    }
+}
+static void dg_snapshot_diagnostic_record(void *opaque, const uint8_t *record)
+{
+    DreamGpu *s = opaque;
+    if (s->diagnostics_enabled) {
+        dg_diagnostic_record(s->diagnostics, record);
+    }
+}
+static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data,
+                                     uint32_t bytes, uint32_t records)
+{
+    DreamGpu *s = opaque;
+    uint32_t width, height;
+    Error *err = NULL;
+    if (!s->gpu_socket || !*s->gpu_socket) {
+        return DG_GL_ERROR_TRANSPORT;
+    }
+    if (!s->gl_blocker) {
+        error_setg(&s->gl_blocker,
+                   "DreamGPU active OpenGL resources cannot be migrated or saved");
+        if (migrate_add_blocker(&s->gl_blocker, &err) < 0) {
+            error_report_err(err);
+            return DG_GL_ERROR_HOST;
+        }
+    }
+    if (!s->gl) {
+        s->gl = dg_gl_engine_new(s->gpu_socket, dg_gl_notify, s);
+    }
+    dg_gl_dimensions(s, &width, &height);
+    return dg_gl_engine_submit(s->gl, data, bytes, s->gl_sequence,
+                                 s->generation, width, height, records) ?
+           0 : DG_GL_ERROR_LIMIT;
+}
 static void dg_gl_submit(DreamGpu *s)
 {
-    uint64_t address = ((uint64_t)s->gl_addr_hi << 32) | s->gl_addr_lo;
-    uint32_t width = 0, height = 0, error, records;
-    g_autofree uint8_t *data = NULL;
-    Error *err = NULL;
-
+    DreamGpuDeviceGlCallbacks callbacks = {
+        .memory = dg_snapshot_memory(s),
+        .validate = dg_snapshot_gl_validate,
+        .diagnostics_begin = dg_snapshot_diagnostics_begin,
+        .diagnostic_record = dg_snapshot_diagnostic_record,
+        .enqueue = dg_snapshot_enqueue,
+    };
+    DreamGpuDeviceGlRequest request = {
+        .address = ((uint64_t)s->gl_addr_hi << 32) | s->gl_addr_lo,
+        .result_address = ((uint64_t)s->gl_result_addr_hi << 32) |
+                          s->gl_result_addr_lo,
+        .bytes = s->gl_bytes, .generation = s->gl_generation,
+        .current_generation = s->generation,
+        .bpp = s->vga.vbe_regs[VBE_DISPI_INDEX_BPP],
+        .busy_2d = s->status & DG_STATUS_BUSY,
+        .result_capacity = s->gl_result_capacity,
+    };
+    DreamGpuDeviceGlResult result;
+    uint32_t error;
     if ((s->gl_status & DG_STATUS_BUSY) || s->gl_fault) {
         return;
     }
@@ -420,107 +482,21 @@ static void dg_gl_submit(DreamGpu *s)
     s->gl_sensitive_op = 0;
     s->gl_result_bytes = s->gl_result_type = 0;
     s->gl_active_result_capacity = 0;
-    if (!s->gl_bytes || s->gl_bytes > DG_GL_MAX_BYTES || (s->gl_bytes & 3)) {
-        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_BATCH);
-        return;
+    error = dreamgpu_device_gl_submit(&callbacks, &request, &result);
+    s->gl_sensitive_op = result.sensitive;
+    s->gl_active_result_capacity = result.result_capacity;
+    if (result.result_capacity) {
+        s->gl_active_result_address = request.result_address;
     }
-    if (s->gl_generation != s->generation) {
-        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_GENERATION);
-        return;
-    }
-    data = g_malloc(s->gl_bytes);
-    if (address > UINT64_MAX - s->gl_bytes ||
-        pci_dma_read(&s->parent_obj, address, data, s->gl_bytes) != MEMTX_OK) {
-        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DMA);
-        return;
-    }
-    /* Recognize even an invalid coherence request before signaling failure. */
-    for (size_t offset = 0; offset + DG_GL_HEADER_BYTES <= s->gl_bytes;) {
-        const uint8_t *r = data + offset;
-        uint32_t size = cmd_word(r, DG_GL_OFF_SIZE);
-        if (size < DG_GL_HEADER_BYTES || size > s->gl_bytes - offset) {
-            break;
-        }
-        if (cmd_word(r, DG_GL_OFF_OP) == DG_GL_DESKTOP && size >= 36) {
-            uint32_t op = cmd_word(r, DG_GL_HEADER_BYTES);
-            if (op == DG_DESKTOP_READBACK || op == DG_DESKTOP_RETURN) {
-                s->gl_sensitive_op = op;
-            }
-        }
-        offset += size;
-    }
-    if (s->vga.vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED) {
-        width = s->vga.vbe_regs[VBE_DISPI_INDEX_XRES];
-        height = s->vga.vbe_regs[VBE_DISPI_INDEX_YRES];
-    }
-    error = dg_gl_validate(data, s->gl_bytes, s->generation, width, height,
-                              s->vga.vram_size, &records);
     if (error) {
         dg_gl_complete(s, s->gl_sequence, error);
         return;
     }
-    if (cmd_word(data, DG_GL_OFF_OP) == DG_GL_QUERY) {
-        uint32_t required = dg_gl_query_result_bytes(cmd_word(data, 32),
-                                                       data + 36);
-        uint64_t result_address = ((uint64_t)s->gl_result_addr_hi << 32) |
-                                 s->gl_result_addr_lo;
-        if (s->gl_result_capacity < required ||
-            s->gl_result_capacity > DG_GL_MAX_READBACK_BYTES) {
-            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_BATCH);
-            return;
-        }
-        if (!dg_result_ram(s, result_address, s->gl_result_capacity)) {
-            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DMA);
-            return;
-        }
-        s->gl_active_result_address = result_address;
-        s->gl_active_result_capacity = s->gl_result_capacity;
-    }
-    if (s->diagnostics_enabled) {
-        s->diagnostics->batches++;
-        s->diagnostics->bytes += s->gl_bytes;
-    }
-    for (size_t offset = 0; offset < s->gl_bytes;) {
-        const uint8_t *r = data + offset;
-        if (s->diagnostics_enabled) {
-            dg_diagnostic_record(s->diagnostics, r);
-        }
-        if (cmd_word(r, DG_GL_OFF_OP) == DG_GL_DESKTOP &&
-            (s->vga.vbe_regs[VBE_DISPI_INDEX_BPP] != 32 ||
-             (s->status & DG_STATUS_BUSY))) {
-            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_DESKTOP);
-            return;
-        }
-        offset += cmd_word(r, DG_GL_OFF_SIZE);
-    }
-    if (!s->gpu_socket || !*s->gpu_socket) {
-        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_TRANSPORT);
-        return;
-    }
-    if (!s->gl_blocker) {
-        error_setg(&s->gl_blocker,
-                   "DreamGPU active OpenGL resources cannot be migrated or saved");
-        if (migrate_add_blocker(&s->gl_blocker, &err) < 0) {
-            error_report_err(err);
-            dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_HOST);
-            return;
-        }
-    }
-    if (!s->gl) {
-        s->gl = dg_gl_engine_new(s->gpu_socket, dg_gl_notify, s);
-    }
-    if (!dg_gl_engine_submit(s->gl, data, s->gl_bytes, s->gl_sequence,
-                              s->generation, width, height, records)) {
-        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_LIMIT);
-        return;
-    }
-    data = NULL;
     s->gl_status = DG_STATUS_BUSY;
     s->gl_error = 0;
     if (s->gl_trace_start_us) {
-        trace_dreamgpu_gl_submit(s->gl_sequence, records, s->gl_bytes,
-                                  g_get_monotonic_time() -
-                                  s->gl_trace_start_us);
+        trace_dreamgpu_gl_submit(s->gl_sequence, result.records, s->gl_bytes,
+                                  g_get_monotonic_time() - s->gl_trace_start_us);
     }
 }
 
@@ -603,11 +579,6 @@ static void dg_gl_write(DreamGpu *s, hwaddr addr, uint32_t value)
 #endif
 
 /* The host Rust engine validates the complete immutable DMA snapshot. */
-static uint32_t dg_validate(DreamGpu *s)
-{
-    return dreamgpu_2d_validate(s->commands, s->active_count,
-                               s->vga.vram_size, &s->validated_bytes);
-}
 
 static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp,
                           uint64_t src, uint64_t dst, uint32_t bytes,
@@ -681,6 +652,7 @@ static void dg_work(void *opaque)
 static void dg_submit(DreamGpu *s)
 {
     uint64_t addr = ((uint64_t)s->addr_hi << 32) | s->addr_lo;
+    DreamGpuDeviceMemory memory = dg_snapshot_memory(s);
     uint32_t error;
 
     /* A producer owns the channel until completion; never replace its work. */
@@ -696,17 +668,8 @@ static void dg_submit(DreamGpu *s)
     s->active_count = s->count;
     s->command_index = s->row = s->column = 0;
     s->error = DG_ERROR_NONE;
-    if (!s->count || s->count > DG_MAX_COMMANDS) {
-        dg_complete(s, DG_ERROR_BATCH_COUNT);
-        return;
-    }
-    if (addr > UINT64_MAX - s->count * DG_COMMAND_BYTES ||
-        pci_dma_read(&s->parent_obj, addr, s->commands,
-                     s->count * DG_COMMAND_BYTES) != MEMTX_OK) {
-        dg_complete(s, DG_ERROR_DMA);
-        return;
-    }
-    error = dg_validate(s);
+    error = dreamgpu_device_2d_capture(&memory, addr, s->count, s->commands,
+                                       s->vga.vram_size, &s->validated_bytes);
     if (error) {
         dg_complete(s, error);
         return;
@@ -874,42 +837,25 @@ static int dg_post_load(void *opaque, int version_id)
 {
     DreamGpu *s = opaque;
 
-    if ((s->cursor.flags & ~DG_CURSOR_FLAGS_MASK) ||
-        (s->cursor_status & DG_STATUS_BUSY) ||
-        s->cursor.width > DG_CURSOR_MAX_DIMENSION ||
-        s->cursor.height > DG_CURSOR_MAX_DIMENSION ||
-        (!!s->cursor.width != !!s->cursor.height) ||
-        (s->cursor.width &&
-         (s->cursor.hot_x < 0 || s->cursor.hot_y < 0 ||
-          s->cursor.hot_x >= s->cursor.width ||
-          s->cursor.hot_y >= s->cursor.height ||
-          (s->cursor.format != DG_CURSOR_ARGB_PREMULTIPLIED &&
-           s->cursor.format != DG_CURSOR_AND_XOR) ||
-          !dreamgpu_cursor_validate(s->cursor.pixels,
-                    s->cursor.width * s->cursor.height, s->cursor.format)))) {
-        return -EINVAL;
-    }
+    DreamGpuDeviceRestore restored = {
+        .cursor = {
+            .flags = s->cursor.flags, .width = s->cursor.width,
+            .height = s->cursor.height, .hot_x = s->cursor.hot_x,
+            .hot_y = s->cursor.hot_y, .format = s->cursor.format,
+        },
+        .cursor_status = s->cursor_status,
 #ifdef CONFIG_DREAMGPU_GL
-    /* Active GL jobs/resources are never part of a valid saved state. */
-    if (s->gl_status & DG_STATUS_BUSY) {
+        .gl_status = s->gl_status,
+#endif
+        .status = s->status, .count = s->active_count,
+        .command = s->command_index, .row = s->row, .column = s->column,
+        .vram = s->vga.vram_size,
+    };
+    if (!dreamgpu_device_restore(&restored, s->cursor.pixels, s->commands,
+                                 &s->validated_bytes)) {
         return -EINVAL;
     }
-#endif
     if (s->status & DG_STATUS_BUSY) {
-        const uint8_t *c;
-
-        if (dg_validate(s) || s->command_index >= s->active_count ||
-            s->row >= cmd_word(s->commands +
-                              s->command_index * DG_COMMAND_BYTES,
-                              DG_CMD_HEIGHT)) {
-            return -EINVAL;
-        }
-        c = s->commands + s->command_index * DG_COMMAND_BYTES;
-        if (s->column >= cmd_word(c, DG_CMD_WIDTH) *
-                         cmd_word(c, DG_CMD_BPP) ||
-            s->column % cmd_word(c, DG_CMD_BPP)) {
-            return -EINVAL;
-        }
         qemu_bh_schedule(s->work_bh);
     }
     dg_update_irq(s);

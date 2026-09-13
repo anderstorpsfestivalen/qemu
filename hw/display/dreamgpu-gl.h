@@ -3,13 +3,11 @@
 #define DREAMGPU_GL_ENGINE_H
 
 #include "standard-headers/dreamgpu/gl.h"
+#include "dreamgpu-host.h"
 
 typedef struct DgGLEngine DgGLEngine;
 typedef void (*DgGLNotify)(void *opaque);
-typedef struct DgGLFrameRef {
-    uint32_t slot, client, drawable;
-    uint64_t epoch, generation;
-} DgGLFrameRef;
+typedef DreamGpuFrame DgGLFrameRef;
 
 typedef struct DgGLTransfer {
     uint8_t *pixels;
@@ -17,14 +15,7 @@ typedef struct DgGLTransfer {
     bool writeback, return_cpu;
 } DgGLTransfer;
 
-typedef struct DgGLCompletion {
-    uint32_t sequence, generation, error;
-    bool resources_live, reset;
-    DgGLFrameRef present;
-    uint32_t result_bytes, result_type;
-    uint8_t result[DG_GL_MAX_RESULT_BYTES];
-    uint8_t *bulk_result; /* Lazy bounded allocation; ownership follows completion. */
-} DgGLCompletion;
+typedef DreamGpuCompletion DgGLCompletion;
 
 uint32_t dg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                          uint32_t primary_width, uint32_t primary_height,

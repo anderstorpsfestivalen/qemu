@@ -32,59 +32,44 @@ typedef DreamGpuDrawable DgDrawable;
 typedef enum SlotState { SLOT_FREE, SLOT_RENDERING, SLOT_PENDING,
                          SLOT_PUBLISHED } SlotState;
 
-typedef struct DgSlot {
-    DgGLImage *image;
-    SlotState state;
-    bool sending, release_pending;
-    uint64_t generation;
-    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
-} DgSlot;
+typedef DreamGpuExportSlot DgSlot;
 
 /* Frames and desktop commands share one publication order. Only frame jobs
  * wait for a GPU fence; the render thread can continue filling the next frame. */
-typedef struct DgOutput {
-    DgSlot *slot;
-    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
-} DgOutput;
-
+typedef DreamGpuOutput DgOutput;
+typedef DreamGpuCpuSlot DgCpuSlot;
 #define DG_MAX_PENDING_DESKTOP 64
 
-typedef struct DgCpuSlot {
-    uint8_t *pixels;
-    size_t bytes;
-    int fd;
-    uint32_t width, height, stride;
-    bool published;
-    uint64_t epoch, sequence;
-} DgCpuSlot;
+typedef DreamGpuBatch DgBatch;
+G_STATIC_ASSERT(sizeof(((DgBatch *)0)->result) == DG_GL_MAX_RESULT_BYTES);
+G_STATIC_ASSERT(sizeof(((DgGLCompletion *)0)->result) == DG_GL_MAX_RESULT_BYTES);
+G_STATIC_ASSERT(G_N_ELEMENTS(((DreamGpuOutputQueue *)0)->items) ==
+                DG_GL_MAX_DRAWABLES * DG_GL_EXPORT_SLOTS + DG_MAX_PENDING_DESKTOP);
+#if UINTPTR_MAX == UINT64_MAX
+G_STATIC_ASSERT(sizeof(DgBatch) == 576);
+G_STATIC_ASSERT(sizeof(DgGLCompletion) == 576);
+G_STATIC_ASSERT(offsetof(DgGLCompletion, bulk_result) == 568);
+#endif
 
-static void completion_free(void *opaque)
+static void *submission_allocate(void *opaque, size_t bytes)
 {
-    DgGLCompletion *done = opaque;
-    g_free(done->bulk_result);
-    g_free(done);
+    return g_try_malloc(bytes);
 }
 
-typedef struct DgBatch {
-    uint8_t *data;
-    size_t bytes;
-    uint32_t sequence, generation;
-    uint32_t records;
-    uint64_t trace_queued_us;
-    uint32_t primary_width, primary_height;
-    uint32_t result_bytes, result_type;
-    uint8_t result[DG_GL_MAX_RESULT_BYTES];
-    uint8_t *bulk_result; /* Lazy bounded allocation; ownership follows completion. */
-} DgBatch;
+static void submission_free(void *opaque, void *allocation)
+{
+    g_free(allocation);
+}
+
+static const DreamGpuSubmissionMemory submission_memory = {
+    .allocate = submission_allocate, .free = submission_free,
+};
 
 struct DgGLEngine {
     QemuMutex lock, send_lock;
     QemuCond cond;
     QemuThread render_thread, completion_thread, release_thread;
-    bool stopping, failed, reset, threads_started;
-    bool exclusive;
-    uint32_t reset_generation;
-    uint64_t reset_cpu_epoch, reset_cpu_generation;
+    bool stopping, failed, threads_started;
     char *socket_path;
     int socket;
 #ifdef CONFIG_DARWIN
@@ -92,23 +77,16 @@ struct DgGLEngine {
 #endif
     uint8_t uuid[16];
     DgGLPlatform *platform;
-    DgBatch *batch;
-    GQueue completions;
-    GQueue pending_output;
-    uint32_t pending_count, pending_desktop;
-    uint64_t desktop_epoch, desktop_sequence;
-    uint32_t desktop_width, desktop_height;
-    bool desktop_active, desktop_coherent;
+    DreamGpuSubmission work;
+    DreamGpuOutputQueue output;
+    DreamGpuDesktopState desktop;
     DgGLFrameRef last_present;
     DgCpuSlot cpu_slots[DG_TRANSPORT_MAX_CPU_SLOTS];
     DgGLTransfer transfer;
     bool transfer_pending, transfer_claimed;
     uint32_t transfer_error;
     uint64_t cpu_epoch, cpu_generation;
-    bool reply_pending, reply_ready;
-    uint64_t reply_epoch, reply_sequence, reply_token;
-    uint8_t reply_packet[DG_TRANSPORT_PACKET_BYTES];
-    int reply_fd;
+    DreamGpuReply reply;
     DreamGpuResources resources;
     DgSlot slots[DG_GL_MAX_DRAWABLES * DG_GL_EXPORT_SLOTS];
     DgContext *current_context;
@@ -120,14 +98,6 @@ struct DgGLEngine {
 static uint32_t word(const uint8_t *p, unsigned offset)
 {
     return ldl_le_p(p + offset);
-}
-
-static uint32_t validate_desktop(const uint8_t *r, uint32_t primary_width,
-                                  uint32_t primary_height, uint32_t vram_size,
-                                  uint64_t *work)
-{
-    return dreamgpu_desktop_validate(r, primary_width, primary_height,
-                                    vram_size, work);
 }
 
 /* Failure-only diagnostics carry bounded numeric command headers, never payloads. */
@@ -152,169 +122,19 @@ static void trace_rejection(const uint8_t *r, uint32_t size, uint32_t sequence,
         size >= args + 16 ? word(r, args + 12) : 0, error, tail);
 }
 
+static void batch_rejection(void *opaque, const uint8_t *record,
+                              uint32_t bytes, uint32_t error)
+{
+    trace_rejection(record, bytes, 0, false, error);
+}
+
 uint32_t dg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                          uint32_t primary_width, uint32_t primary_height,
                          uint32_t vram_size, uint32_t *records)
 {
-    size_t offset = 0;
-    unsigned count = 0, desktop_count = 0;
-    uint64_t desktop_work = 0;
-
-    *records = 0;
-    if (!bytes || bytes > DG_GL_MAX_BYTES || (bytes & 3)) {
-        return DG_GL_ERROR_BATCH;
-    }
-    while (offset < bytes) {
-        const uint8_t *r = data + offset;
-        uint32_t op, size, flags, expected = DG_GL_HEADER_BYTES;
-
-        if (bytes - offset < DG_GL_HEADER_BYTES ||
-            ++count > DG_GL_MAX_RECORDS) {
-            return DG_GL_ERROR_BATCH;
-        }
-        op = word(r, DG_GL_OFF_OP);
-        size = word(r, DG_GL_OFF_SIZE);
-        flags = word(r, DG_GL_OFF_FLAGS);
-        if (size < DG_GL_HEADER_BYTES || size > bytes - offset || (size & 3) ||
-            !word(r, DG_GL_OFF_CLIENT) || word(r, DG_GL_OFF_RESERVED) ||
-            (flags && (op != DG_GL_PRESENT ||
-                       (flags & ~(DG_GL_PRESENT_EXCLUSIVE |
-                                  DG_GL_PRESENT_RETAIN |
-                                  DG_GL_PRESENT_FRONT_ONLY |
-                                  DG_GL_PRESENT_NO_EXPORT |
-                                  DG_GL_PRESENT_BOUNDED)) ||
-                       ((flags & DG_GL_PRESENT_NO_EXPORT) &&
-                        (flags & ~DG_GL_PRESENT_BOUNDED) !=
-                         DG_GL_PRESENT_NO_EXPORT) ||
-                       ((flags & DG_GL_PRESENT_EXCLUSIVE) &&
-                        (flags & DG_GL_PRESENT_RETAIN))))) {
-            return DG_GL_ERROR_BATCH;
-        }
-        if (word(r, DG_GL_OFF_GENERATION) != generation) {
-            return DG_GL_ERROR_GENERATION;
-        }
-        switch (op) {
-        case DG_GL_CREATE_CONTEXT:
-            expected += 4;
-            break;
-        case DG_GL_CREATE_DRAWABLE:
-            expected += 8;
-            break;
-        case DG_GL_CALL:
-            if (size < expected + 4) {
-                return DG_GL_ERROR_BATCH;
-            }
-            uint32_t words = dg_gl_function_words(word(r, expected));
-            if (words == UINT32_MAX || (words & DG_GL_FUNCTION_KIND_MASK)) {
-                trace_rejection(r, size, 0, false, DG_GL_ERROR_UNSUPPORTED);
-                return DG_GL_ERROR_UNSUPPORTED;
-            }
-            expected += 4 + words * 4;
-            break;
-        case DG_GL_DATA_CALL: {
-            if (size < DG_GL_DATA_ARGS) {
-                return DG_GL_ERROR_BATCH;
-            }
-            uint32_t fn = word(r, DG_GL_DATA_FUNCTION);
-            uint32_t count = dg_gl_function_words(fn);
-            uint32_t bytes = word(r, DG_GL_DATA_BYTES);
-            if (count == UINT32_MAX ||
-                (count & DG_GL_FUNCTION_KIND_MASK) !=
-                DG_GL_FUNCTION_INLINE_DATA) {
-                trace_rejection(r, size, 0, false, DG_GL_ERROR_UNSUPPORTED);
-                return DG_GL_ERROR_UNSUPPORTED;
-            }
-            count &= ~DG_GL_FUNCTION_INLINE_DATA;
-            if (bytes > DG_GL_MAX_BYTES ||
-                size != DG_GL_DATA_ARGS + count * 4 +
-                        QEMU_ALIGN_UP(bytes, 4)) {
-                return DG_GL_ERROR_BATCH;
-            }
-            uint32_t error = dg_gl_data_validate(fn, r + DG_GL_DATA_ARGS,
-                                                  r + DG_GL_DATA_ARGS +
-                                                  count * 4,
-                                                  bytes);
-            if (error) {
-                trace_rejection(r, size, 0, false, error);
-                return error;
-            }
-            for (unsigned i = bytes; i < QEMU_ALIGN_UP(bytes, 4); i++) {
-                if (r[DG_GL_DATA_ARGS + count * 4 + i]) {
-                    return DG_GL_ERROR_BATCH;
-                }
-            }
-            expected = size;
-            break;
-        }
-        case DG_GL_QUERY:
-            if (size != DG_GL_QUERY_BYTES || bytes != DG_GL_QUERY_BYTES) {
-                return DG_GL_ERROR_BATCH;
-            }
-            uint32_t query_error = dg_gl_query_validate(word(r, 32), r + 36);
-            if (query_error) {
-                trace_rejection(r, size, 0, false, query_error);
-                return query_error;
-            }
-            expected = DG_GL_QUERY_BYTES;
-            break;
-        case DG_GL_DESKTOP:
-            expected += DG_DESKTOP_BYTES;
-            if (size != expected || ++desktop_count > DG_DESKTOP_MAX_RECORDS) {
-                return DG_GL_ERROR_BATCH;
-            }
-            uint32_t error = validate_desktop(r + DG_GL_HEADER_BYTES,
-                                             primary_width, primary_height,
-                                             vram_size, &desktop_work);
-            if (error) {
-                trace_rejection(r, size, 0, false, error);
-                return error;
-            }
-            break;
-        case DG_GL_DESTROY_CONTEXT:
-        case DG_GL_DESTROY_DRAWABLE:
-        case DG_GL_MAKE_CURRENT:
-        case DG_GL_CLOSE_CLIENT:
-            break;
-        case DG_GL_PRESENT:
-            if (flags & DG_GL_PRESENT_BOUNDED) {
-                expected += 8;
-                if (size != expected) {
-                    return DG_GL_ERROR_BATCH;
-                }
-                if (!word(r, 32) || !word(r, 36) ||
-                    word(r, 32) > DG_GL_MAX_DIMENSION ||
-                    word(r, 36) > DG_GL_MAX_DIMENSION) {
-                    return DG_GL_ERROR_DRAWABLE;
-                }
-            }
-            break;
-        default:
-            return DG_GL_ERROR_UNSUPPORTED;
-        }
-        if (size != expected) {
-            return DG_GL_ERROR_BATCH;
-        }
-        if (op == DG_GL_CALL) {
-            uint32_t error = dg_gl_call_validate(word(r, 32), r + 36);
-            if (error) {
-                trace_rejection(r, size, 0, false, error);
-                return error;
-            }
-        }
-        if (op == DG_GL_CREATE_DRAWABLE &&
-            (!word(r, 32) || !word(r, 36) ||
-             word(r, 32) > DG_GL_MAX_DIMENSION ||
-             word(r, 36) > DG_GL_MAX_DIMENSION)) {
-            return DG_GL_ERROR_DRAWABLE;
-        }
-        if ((flags & DG_GL_PRESENT_EXCLUSIVE) &&
-            (!primary_width || !primary_height)) {
-            return DG_GL_ERROR_DRAWABLE;
-        }
-        offset += size;
-    }
-    *records = count;
-    return 0;
+    return dreamgpu_batch_validate(data, bytes, generation, primary_width,
+                                    primary_height, vram_size, records,
+                                    batch_rejection, NULL);
 }
 
 /* Ancillary handles belong to the first byte; never read across records. */
@@ -513,40 +333,20 @@ static void *release_worker(void *opaque)
 
         qemu_mutex_lock(&e->lock);
         if (kind == DG_TRANSPORT_KIND_DESKTOP_REPLY) {
-            uint64_t token = ldq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_TOKEN);
-            if (!e->reply_pending && epoch == e->reply_epoch &&
-                sequence == e->reply_sequence && token == e->reply_token) {
-                /* A reset can cancel a readback already executing remotely. */
-            } else if (!e->reply_pending || e->reply_ready ||
-                       epoch != e->reply_epoch ||
-                       sequence != e->reply_sequence ||
-                       token != e->reply_token) {
-                valid = false;
-            } else {
-                memcpy(e->reply_packet, packet, sizeof(packet));
-                e->reply_fd = received_fd;
+            uint32_t result = dreamgpu_reply_receive(&e->reply, packet, received_fd);
+            valid = result != 0;
+            if (result == 2) {
                 received_fd = -1;
-                e->reply_ready = true;
             }
         } else if (kind != DG_TRANSPORT_KIND_RELEASE || received_fd >= 0) {
             valid = false;
         } else if (slot >= DG_TRANSPORT_CPU_SLOT_BASE &&
                    slot < DG_TRANSPORT_CPU_SLOT_BASE + DG_TRANSPORT_MAX_CPU_SLOTS) {
             DgCpuSlot *s = &e->cpu_slots[slot - DG_TRANSPORT_CPU_SLOT_BASE];
-            if (s->published && s->epoch == epoch && s->sequence == sequence) {
-                s->published = false;
-            }
+            dreamgpu_cpu_release(s, epoch, sequence);
         } else if (slot < G_N_ELEMENTS(e->slots)) {
             DgSlot *s = &e->slots[slot];
-            if (s->state == SLOT_PUBLISHED &&
-                epoch == ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH) &&
-                sequence == s->generation) {
-                if (s->sending) {
-                    s->release_pending = true;
-                } else {
-                    s->state = SLOT_FREE;
-                }
-            }
+            dreamgpu_slot_release(s, epoch, sequence);
         } else {
             valid = false;
         }
@@ -611,59 +411,46 @@ static void *completion_worker(void *opaque)
         DgSlot *s;
         Error *err = NULL;
 
-        while (g_queue_is_empty(&e->pending_output) && !e->stopping) {
+        while (!e->output.len && !e->stopping) {
             qemu_cond_wait(&e->cond, &e->lock);
         }
-        if (g_queue_is_empty(&e->pending_output)) {
+        if (!e->output.len) {
             break;
         }
-        DgOutput *output = g_queue_pop_head(&e->pending_output);
-        s = output->slot;
+        DgOutput output;
+        if (!dreamgpu_output_pop(&e->output, &output)) {
+            break;
+        }
+        s = output.slot;
         if (!s) {
-            bool publish = !e->failed && !e->stopping && !e->reset;
+            bool publish = !e->failed && !e->stopping && !e->work.reset;
             qemu_mutex_unlock(&e->lock);
-            bool sent = publish && send_record(e, output->packet, NULL, 0);
+            bool sent = publish && send_record(e, output.packet, NULL, 0);
             qemu_mutex_lock(&e->lock);
             if (publish && !sent) {
                 e->failed = true;
             }
-            g_free(output);
-            e->pending_desktop--;
-            e->pending_count--;
+            dreamgpu_output_done(&e->output, 1);
             qemu_cond_broadcast(&e->cond);
             continue;
         }
         qemu_mutex_unlock(&e->lock);
         bool ready = dg_gl_image_ready(s->image, &err);
         qemu_mutex_lock(&e->lock);
-        /* A fast consumer may release during send_frame; publish first. */
-        s->state = SLOT_PUBLISHED;
-        s->sending = true;
-        bool publish = ready && !e->failed && !e->stopping && !e->reset;
+        bool publish = dreamgpu_slot_publish(s, ready,
+                                               e->failed || e->stopping || e->work.reset);
         qemu_mutex_unlock(&e->lock);
         bool sent = publish && send_frame(e, s);
         if (err) {
             error_report_err(err);
         }
         qemu_mutex_lock(&e->lock);
-        s->sending = false;
-        if (sent && s->release_pending) {
-            s->state = SLOT_FREE;
+        unsigned index = (s - e->slots) / DG_GL_EXPORT_SLOTS;
+        if (dreamgpu_slot_sent(s, &e->resources.drawables[index],
+                               sent, publish, ready)) {
+            e->failed = true;
         }
-        if (!sent) {
-            s->state = SLOT_FREE;
-            if (publish || !ready) {
-                e->failed = true;
-            }
-        }
-        if (sent) {
-            unsigned index = (s - e->slots) / DG_GL_EXPORT_SLOTS;
-            DgDrawable *d = &e->resources.drawables[index];
-            d->published_epoch = ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH);
-            d->published_generation = s->generation;
-        }
-        g_free(output);
-        e->pending_count--;
+        dreamgpu_output_done(&e->output, 0);
         qemu_cond_broadcast(&e->cond);
     }
     qemu_mutex_unlock(&e->lock);
@@ -691,7 +478,7 @@ static bool make_current(DgGLEngine *e, DgContext *c, DgDrawable *d,
 static void drain_output(DgGLEngine *e)
 {
     qemu_mutex_lock(&e->lock);
-    while (e->pending_count) {
+    while (e->output.pending) {
         qemu_cond_wait(&e->cond, &e->lock);
     }
     qemu_mutex_unlock(&e->lock);
@@ -701,29 +488,23 @@ static void drain_output(DgGLEngine *e)
  * queue without bound. Blocking here applies only at the fixed backlog limit. */
 static uint32_t queue_desktop(DgGLEngine *e, const uint8_t *packet)
 {
-    DgOutput *output = g_new0(DgOutput, 1);
     uint32_t error = 0;
 
-    memcpy(output->packet, packet, DG_TRANSPORT_PACKET_BYTES);
     qemu_mutex_lock(&e->lock);
-    while (e->pending_desktop == DG_MAX_PENDING_DESKTOP &&
-           !e->stopping && !e->reset && !e->failed) {
+    while (e->output.desktop == DG_MAX_PENDING_DESKTOP &&
+           !e->stopping && !e->work.reset && !e->failed) {
         qemu_cond_wait(&e->cond, &e->lock);
     }
-    if (e->reset) {
+    if (e->work.reset) {
         error = DG_GL_ERROR_GENERATION;
     } else if (e->stopping || e->failed) {
         error = DG_GL_ERROR_TRANSPORT;
+    } else if (!dreamgpu_output_push(&e->output, NULL, packet)) {
+        error = DG_GL_ERROR_LIMIT;
     } else {
-        g_queue_push_tail(&e->pending_output, output);
-        e->pending_count++;
-        e->pending_desktop++;
         qemu_cond_broadcast(&e->cond);
     }
     qemu_mutex_unlock(&e->lock);
-    if (error) {
-        g_free(output);
-    }
     return error;
 }
 
@@ -754,7 +535,10 @@ static void delete_drawable(DgGLEngine *e, DgDrawable *d)
     unsigned index = d - e->resources.drawables;
 
     drain_output(e);
-    if (!e->reset) {
+    qemu_mutex_lock(&e->lock);
+    bool resetting = e->work.reset;
+    qemu_mutex_unlock(&e->lock);
+    if (!resetting) {
         drop_drawable_resource(e, d);
     }
     e->current_context = NULL;
@@ -770,7 +554,7 @@ static void delete_drawable(DgGLEngine *e, DgDrawable *d)
         dg_gl_image_free(e->platform, s->image);
         qemu_mutex_lock(&e->lock);
         s->image = NULL;
-        s->state = SLOT_FREE;
+        dreamgpu_slot_abort(s);
         qemu_mutex_unlock(&e->lock);
     }
     dg_gl_drawable_free(e->platform, d->native);
@@ -791,14 +575,10 @@ static uint32_t present(DgGLEngine *e, DgContext *c, DgDrawable *d,
         return 0;
     }
     qemu_mutex_lock(&e->lock);
-    while (!e->stopping && !e->reset && !e->failed) {
-        for (unsigned i = 0; i < DG_GL_EXPORT_SLOTS; i++) {
-            if (e->slots[first + i].state == SLOT_FREE) {
-                s = &e->slots[first + i];
-                s->state = SLOT_RENDERING;
-                s->release_pending = false;
-                break;
-            }
+    while (!e->stopping && !e->work.reset && !e->failed) {
+        uint32_t slot = dreamgpu_slot_claim(e->slots, first);
+        if (slot != UINT32_MAX) {
+            s = &e->slots[slot];
         }
         if (s) {
             break;
@@ -816,47 +596,38 @@ static uint32_t present(DgGLEngine *e, DgContext *c, DgDrawable *d,
                                     !(flags & DG_GL_PRESENT_FRONT_ONLY),
                                     errp)) {
         qemu_mutex_lock(&e->lock);
-        s->state = SLOT_FREE;
+        dreamgpu_slot_abort(s);
         qemu_mutex_unlock(&e->lock);
         return DG_GL_ERROR_HOST;
     }
     dg_gl_image_metadata(s->image, &stride, &offset, &modifier);
     if (flags & DG_GL_PRESENT_EXCLUSIVE) {
-        e->exclusive = true;
+        e->desktop.exclusive = true;
     }
-    packet_init(s->packet, flags & DG_GL_PRESENT_EXCLUSIVE ?
-                 DG_TRANSPORT_KIND_FRAME : DG_TRANSPORT_KIND_DRAWABLE);
-    uint32_t wire_flags = DG_TRANSPORT_FLAG_TOP_LEFT;
-    if (flags & DG_GL_PRESENT_RETAIN) {
-        wire_flags |= DG_TRANSPORT_FLAG_RETAIN_FOR_DESKTOP;
+    DreamGpuImageMetadata metadata = {
+        .stride = stride, .offset = offset, .modifier = modifier,
+        .ready_fence = dg_gl_image_fence_fd(s->image) >= 0,
+    };
+    memcpy(metadata.uuid, e->uuid, sizeof(e->uuid));
+    uint32_t error = dreamgpu_slot_prepare(s, d, s - e->slots, flags,
+                                           &metadata);
+    if (error) {
+        qemu_mutex_lock(&e->lock);
+        dreamgpu_slot_abort(s);
+        qemu_mutex_unlock(&e->lock);
+        return error;
     }
-    if (dg_gl_image_fence_fd(s->image) >= 0) {
-        wire_flags |= DG_TRANSPORT_FLAG_READY_FENCE;
-    }
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_FLAGS, wire_flags);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_WIDTH, d->width);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_HEIGHT, d->height);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_STRIDE, stride);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_OFFSET, offset);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_FOURCC, DG_TRANSPORT_FORMAT_ARGB8888);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_SLOT, s - e->slots);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_CLIENT, d->client);
-    stl_le_p(s->packet + DG_TRANSPORT_OFF_DRAWABLE, d->id);
-    stq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH, d->epoch);
-    s->generation = ++d->generation;
-    stq_le_p(s->packet + DG_TRANSPORT_OFF_GENERATION, s->generation);
-    stq_le_p(s->packet + DG_TRANSPORT_OFF_MODIFIER, modifier);
-    memcpy(s->packet + DG_TRANSPORT_OFF_DEVICE_UUID, e->uuid, sizeof(e->uuid));
     qemu_mutex_lock(&e->lock);
     e->last_present = (DgGLFrameRef) {
         .slot = s - e->slots, .client = d->client, .drawable = d->id,
         .epoch = d->epoch, .generation = s->generation,
     };
-    s->state = SLOT_PENDING;
-    DgOutput *output = g_new0(DgOutput, 1);
-    output->slot = s;
-    g_queue_push_tail(&e->pending_output, output);
-    e->pending_count++;
+    dreamgpu_slot_pending(s);
+    if (!dreamgpu_output_push(&e->output, s, NULL)) {
+        dreamgpu_slot_abort(s);
+        qemu_mutex_unlock(&e->lock);
+        return DG_GL_ERROR_LIMIT;
+    }
     qemu_cond_broadcast(&e->cond);
     qemu_mutex_unlock(&e->lock);
     return 0;
@@ -895,45 +666,36 @@ static uint32_t transfer_pixels(DgGLEngine *e, const uint8_t *r,
     return error;
 }
 
-static DgCpuSlot *cpu_slot(DgGLEngine *e, size_t bytes, Error **errp)
+static uint8_t *cpu_allocate(void *opaque, size_t bytes, int32_t *fd)
+{
+    return qemu_memfd_alloc("dreamgpu-desktop", bytes, 0, fd, opaque);
+}
+
+static void cpu_free(void *opaque, uint8_t *pixels, size_t bytes, int32_t fd)
+{
+    qemu_memfd_free(pixels, bytes, fd);
+}
+
+static DgCpuSlot *cpu_slot(DgGLEngine *e, uint32_t width, uint32_t height,
+                           Error **errp)
 {
     DgCpuSlot *slot = NULL;
+    DreamGpuCpuMemory memory = { errp, cpu_allocate, cpu_free };
 
     qemu_mutex_lock(&e->lock);
-    while (!e->stopping && !e->reset && !e->failed) {
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->cpu_slots); i++) {
-            if (!e->cpu_slots[i].published) {
-                slot = &e->cpu_slots[i];
-                slot->published = true;
-                slot->epoch = e->desktop_epoch;
-                slot->sequence = e->desktop_sequence;
-                break;
-            }
-        }
-        if (slot) {
+    while (!e->stopping && !e->work.reset && !e->failed) {
+        uint32_t index = dreamgpu_cpu_claim(e->cpu_slots, e->desktop.epoch,
+                                           e->desktop.sequence);
+        if (index != UINT32_MAX) {
+            slot = &e->cpu_slots[index];
             break;
         }
         qemu_cond_wait(&e->cond, &e->lock);
     }
     qemu_mutex_unlock(&e->lock);
-    if (!slot) {
-        return NULL;
-    }
-    if (!slot->pixels || slot->bytes != bytes) {
-        if (slot->pixels) {
-            qemu_memfd_free(slot->pixels, slot->bytes, slot->fd);
-        }
-        slot->bytes = bytes;
-        slot->fd = -1;
-        slot->pixels = qemu_memfd_alloc("dreamgpu-desktop", bytes, 0, &slot->fd,
-                                        errp);
-        if (slot->pixels) {
-            memset(slot->pixels, 0, bytes);
-        }
-    }
-    if (!slot->pixels) {
+    if (slot && dreamgpu_cpu_storage(slot, &memory, width, height)) {
         qemu_mutex_lock(&e->lock);
-        slot->published = false;
+        dreamgpu_cpu_release(slot, slot->epoch, slot->sequence);
         qemu_mutex_unlock(&e->lock);
         return NULL;
     }
@@ -946,52 +708,26 @@ static uint32_t capture_desktop(DgGLEngine *e, const uint8_t *r,
 {
     uint32_t w = word(r, DG_DESKTOP_WIDTH);
     uint32_t h = word(r, DG_DESKTOP_HEIGHT);
-    uint32_t stride = QEMU_ALIGN_UP(w * 4, 256);
-    size_t bytes = QEMU_ALIGN_UP((size_t)stride * h, 65536);
     uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
     DgCpuSlot *s;
     uint32_t error;
 
-    if (bytes > DG_TRANSPORT_MAX_CPU_BYTES) {
-        return DG_GL_ERROR_LIMIT;
-    }
-    s = cpu_slot(e, bytes, errp);
+    s = cpu_slot(e, w, h, errp);
     if (!s) {
         return DG_GL_ERROR_TRANSPORT;
     }
-    if (s->width != w || s->height != h || s->stride != stride) {
-        memset(s->pixels, 0, bytes);
-        s->width = w;
-        s->height = h;
-        s->stride = stride;
-    }
-    error = transfer_pixels(e, r, s->pixels, stride, batch, false,
+    error = transfer_pixels(e, r, s->pixels, s->stride, batch, false,
                               subtype == DG_TRANSPORT_CPU_RETURN);
     if (!error) {
-        packet_init(packet, DG_TRANSPORT_KIND_CPU_DESKTOP);
-        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_SUBTYPE, subtype);
-        stl_le_p(packet + DG_TRANSPORT_OFF_WIDTH, w);
-        stl_le_p(packet + DG_TRANSPORT_OFF_HEIGHT, h);
-        stl_le_p(packet + DG_TRANSPORT_OFF_STRIDE, stride);
-        stl_le_p(packet + DG_TRANSPORT_OFF_FOURCC, DG_TRANSPORT_FORMAT_ARGB8888);
-        stl_le_p(packet + DG_TRANSPORT_OFF_SLOT,
-                 DG_TRANSPORT_CPU_SLOT_BASE + (s - e->cpu_slots));
-        stq_le_p(packet + DG_TRANSPORT_OFF_EPOCH, s->epoch);
-        stq_le_p(packet + DG_TRANSPORT_OFF_GENERATION, s->sequence);
-        stq_le_p(packet + DG_TRANSPORT_CPU_OFF_ALLOCATION, bytes);
-        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_DST_X, word(r, DG_DESKTOP_DST_X));
-        stl_le_p(packet + DG_TRANSPORT_CPU_OFF_DST_Y, word(r, DG_DESKTOP_DST_Y));
-        if (subtype == DG_TRANSPORT_CPU_RETURN) {
-            stq_le_p(packet + DG_TRANSPORT_CPU_OFF_LEGACY_EPOCH, e->cpu_epoch);
-            stq_le_p(packet + DG_TRANSPORT_CPU_OFF_LEGACY_FRAME, e->cpu_generation);
-        }
+        dreamgpu_cpu_packet(s, s - e->cpu_slots, subtype, r,
+                             e->cpu_epoch, e->cpu_generation, packet);
         if (!send_record(e, packet, &s->fd, 1)) {
             error = DG_GL_ERROR_TRANSPORT;
         }
     }
     if (error) {
         qemu_mutex_lock(&e->lock);
-        s->published = false;
+        dreamgpu_cpu_release(s, s->epoch, s->sequence);
         qemu_mutex_unlock(&e->lock);
     }
     return error;
@@ -1003,27 +739,22 @@ static uint32_t readback_desktop(DgGLEngine *e, const uint8_t *r,
     uint32_t error = 0;
     uint32_t w = word(r, DG_DESKTOP_WIDTH);
     uint32_t h = word(r, DG_DESKTOP_HEIGHT);
-    uint64_t token = e->desktop_sequence;
+    DreamGpuReplyResult result;
     int fd = -1;
     struct stat statbuf;
     uint8_t *pixels = MAP_FAILED;
     uint64_t bytes = 0;
     uint32_t stride = 0;
 
-    stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_TOKEN, token);
     qemu_mutex_lock(&e->lock);
-    e->reply_pending = true;
-    e->reply_ready = false;
-    e->reply_epoch = e->desktop_epoch;
-    e->reply_sequence = e->desktop_sequence;
-    e->reply_token = token;
+    dreamgpu_reply_begin(&e->reply, e->desktop.epoch, e->desktop.sequence, packet);
     qemu_mutex_unlock(&e->lock);
     if (!send_record(e, packet, NULL, 0)) {
         error = DG_GL_ERROR_TRANSPORT;
     }
     qemu_mutex_lock(&e->lock);
     int64_t deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
-    while (!error && !e->reply_ready && !e->stopping && !e->reset &&
+    while (!error && !e->reply.ready && !e->stopping && !e->work.reset &&
            !e->failed) {
         int64_t remaining = deadline - g_get_monotonic_time();
         if (remaining <= 0) {
@@ -1032,28 +763,14 @@ static uint32_t readback_desktop(DgGLEngine *e, const uint8_t *r,
         qemu_cond_timedwait(&e->cond, &e->lock,
                             DIV_ROUND_UP(remaining, G_TIME_SPAN_MILLISECOND));
     }
-    if (e->stopping || e->reset) {
-        error = DG_GL_ERROR_GENERATION;
-    } else if (!error && (!e->reply_ready || e->failed)) {
-        error = DG_GL_ERROR_TRANSPORT;
-    }
-    fd = e->reply_fd;
-    e->reply_fd = -1;
-    if (!error) {
-        bytes = ldq_le_p(e->reply_packet + DG_TRANSPORT_CPU_OFF_ALLOCATION);
-        stride = word(e->reply_packet, DG_TRANSPORT_OFF_STRIDE);
-        if (word(e->reply_packet, 16) || fd < 0 ||
-            word(e->reply_packet, DG_TRANSPORT_OFF_WIDTH) != w ||
-            word(e->reply_packet, DG_TRANSPORT_OFF_HEIGHT) != h ||
-            stride != w * 4 || bytes != (uint64_t)stride * h ||
-            bytes > DG_TRANSPORT_MAX_CPU_BYTES || fstat(fd, &statbuf) ||
-            statbuf.st_size < 0 || (uint64_t)statbuf.st_size < bytes) {
-            error = DG_GL_ERROR_DESKTOP;
-        }
-    }
-    e->reply_pending = false;
-    e->reply_ready = false;
+    dreamgpu_reply_finish(&e->reply, error, e->stopping || e->work.reset,
+                           e->failed, &result);
     qemu_mutex_unlock(&e->lock);
+    fd = result.fd;
+    bool stat_ok = !result.error && fd >= 0 && !fstat(fd, &statbuf);
+    error = dreamgpu_reply_layout(&result, w, h, stat_ok,
+                                   stat_ok ? statbuf.st_size : 0,
+                                   &bytes, &stride);
     if (!error) {
         pixels = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
         if (pixels == MAP_FAILED) {
@@ -1071,151 +788,64 @@ static uint32_t readback_desktop(DgGLEngine *e, const uint8_t *r,
     return error;
 }
 
+typedef struct DgDesktopCall {
+    DgGLEngine *engine;
+    const DgBatch *batch;
+    Error **errp;
+} DgDesktopCall;
+
+static uint32_t desktop_capture(void *opaque, const uint8_t *r, uint32_t subtype)
+{
+    DgDesktopCall *call = opaque;
+    drain_output(call->engine);
+    return capture_desktop(call->engine, r, call->batch, subtype, call->errp);
+}
+
+static uint32_t desktop_readback(void *opaque, const uint8_t *r, uint8_t *packet)
+{
+    DgDesktopCall *call = opaque;
+    drain_output(call->engine);
+    return readback_desktop(call->engine, r, call->batch, packet);
+}
+
+static uint32_t desktop_queue(void *opaque, const uint8_t *packet)
+{
+    DgDesktopCall *call = opaque;
+    return queue_desktop(call->engine, packet);
+}
+
+static uint32_t desktop_retained(void *opaque, const uint8_t *record)
+{
+    DgDesktopCall *call = opaque;
+    DgGLEngine *e = call->engine;
+    uint32_t index = word(record + DG_GL_HEADER_BYTES, DG_DESKTOP_SLOT_OR_OFFSET);
+    qemu_mutex_lock(&e->lock);
+    uint32_t valid = dreamgpu_desktop_retained(&e->slots[index], record);
+    qemu_mutex_unlock(&e->lock);
+    return valid;
+}
+
+static void desktop_failed(void *opaque)
+{
+    DgDesktopCall *call = opaque;
+    DgGLEngine *e = call->engine;
+    qemu_mutex_lock(&e->lock);
+    e->failed = true;
+    qemu_cond_broadcast(&e->cond);
+    qemu_mutex_unlock(&e->lock);
+}
+
 static uint32_t execute_desktop(DgGLEngine *e, const uint8_t *record,
                                   const DgBatch *batch, Error **errp)
 {
-    const uint8_t *r = record + DG_GL_HEADER_BYTES;
-    uint32_t op = word(r, DG_DESKTOP_OP);
-    uint32_t client = word(record, DG_GL_OFF_CLIENT);
-    uint32_t drawable = word(record, DG_GL_OFF_DRAWABLE);
-    uint32_t w = word(r, DG_DESKTOP_WIDTH);
-    uint32_t h = word(r, DG_DESKTOP_HEIGHT);
-    uint32_t wire_op = 0, error = 0;
-    uint8_t packet[DG_TRANSPORT_PACKET_BYTES];
-
-    bool detached = op == DG_DESKTOP_DISCARD;
-
-    if (op == DG_DESKTOP_SEED) {
-        if (e->desktop_active) {
-            return DG_GL_ERROR_DESKTOP;
-        }
-        ++e->desktop_epoch;
-        e->desktop_sequence = 0;
-        e->desktop_width = batch->primary_width;
-        e->desktop_height = batch->primary_height;
-    } else if (!detached && (!e->desktop_active ||
-               batch->primary_width != e->desktop_width ||
-               batch->primary_height != e->desktop_height)) {
-        return DG_GL_ERROR_DESKTOP;
-    }
-    /* Releasing an occluded retained image does not acquire or mutate the
-     * desktop. Keep it ordered in the output FIFO, outside desktop epochs. */
-    if (!detached) {
-        ++e->desktop_sequence;
-    }
-    switch (op) {
-    case DG_DESKTOP_SEED:
-    case DG_DESKTOP_PATCH:
-    case DG_DESKTOP_RETURN:
-        if (op == DG_DESKTOP_RETURN && !e->desktop_coherent) {
-            --e->desktop_sequence;
-            return DG_GL_ERROR_DESKTOP;
-        }
-        /* CPU patches and returns must follow every queued GPU operation. */
-        drain_output(e);
-        error = capture_desktop(e, r, batch,
-                                  op == DG_DESKTOP_SEED ? DG_TRANSPORT_CPU_SEED :
-                                  op == DG_DESKTOP_PATCH ? DG_TRANSPORT_CPU_PATCH :
-                                  DG_TRANSPORT_CPU_RETURN, errp);
-        if (!error && op == DG_DESKTOP_SEED) {
-            e->desktop_active = e->desktop_coherent = true;
-        }
-        if (!error && op == DG_DESKTOP_RETURN) {
-            e->exclusive = false;
-            e->desktop_active = e->desktop_coherent = false;
-        }
-        if (error) {
-            --e->desktop_sequence;
-        }
-        return error;
-    case DG_DESKTOP_FILL:
-        wire_op = DG_TRANSPORT_DESKTOP_FILL;
-        break;
-    case DG_DESKTOP_COPY:
-        wire_op = DG_TRANSPORT_DESKTOP_COPY;
-        break;
-    case DG_DESKTOP_READBACK:
-        wire_op = DG_TRANSPORT_DESKTOP_READBACK;
-        break;
-    case DG_DESKTOP_BLIT:
-    case DG_DESKTOP_DISCARD: {
-        uint32_t index = word(r, DG_DESKTOP_SLOT_OR_OFFSET);
-        uint64_t epoch = ldq_le_p(r + DG_DESKTOP_IMAGE_EPOCH);
-        uint64_t frame = ldq_le_p(r + DG_DESKTOP_IMAGE_FRAME);
-        DgSlot *s = &e->slots[index];
-        qemu_mutex_lock(&e->lock);
-        /* The matching frame is already ahead of this command in the output
-         * FIFO. Retained storage stays alive until the desktop consumer's
-         * final blit/discard; no GPU-fence wait belongs on this thread. */
-        bool valid = (s->state == SLOT_PENDING || s->state == SLOT_PUBLISHED) &&
-            word(s->packet, DG_TRANSPORT_OFF_CLIENT) == client &&
-            word(s->packet, DG_TRANSPORT_OFF_DRAWABLE) == drawable &&
-            ldq_le_p(s->packet + DG_TRANSPORT_OFF_EPOCH) == epoch &&
-            s->generation == frame &&
-            (word(s->packet, DG_TRANSPORT_OFF_FLAGS) & DG_TRANSPORT_FLAG_RETAIN_FOR_DESKTOP);
-        if (op == DG_DESKTOP_BLIT) {
-            valid &= dreamgpu_desktop_rect(word(r, DG_DESKTOP_SRC_X),
-                                    word(r, DG_DESKTOP_SRC_Y), w, h,
-                                    word(s->packet, DG_TRANSPORT_OFF_WIDTH),
-                                    word(s->packet, DG_TRANSPORT_OFF_HEIGHT));
-        }
-        qemu_mutex_unlock(&e->lock);
-        if (!valid) {
-            if (!detached) {
-                --e->desktop_sequence;
-            }
-            return DG_GL_ERROR_DESKTOP;
-        }
-        wire_op = op == DG_DESKTOP_BLIT ? DG_TRANSPORT_DESKTOP_BLIT :
-                                          DG_TRANSPORT_DESKTOP_DISCARD;
-        break;
-    }
-    }
-    packet_init(packet, DG_TRANSPORT_KIND_DESKTOP_OP);
-    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_OPCODE, wire_op);
-    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_DST_X, word(r, DG_DESKTOP_DST_X));
-    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_DST_Y, word(r, DG_DESKTOP_DST_Y));
-    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_WIDTH, w);
-    stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_HEIGHT, h);
-    stq_le_p(packet + DG_TRANSPORT_OFF_EPOCH, detached ? 0 : e->desktop_epoch);
-    stq_le_p(packet + DG_TRANSPORT_OFF_GENERATION, detached ? 0 : e->desktop_sequence);
-    if (op == DG_DESKTOP_FILL) {
-        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_COLOR, word(r, DG_DESKTOP_SRC_X));
-    } else if (op == DG_DESKTOP_COPY || op == DG_DESKTOP_BLIT ||
-               op == DG_DESKTOP_DISCARD) {
-        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_SRC_X, word(r, DG_DESKTOP_SRC_X));
-        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_SRC_Y, word(r, DG_DESKTOP_SRC_Y));
-    }
-    if (op == DG_DESKTOP_BLIT || op == DG_DESKTOP_DISCARD) {
-        stl_le_p(packet + DG_TRANSPORT_OFF_CLIENT, client);
-        stl_le_p(packet + DG_TRANSPORT_OFF_DRAWABLE, drawable);
-        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_SLOT,
-                 word(r, DG_DESKTOP_SLOT_OR_OFFSET));
-        stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_EPOCH,
-                 ldq_le_p(r + DG_DESKTOP_IMAGE_EPOCH));
-        stq_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_GPU_FRAME,
-                 ldq_le_p(r + DG_DESKTOP_IMAGE_FRAME));
-        stl_le_p(packet + DG_TRANSPORT_DESKTOP_OFF_FLAGS, word(r, DG_DESKTOP_FLAGS));
-    }
-    if (op == DG_DESKTOP_READBACK) {
-        drain_output(e);
-        error = readback_desktop(e, r, batch, packet);
-        if (!error && w == e->desktop_width && h == e->desktop_height) {
-            e->desktop_coherent = true;
-        }
-    } else {
-        error = queue_desktop(e, packet);
-        if (op != DG_DESKTOP_DISCARD) {
-            e->desktop_coherent = false;
-        }
-    }
-    if (error && error != DG_GL_ERROR_GENERATION) {
-        qemu_mutex_lock(&e->lock);
-        e->failed = true;
-        qemu_cond_broadcast(&e->cond);
-        qemu_mutex_unlock(&e->lock);
-    }
-    return error;
+    DgDesktopCall call = { .engine = e, .batch = batch, .errp = errp };
+    const DreamGpuDesktopOps ops = {
+        .opaque = &call, .capture = desktop_capture, .readback = desktop_readback,
+        .queue = desktop_queue, .retained = desktop_retained,
+        .failed = desktop_failed,
+    };
+    return dreamgpu_desktop_execute(&e->desktop, &ops, record,
+                                     batch->primary_width, batch->primary_height);
 }
 
 bool dg_gl_engine_transfer(DgGLEngine *e, DgGLTransfer *transfer)
@@ -1344,18 +974,12 @@ static uint32_t host_query(void *opaque, uint32_t ci, uint32_t fn,
     DgDispatch *d = opaque;
     DgBatch *batch = d->batch;
     uint32_t required = dg_gl_query_result_bytes(fn, args);
-    if (required > DG_GL_MAX_READBACK_BYTES) {
+    uint8_t *result = dreamgpu_submission_query(batch, &submission_memory, required);
+    if (!result) {
         return DG_GL_ERROR_LIMIT;
     }
-    if (required > sizeof(batch->result)) {
-        batch->bulk_result = g_try_malloc(required);
-        if (!batch->bulk_result) {
-            return DG_GL_ERROR_LIMIT;
-        }
-    }
     return dg_gl_query(d->engine->resources.contexts[ci].native, fn, args,
-                        batch->bulk_result ? batch->bulk_result : batch->result,
-                        &batch->result_bytes, &batch->result_type);
+                        result, required, &batch->result_bytes, &batch->result_type);
 }
 
 static uint32_t host_present(void *opaque, uint32_t ci, uint32_t di,
@@ -1391,13 +1015,26 @@ static void close_client(DgGLEngine *e, uint32_t client)
     dreamgpu_gl_close_client(&e->resources, &platform, client);
 }
 
-static uint32_t execute_record(DgGLEngine *e, const uint8_t *record,
-                                DgBatch *batch,
-                                const DreamGpuPlatform *platform)
+static uint32_t submission_cancelled(void *opaque)
 {
-    return dreamgpu_gl_execute(&e->resources, platform, record,
-                               word(record, DG_GL_OFF_SIZE),
-                               batch->primary_width, batch->primary_height);
+    DgGLEngine *e = ((DgDispatch *)opaque)->engine;
+    qemu_mutex_lock(&e->lock);
+    bool cancelled = e->work.reset || e->stopping;
+    qemu_mutex_unlock(&e->lock);
+    return cancelled;
+}
+
+static void submission_report(void *opaque, const uint8_t *record, uint32_t error)
+{
+    DgDispatch *d = opaque;
+    if (error) {
+        trace_rejection(record, word(record, DG_GL_OFF_SIZE),
+                          d->batch->sequence, true, error);
+    }
+    if (*d->errp) {
+        error_report_err(*d->errp);
+        *d->errp = NULL;
+    }
 }
 
 static void *render_worker(void *opaque)
@@ -1429,13 +1066,17 @@ static void *render_worker(void *opaque)
         DgBatch *batch;
         uint32_t result = 0;
 
-        while (!e->batch && !e->reset && !e->stopping) {
+        while (!e->work.pending && !e->work.reset && !e->stopping) {
             qemu_cond_wait(&e->cond, &e->lock);
         }
         if (e->stopping) {
             break;
         }
-        if (e->reset) {
+        if (e->work.reset) {
+            DreamGpuResetTicket ticket;
+            if (!dreamgpu_submission_reset_snapshot(&e->work, &ticket)) {
+                continue;
+            }
             qemu_mutex_unlock(&e->lock);
             drain_output(e);
             for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.drawables); i++) {
@@ -1446,9 +1087,9 @@ static void *render_worker(void *opaque)
             uint8_t reset_packet[DG_TRANSPORT_PACKET_BYTES];
             packet_init(reset_packet, DG_TRANSPORT_KIND_RESET);
             stq_le_p(reset_packet + DG_TRANSPORT_CPU_OFF_LEGACY_EPOCH,
-                     e->reset_cpu_epoch);
+                     ticket.epoch);
             stq_le_p(reset_packet + DG_TRANSPORT_CPU_OFF_LEGACY_FRAME,
-                     e->reset_cpu_generation);
+                     ticket.frame);
             if (!send_record(e, reset_packet, NULL, 0)) {
                 qemu_mutex_lock(&e->lock);
                 e->failed = true;
@@ -1456,20 +1097,17 @@ static void *render_worker(void *opaque)
             }
             close_client(e, 0);
             qemu_mutex_lock(&e->lock);
-            e->reset = false;
-            e->exclusive = false;
-            e->desktop_active = e->desktop_coherent = false;
-            memset(&e->last_present, 0, sizeof(e->last_present));
-            DgGLCompletion *reset_done = g_new0(DgGLCompletion, 1);
-            reset_done->generation = e->reset_generation;
-            reset_done->reset = true;
-            g_queue_push_tail(&e->completions, reset_done);
+            if (!dreamgpu_submission_reset_done(&e->work, &submission_memory,
+                                                  &ticket, &e->desktop,
+                                                  &e->last_present)) {
+                /* A newer reset arrived during native drain/send/close. */
+                continue;
+            }
             qemu_mutex_unlock(&e->lock);
             e->notify(e->opaque);
             qemu_mutex_lock(&e->lock);
         }
-        batch = e->batch;
-        e->batch = NULL;
+        batch = dreamgpu_submission_take(&e->work);
         if (!batch) {
             continue;
         }
@@ -1479,26 +1117,11 @@ static void *render_worker(void *opaque)
                                  g_get_monotonic_time() : 0;
         DgDispatch dispatch = { e, batch, &err };
         DreamGpuPlatform platform = host_platform(&dispatch);
-        for (size_t offset = 0; !result && offset < batch->bytes;) {
-            qemu_mutex_lock(&e->lock);
-            bool cancelled = e->reset || e->stopping;
-            qemu_mutex_unlock(&e->lock);
-            if (cancelled) {
-                result = DG_GL_ERROR_GENERATION;
-                break;
-            }
-            err = NULL;
-            result = execute_record(e, batch->data + offset, batch, &platform);
-            if (result) {
-                trace_rejection(batch->data + offset,
-                    word(batch->data + offset, DG_GL_OFF_SIZE),
-                    batch->sequence, true, result);
-            }
-            if (err) {
-                error_report_err(err);
-            }
-            offset += word(batch->data + offset, DG_GL_OFF_SIZE);
-        }
+        DreamGpuSubmissionRun run = {
+            &dispatch, submission_cancelled, submission_report,
+        };
+        result = dreamgpu_submission_run(batch, &e->resources, &platform,
+                                          &run, result);
         if (trace_start_us) {
             trace_dreamgpu_gl_work(batch->sequence, batch->records,
                                     batch->bytes,
@@ -1506,37 +1129,10 @@ static void *render_worker(void *opaque)
                                     g_get_monotonic_time() - trace_start_us,
                                     result);
         }
-        DgGLCompletion *done = g_new(DgGLCompletion, 1);
-        *done = (DgGLCompletion) { .sequence = batch->sequence,
-                                    .generation = batch->generation,
-                                    .error = result,
-                                    .resources_live = e->exclusive ||
-                                                      e->desktop_active,
-                                    .present = e->last_present };
-        if (!result) {
-            done->result_bytes = batch->result_bytes;
-            done->result_type = batch->result_type;
-            if (batch->bulk_result) {
-                done->bulk_result = batch->bulk_result;
-                batch->bulk_result = NULL;
-            } else {
-                memcpy(done->result, batch->result, batch->result_bytes);
-            }
-        }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.contexts); i++) {
-            done->resources_live |= e->resources.contexts[i].native != NULL;
-        }
-        for (unsigned i = 0; i < G_N_ELEMENTS(e->resources.drawables); i++) {
-            done->resources_live |= e->resources.drawables[i].native != NULL;
-        }
-        g_free(batch->bulk_result);
-        g_free(batch->data);
-        g_free(batch);
         qemu_mutex_lock(&e->lock);
-        if (g_queue_get_length(&e->completions) == 16) {
-            completion_free(g_queue_pop_head(&e->completions));
-        }
-        g_queue_push_tail(&e->completions, done);
+        dreamgpu_submission_complete(&e->work, &submission_memory, batch,
+                                       result, &e->resources, &e->desktop,
+                                       &e->last_present);
         qemu_mutex_unlock(&e->lock);
         e->notify(e->opaque);
         qemu_mutex_lock(&e->lock);
@@ -1554,11 +1150,9 @@ DgGLEngine *dg_gl_engine_new(const char *socket_path, DgGLNotify notify,
     qemu_mutex_init(&e->lock);
     qemu_mutex_init(&e->send_lock);
     qemu_cond_init(&e->cond);
-    g_queue_init(&e->completions);
-    g_queue_init(&e->pending_output);
     e->socket_path = g_strdup(socket_path);
     e->socket = -1;
-    e->reply_fd = -1;
+    e->reply.fd = -1;
     for (unsigned i = 0; i < G_N_ELEMENTS(e->cpu_slots); i++) {
         e->cpu_slots[i].fd = -1;
     }
@@ -1588,11 +1182,7 @@ void dg_gl_engine_free(DgGLEngine *e)
     }
     close_client(e, 0);
     dg_gl_platform_free(e->platform);
-    if (e->batch) {
-        g_free(e->batch->data);
-        g_free(e->batch);
-    }
-    g_queue_clear_full(&e->completions, completion_free);
+    dreamgpu_submission_free(&e->work, &submission_memory);
 #ifdef CONFIG_DARWIN
     if (e->remote) {
         mach_port_deallocate(mach_task_self(), e->remote);
@@ -1603,12 +1193,11 @@ void dg_gl_engine_free(DgGLEngine *e)
     }
     for (unsigned i = 0; i < G_N_ELEMENTS(e->cpu_slots); i++) {
         DgCpuSlot *s = &e->cpu_slots[i];
-        if (s->pixels) {
-            qemu_memfd_free(s->pixels, s->bytes, s->fd);
-        }
+        DreamGpuCpuMemory memory = { NULL, cpu_allocate, cpu_free };
+        dreamgpu_cpu_storage_free(s, &memory);
     }
-    if (e->reply_fd >= 0) {
-        close(e->reply_fd);
+    if (e->reply.fd >= 0) {
+        close(e->reply.fd);
     }
     g_free(e->socket_path);
     qemu_cond_destroy(&e->cond);
@@ -1622,54 +1211,37 @@ bool dg_gl_engine_submit(DgGLEngine *e, uint8_t *data, size_t bytes,
                            uint32_t primary_width, uint32_t primary_height,
                            uint32_t records)
 {
+    DreamGpuSubmissionRequest request = {
+        .data = data, .bytes = bytes, .sequence = sequence,
+        .generation = generation, .records = records,
+        .trace_queued_us = trace_event_get_state_backends(TRACE_DREAMGPU_GL_WORK) ?
+                           g_get_monotonic_time() : 0,
+        .primary_width = primary_width, .primary_height = primary_height,
+    };
     qemu_mutex_lock(&e->lock);
-    if (e->batch || e->stopping) {
-        qemu_mutex_unlock(&e->lock);
-        return false;
+    bool accepted = dreamgpu_submission_submit(&e->work, &submission_memory,
+                                                &request, e->stopping);
+    if (accepted) {
+        qemu_cond_broadcast(&e->cond);
     }
-    e->batch = g_new0(DgBatch, 1);
-    *e->batch = (DgBatch) { .data = data, .bytes = bytes,
-                            .sequence = sequence, .generation = generation,
-                            .records = records,
-                            .trace_queued_us =
-                                trace_event_get_state_backends(
-                                    TRACE_DREAMGPU_GL_WORK) ?
-                                    g_get_monotonic_time() : 0,
-                            .primary_width = primary_width,
-                            .primary_height = primary_height };
-    qemu_cond_broadcast(&e->cond);
     qemu_mutex_unlock(&e->lock);
-    return true;
+    return accepted;
 }
 
 void dg_gl_engine_reset(DgGLEngine *e, uint32_t generation,
                           uint64_t cpu_epoch, uint64_t cpu_generation)
 {
     qemu_mutex_lock(&e->lock);
-    e->reset = true;
-    e->reset_generation = generation;
-    e->reset_cpu_epoch = cpu_epoch;
-    e->reset_cpu_generation = cpu_generation;
-    if (e->batch) {
-        g_free(e->batch->data);
-        g_free(e->batch);
-        e->batch = NULL;
-    }
+    dreamgpu_submission_reset(&e->work, &submission_memory, generation,
+                                cpu_epoch, cpu_generation);
     qemu_cond_broadcast(&e->cond);
     qemu_mutex_unlock(&e->lock);
 }
 
 bool dg_gl_engine_completion(DgGLEngine *e, DgGLCompletion *completion)
 {
-    DgGLCompletion *done;
-
     qemu_mutex_lock(&e->lock);
-    done = g_queue_pop_head(&e->completions);
+    bool available = dreamgpu_submission_poll(&e->work, completion);
     qemu_mutex_unlock(&e->lock);
-    if (!done) {
-        return false;
-    }
-    *completion = *done;
-    g_free(done);
-    return true;
+    return available;
 }

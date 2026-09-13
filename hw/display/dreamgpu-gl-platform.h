@@ -5,7 +5,7 @@
 typedef struct DgGLPlatform DgGLPlatform;
 typedef struct DgGLContext DgGLContext;
 typedef struct DgGLDrawable DgGLDrawable;
-typedef struct DgGLImage DgGLImage;
+typedef struct DreamGpuNativeImage DgGLImage;
 
 DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp);
 void dg_gl_platform_free(DgGLPlatform *p);
@@ -28,7 +28,7 @@ uint32_t dg_gl_data_call(DgGLContext *c, uint32_t function,
                           const uint8_t *args, const uint8_t *data,
                           uint32_t bytes);
 uint32_t dg_gl_query(DgGLContext *c, uint32_t function, const uint8_t *args,
-                       uint8_t *result, uint32_t *bytes, uint32_t *type);
+                       uint8_t *result, uint32_t capacity, uint32_t *bytes, uint32_t *type);
 bool dg_gl_context_in_begin(DgGLContext *c);
 
 DgGLImage *dg_gl_image_new(DgGLPlatform *p, uint32_t width, uint32_t height,
