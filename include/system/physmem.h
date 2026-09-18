@@ -98,6 +98,9 @@ DirtyBitmapSnapshot *
 physical_memory_snapshot_and_clear_dirty(MemoryRegion *mr, hwaddr offset,
                                          hwaddr length, unsigned client);
 
+/* True only when the immutable snapshot contains no cleared dirty bits. */
+bool physical_memory_snapshot_is_clean(const DirtyBitmapSnapshot *snap);
+
 bool physical_memory_snapshot_get_dirty(DirtyBitmapSnapshot *snap,
                                         ram_addr_t start,
                                         ram_addr_t length);

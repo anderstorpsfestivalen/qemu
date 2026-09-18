@@ -4,6 +4,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
+#include "qemu/timer.h"
 #include "qemu/module.h"
 #include "qemu/bswap.h"
 #include "hw/pci/pci_device.h"
@@ -25,6 +26,8 @@
 #include "trace.h"
 #include "dreamgpu-diagnostics.h"
 #include "dreamgpu-host.h"
+#include "dreamgpu-timing.h"
+#include "dreamgpu-edid.h"
 
 #define TYPE_DREAMGPU "dreamgpu"
 OBJECT_DECLARE_SIMPLE_TYPE(DreamGpu, DREAMGPU)
@@ -38,7 +41,11 @@ struct DreamGpu {
     PCIDevice parent_obj;
     VGACommonState vga;
     MemoryRegion mmio, regs, vga_regs[4];
+    uint8_t edid[256];
     QEMUBH *work_bh;
+    QEMUTimer *timing_timer;
+    uint32_t timing_rate, timing_serial, timing_sequence, timing_completed, timing_status;
+    DgTimingSample timing_sample;
     uint32_t addr_lo, addr_hi, count, sequence;
     uint32_t status, completed, error, irq_enable, irq_status, generation;
     uint32_t active_count, active_sequence, command_index, row, column;
@@ -74,6 +81,95 @@ struct DreamGpu {
 
 static void dg_update_irq(DreamGpu *s) {
     pci_set_irq(&s->parent_obj, !!(s->irq_enable & s->irq_status));
+}
+
+static uint32_t dg_timing_height(DreamGpu *s) {
+    uint32_t height = s->vga.vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED
+                          ? s->vga.vbe_regs[VBE_DISPI_INDEX_YRES]
+                          : qemu_console_get_height(s->vga.con, 480);
+    return height && height <= 16384 ? height : 480;
+}
+
+static void dg_timing_finish(DreamGpu *s, uint32_t status) {
+    timer_del(s->timing_timer);
+    if (s->timing_status != DG_TIMING_PENDING) {
+        return;
+    }
+    s->timing_status = status;
+    s->timing_completed = s->timing_sequence;
+    s->irq_status |= DG_IRQ_DISPLAY_TIMING;
+    dg_update_irq(s);
+}
+
+static void dg_timing_expired(void *opaque) {
+    dg_timing_finish(opaque, DG_TIMING_DONE);
+}
+
+static uint32_t dg_timing_read(DreamGpu *s, uint32_t reg) {
+    switch (reg) {
+        case DG_TIMING_REG_VERSION:
+            return DG_TIMING_VERSION;
+        case DG_TIMING_REG_RATES:
+            return DG_TIMING_RATES;
+        case DG_TIMING_REG_RATE:
+            return s->timing_rate;
+        case DG_TIMING_REG_SNAPSHOT:
+            s->timing_sample = dg_timing_sample(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
+                                                s->timing_rate, dg_timing_height(s));
+            if (!++s->timing_serial)
+                ++s->timing_serial;
+            return s->timing_serial;
+        case DG_TIMING_REG_SERIAL:
+            return s->timing_serial;
+        case DG_TIMING_REG_SCANLINE:
+            return s->timing_sample.line;
+        case DG_TIMING_REG_HEIGHT:
+            return s->timing_sample.height;
+        case DG_TIMING_REG_PHASE:
+            return s->timing_sample.phase;
+        case DG_TIMING_REG_BEGIN_NS:
+            return s->timing_sample.begin_ns;
+        case DG_TIMING_REG_END_NS:
+            return s->timing_sample.end_ns;
+        case DG_TIMING_REG_SEQUENCE:
+            return s->timing_sequence;
+        case DG_TIMING_REG_COMPLETED:
+            return s->timing_completed;
+        case DG_TIMING_REG_STATUS:
+            return s->timing_status;
+        default:
+            return 0;
+    }
+}
+
+static void dg_timing_write(DreamGpu *s, uint32_t reg, uint32_t value) {
+    switch (reg) {
+        case DG_TIMING_REG_RATE:
+            if (dg_timing_rate_valid(value)) {
+                /* Mode commits also cancel a waiter when only dimensions changed. */
+                dg_timing_finish(s, DG_TIMING_CANCELLED);
+                s->timing_rate = value;
+            }
+            break;
+        case DG_TIMING_REG_SEQUENCE:
+            if (s->timing_status != DG_TIMING_PENDING)
+                s->timing_sequence = value;
+            break;
+        case DG_TIMING_REG_COMMAND:
+            if (value == DG_TIMING_CANCEL) {
+                dg_timing_finish(s, DG_TIMING_CANCELLED);
+            } else if ((value == DG_TIMING_WAIT_BEGIN || value == DG_TIMING_WAIT_END) &&
+                       s->timing_status != DG_TIMING_PENDING && s->timing_sequence) {
+                uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+                DgTimingSample sample = dg_timing_sample(now, s->timing_rate, dg_timing_height(s));
+                s->timing_status = DG_TIMING_PENDING;
+                s->irq_status &= ~DG_IRQ_DISPLAY_TIMING;
+                dg_update_irq(s);
+                timer_mod(s->timing_timer,
+                          now + (value == DG_TIMING_WAIT_BEGIN ? sample.begin_ns : sample.end_ns));
+            }
+            break;
+    }
 }
 
 static void dg_complete(DreamGpu *s, uint32_t error) {
@@ -304,17 +400,28 @@ static void dg_gl_transfer_work(DreamGpu *s) {
     if (t->generation != s->generation) {
         error = DG_GL_ERROR_GENERATION;
     }
+    if (t->primary_bpp != s->vga.vbe_regs[VBE_DISPI_INDEX_BPP]) {
+        error = DG_GL_ERROR_DESKTOP;
+    }
     while (!error && budget && s->gl_transfer_row < t->height) {
         uint32_t row = s->gl_transfer_row;
         uint32_t column = s->gl_transfer_column;
         uint32_t count = MIN(budget, t->width * 4 - column);
-        uint64_t offset = (uint64_t)t->offset + (uint64_t)row * t->vram_stride + column;
+        bool packed16 = t->primary_bpp == 16;
+        uint32_t primary_count = packed16 ? count / 2 : count;
+        uint64_t offset =
+            (uint64_t)t->offset + (uint64_t)row * t->vram_stride + (packed16 ? column / 2 : column);
         uint8_t *pixels = t->pixels + (size_t)row * t->stride + column;
-        if (offset + count > s->vga.vram_size) {
+        if (offset + primary_count > s->vga.vram_size) {
             error = DG_GL_ERROR_DESKTOP;
             break;
         }
-        if (t->writeback) {
+        if (packed16) {
+            dreamgpu_primary16_transfer(pixels, s->vga.vram_ptr + offset, count / 4, t->writeback);
+            if (t->writeback) {
+                memory_region_set_dirty(&s->vga.vram, offset, primary_count);
+            }
+        } else if (t->writeback) {
             memcpy(s->vga.vram_ptr + offset, pixels, count);
             memory_region_set_dirty(&s->vga.vram, offset, count);
         } else {
@@ -599,13 +706,16 @@ static void dg_transfer(void *opaque, uint32_t op, uint32_t bpp, uint64_t src, u
     } else if (op == DG_CMD_FILL) {
         if (bpp == 1) {
             memset(out, color, bytes);
+        } else if (bpp == 2) {
+            /* Constant strides let the compiler vectorize validated fills.
+             * Keep unaligned little-endian stores and the original work bound. */
+            for (uint32_t x = 0; x < bytes; x += 2) {
+                stw_le_p(out + x, color);
+            }
         } else {
-            for (uint32_t x = 0; x < bytes; x += bpp) {
-                if (bpp == 2) {
-                    stw_le_p(out + x, color);
-                } else {
-                    stl_le_p(out + x, color);
-                }
+            /* The immutable batch validator accepts only 1, 2 or 4-byte pixels. */
+            for (uint32_t x = 0; x < bytes; x += 4) {
+                stl_le_p(out + x, color);
             }
         }
     }
@@ -688,6 +798,10 @@ static void dg_submit(DreamGpu *s) {
 
 static void dg_engine_reset(DreamGpu *s) {
     qemu_bh_cancel(s->work_bh);
+    timer_del(s->timing_timer);
+    s->timing_rate = DG_TIMING_DEFAULT_HZ;
+    s->timing_status = DG_TIMING_IDLE;
+    s->timing_sequence = s->timing_completed = s->timing_serial = 0;
     s->trace_start_us = 0;
     s->addr_lo = s->addr_hi = s->count = s->sequence = 0;
     s->status = s->completed = s->error = 0;
@@ -722,6 +836,10 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
         s->diagnostics->reads[(addr + DG_REG_MAGIC) / 4]++;
     }
 
+    if (addr + DG_REG_MAGIC >= DG_TIMING_REG_VERSION &&
+        addr + DG_REG_MAGIC <= DG_TIMING_REG_STATUS) {
+        return dg_timing_read(s, addr + DG_REG_MAGIC);
+    }
     if (addr + DG_REG_MAGIC >= DG_CURSOR_REG_VERSION &&
         addr + DG_REG_MAGIC <= DG_CURSOR_REG_MAX_DIMENSION) {
         return dg_cursor_read(s, addr + DG_REG_MAGIC);
@@ -739,7 +857,7 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
             return DG_ABI_VERSION;
         case DG_REG_CAPS:
             return DG_CAP_FILL | DG_CAP_COPY | DG_CAP_DAMAGE | DG_CAP_COMPLETION_IRQ |
-                   DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR
+                   DG_CAP_INLINE_NO_IRQ | DG_CAP_CURSOR | DG_CAP_DISPLAY_TIMING
 #ifdef CONFIG_DREAMGPU_GL
                    | (s->gpu_socket && *s->gpu_socket
                           ? DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
@@ -784,6 +902,11 @@ static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size) {
         s->diagnostics->writes[(addr + DG_REG_MAGIC) / 4]++;
     }
 
+    if (addr + DG_REG_MAGIC >= DG_TIMING_REG_VERSION &&
+        addr + DG_REG_MAGIC <= DG_TIMING_REG_STATUS) {
+        dg_timing_write(s, addr + DG_REG_MAGIC, value);
+        return;
+    }
     if (addr + DG_REG_MAGIC >= DG_CURSOR_REG_VERSION &&
         addr + DG_REG_MAGIC <= DG_CURSOR_REG_MAX_DIMENSION) {
         dg_cursor_write(s, addr + DG_REG_MAGIC, value);
@@ -818,11 +941,13 @@ static void dg_write(void *opaque, hwaddr addr, uint64_t value, unsigned size) {
             }
             break;
         case DG_REG_IRQ_ENABLE:
-            s->irq_enable = value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION);
+            s->irq_enable =
+                value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION | DG_IRQ_DISPLAY_TIMING);
             dg_update_irq(s);
             break;
         case DG_REG_IRQ_STATUS:
-            s->irq_status &= ~(value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION));
+            s->irq_status &=
+                ~(value & (DG_IRQ_COMPLETION | DG_IRQ_GL_COMPLETION | DG_IRQ_DISPLAY_TIMING));
             dg_update_irq(s);
             break;
         case DG_REG_RESET:
@@ -849,6 +974,11 @@ static const MemoryRegionOps dg_ops = {
 static int dg_post_load(void *opaque, int version_id) {
     DreamGpu *s = opaque;
 
+    if (!dg_timing_rate_valid(s->timing_rate))
+        return -EINVAL;
+    /* An in-flight wait is cancelled on migration, never silently lost. */
+    if (s->timing_status == DG_TIMING_PENDING)
+        dg_timing_finish(s, DG_TIMING_CANCELLED);
     DreamGpuDeviceRestore restored = {
         .cursor =
             {
@@ -924,7 +1054,7 @@ static const VMStateDescription vmstate_dg_cursor = {
 
 static const VMStateDescription vmstate_dg = {
     .name = TYPE_DREAMGPU,
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 1,
     .pre_load = dg_pre_load,
     .post_load = dg_post_load,
@@ -942,6 +1072,10 @@ static const VMStateDescription vmstate_dg = {
             VMSTATE_UINT32(irq_enable, DreamGpu),
             VMSTATE_UINT32(irq_status, DreamGpu),
             VMSTATE_UINT32(generation, DreamGpu),
+            VMSTATE_UINT32_V(timing_rate, DreamGpu, 4),
+            VMSTATE_UINT32_V(timing_sequence, DreamGpu, 4),
+            VMSTATE_UINT32_V(timing_completed, DreamGpu, 4),
+            VMSTATE_UINT32_V(timing_status, DreamGpu, 4),
             VMSTATE_UINT32(active_count, DreamGpu),
             VMSTATE_UINT32(active_sequence, DreamGpu),
             VMSTATE_UINT32(command_index, DreamGpu),
@@ -991,6 +1125,10 @@ static void dg_reset(DeviceState *dev) {
 #endif
     dg_engine_reset(s);
     vga_common_reset(&s->vga);
+    timer_del(s->timing_timer);
+    s->timing_rate = DG_TIMING_DEFAULT_HZ;
+    s->timing_status = DG_TIMING_IDLE;
+    s->timing_sequence = s->timing_completed = s->timing_serial = 0;
 }
 
 static void dg_realize(PCIDevice *dev, Error **errp) {
@@ -1002,12 +1140,19 @@ static void dg_realize(PCIDevice *dev, Error **errp) {
     vga_init(&s->vga, OBJECT(dev), pci_address_space(dev), pci_address_space_io(dev), true);
     s->vga.con = qemu_graphic_console_create(DEVICE(dev), 0, s->vga.hw_ops, &s->vga);
     s->work_bh = qemu_bh_new(dg_work, s);
+    s->timing_rate = DG_TIMING_DEFAULT_HZ;
+    s->timing_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dg_timing_expired, s);
 #ifdef CONFIG_DREAMGPU_GL
     s->gl_bh = qemu_bh_new(dg_gl_completed_bh, s);
 #endif
     pci_register_bar(dev, DG_VRAM_BAR, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vga.vram);
     memory_region_init(&s->mmio, OBJECT(dev), "dreamgpu.mmio", DG_MMIO_SIZE);
     pci_std_vga_mmio_region_init(&s->vga, OBJECT(dev), &s->mmio, s->vga_regs, true, false);
+    /* The common helper's EDID option assumes PCIVGAState, not DreamGpu.
+     * Own this region explicitly; SeaVGABIOS reads DDC data from BAR2+0. */
+    dg_edid_generate(s->edid);
+    qemu_edid_region_io(&s->vga_regs[3], OBJECT(dev), s->edid, sizeof(s->edid));
+    memory_region_add_subregion(&s->mmio, 0, &s->vga_regs[3]);
     memory_region_init_io(&s->regs, OBJECT(dev), &dg_ops, s, "dreamgpu.commands", 0x1000);
     memory_region_add_subregion(&s->mmio, DG_REG_MAGIC, &s->regs);
     pci_register_bar(dev, DG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
@@ -1115,7 +1260,7 @@ static void dg_instance_init(Object *obj) {
 }
 
 static const Property dg_properties[] = {
-    DEFINE_PROP_UINT32("vgamem_mb", DreamGpu, vga.vram_size_mb, 16),
+    DEFINE_PROP_UINT32("vgamem_mb", DreamGpu, vga.vram_size_mb, 256),
     DEFINE_PROP_STRING("gpu-socket", DreamGpu, gpu_socket),
 };
 
@@ -1156,6 +1301,7 @@ static void dg_finalize(Object *obj) {
     if (s->work_bh) {
         qemu_bh_delete(s->work_bh);
     }
+    timer_free(s->timing_timer);
     g_free(s->diagnostics);
 }
 

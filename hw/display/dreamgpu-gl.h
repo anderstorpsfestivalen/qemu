@@ -11,7 +11,7 @@ typedef DreamGpuFrame DgGLFrameRef;
 
 typedef struct DgGLTransfer {
     uint8_t *pixels;
-    uint32_t width, height, stride, offset, vram_stride, generation;
+    uint32_t width, height, stride, offset, vram_stride, generation, primary_bpp;
     bool writeback, return_cpu;
 } DgGLTransfer;
 

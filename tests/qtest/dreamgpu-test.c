@@ -109,22 +109,27 @@ static void test_identity(Fixture *f, gconstpointer unused) {
 
 static void test_fill(Fixture *f, gconstpointer unused) {
     uint8_t cmd[DG_COMMAND_BYTES];
-    uint8_t actual[512], expected[512];
-    unsigned bpp, x, y;
+    uint8_t actual[4096], expected[4096];
+    const unsigned widths[] = {1, 7, 8, 15, 16, 31, 32, 63, 64, 65, 127, 128, 129};
+    unsigned bpp, n, x, y;
 
+    /* Exercise vector-sized fills, short tails and starts not aligned to a
+     * vector. Guard bytes include row padding and both ends of the allocation. */
     for (bpp = 1; bpp <= 4; bpp *= 2) {
-        memset(expected, 0x55, sizeof(expected));
-        qpci_memwrite(f->dev, f->vram, 0, expected, sizeof(expected));
-        make_cmd(cmd, DG_CMD_FILL, bpp, 0, 68, 64, 7, 3, 0x12345678);
-        submit(f, cmd, 1);
-        await_completion(f, 0);
-        for (y = 0; y < 3; y++) {
-            for (x = 0; x < 7 * bpp; x++) {
-                expected[68 + y * 64 + x] = 0x12345678 >> (8 * (x % bpp));
+        for (n = 0; n < ARRAY_SIZE(widths); n++) {
+            memset(expected, 0x55, sizeof(expected));
+            qpci_memwrite(f->dev, f->vram, 0, expected, sizeof(expected));
+            make_cmd(cmd, DG_CMD_FILL, bpp, 0, 68, 544, widths[n], 3, 0x12345678);
+            submit(f, cmd, 1);
+            await_completion(f, 0);
+            for (y = 0; y < 3; y++) {
+                for (x = 0; x < widths[n] * bpp; x++) {
+                    expected[68 + y * 544 + x] = 0x12345678 >> (8 * (x % bpp));
+                }
             }
+            qpci_memread(f->dev, f->vram, 0, actual, sizeof(actual));
+            g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
         }
-        qpci_memread(f->dev, f->vram, 0, actual, sizeof(actual));
-        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
     }
 }
 

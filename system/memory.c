@@ -2279,7 +2279,14 @@ DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
     assert(mr->ram_block);
     memory_region_sync_dirty_bitmap(mr, false);
     snapshot = physical_memory_snapshot_and_clear_dirty(mr, addr, size, client);
-    memory_global_after_dirty_log_sync();
+    /* TCG needs the vCPU rendezvous after rearming dirty write tracking,
+     * before reading the cleared pages. An empty snapshot rearmed no pages;
+     * waking every sleeping vCPU then has no corresponding write to fence.
+     * Inspect the captured bitmap, never concurrent new live dirty bits.
+     * Other accelerators retain their unconditional listener notification. */
+    if (!tcg_enabled() || !physical_memory_snapshot_is_clean(snapshot)) {
+        memory_global_after_dirty_log_sync();
+    }
     return snapshot;
 }
 

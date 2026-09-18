@@ -9,6 +9,7 @@
 #include "qemu/error-report.h"
 #include "qemu/sockets.h"
 #include "qemu/thread.h"
+#include "qemu/atomic.h"
 #include "qemu/cutils.h"
 #include "qemu/memfd.h"
 #include <sys/mman.h>
@@ -68,6 +69,9 @@ struct DgGLEngine {
     QemuCond cond;
     QemuThread render_thread, completion_thread, release_thread;
     bool stopping, failed, threads_started;
+    /* Atomic mirror used only by the per-record cancellation check. The lock
+     * still owns all reset/stop state transitions and resource lifetime. */
+    uint32_t cancel_requested;
     char *socket_path;
     int socket;
 #ifdef CONFIG_DARWIN
@@ -501,6 +505,13 @@ static void drop_drawable_resource(DgGLEngine *e, DgDrawable *d) {
 
 static void delete_drawable(DgGLEngine *e, DgDrawable *d) {
     unsigned index = d - e->resources.drawables;
+    /* Destroying a drawable invalidates uploads bound to its old identity. */
+    for (unsigned i = 0; i < DG_GL_MAX_CONTEXTS; ++i) {
+        DgContext *context = &e->resources.contexts[i];
+        if (context->native && context->client == d->client && context->drawable == d->id) {
+            dg_gl_pixel_image_abort(context->native);
+        }
+    }
 
     drain_output(e);
     qemu_mutex_lock(&e->lock);
@@ -531,6 +542,9 @@ static void delete_drawable(DgGLEngine *e, DgDrawable *d) {
 static void close_client(DgGLEngine *e, uint32_t client);
 
 static uint32_t present(DgGLEngine *e, DgContext *c, DgDrawable *d, uint32_t flags, Error **errp) {
+    uint32_t pending = dg_gl_pixel_image_guard(c->native);
+    if (pending)
+        return pending;
     unsigned first = (d - e->resources.drawables) * DG_GL_EXPORT_SLOTS;
     DgSlot *s = NULL;
     uint32_t stride, offset;
@@ -612,6 +626,7 @@ static uint32_t transfer_pixels(DgGLEngine *e, const uint8_t *r, uint8_t *pixels
         .height = word(r, DG_DESKTOP_HEIGHT),
         .offset = word(r, DG_DESKTOP_SLOT_OR_OFFSET),
         .vram_stride = word(r, DG_DESKTOP_VRAM_STRIDE),
+        .primary_bpp = word(r, DG_DESKTOP_PRIMARY_BPP) == 16 ? 16 : 32,
         .generation = batch->generation,
         .writeback = writeback,
         .return_cpu = return_cpu,
@@ -860,6 +875,7 @@ static void host_context_free(void *opaque, uint32_t index) {
     if (e->current_context == c && e->current_drawable && !dg_gl_context_in_begin(c->native)) {
         dg_gl_flush_drawable(e->current_drawable->native);
     }
+    dg_gl_pixel_image_abort(c->native);
     dg_gl_context_free(c->native);
     e->current_context = NULL;
 }
@@ -954,10 +970,7 @@ static void close_client(DgGLEngine *e, uint32_t client) {
 
 static uint32_t submission_cancelled(void *opaque) {
     DgGLEngine *e = ((DgDispatch *)opaque)->engine;
-    qemu_mutex_lock(&e->lock);
-    bool cancelled = e->work.reset || e->stopping;
-    qemu_mutex_unlock(&e->lock);
-    return cancelled;
+    return qatomic_read(&e->cancel_requested);
 }
 
 static void submission_report(void *opaque, const uint8_t *record, uint32_t error) {
@@ -969,6 +982,17 @@ static void submission_report(void *opaque, const uint8_t *record, uint32_t erro
         error_report_err(*d->errp);
         *d->errp = NULL;
     }
+}
+
+/* Called with e->lock held. A newer reset keeps cancellation asserted; stop
+ * can never be cleared by an older reset finishing its resource drain. */
+static bool submission_reset_complete(DgGLEngine *e, DreamGpuResetTicket *ticket) {
+    if (!dreamgpu_submission_reset_done(&e->work, &submission_memory, ticket, &e->desktop,
+                                        &e->last_present)) {
+        return false;
+    }
+    qatomic_set(&e->cancel_requested, e->stopping);
+    return true;
 }
 
 static void *render_worker(void *opaque) {
@@ -1028,8 +1052,7 @@ static void *render_worker(void *opaque) {
             }
             close_client(e, 0);
             qemu_mutex_lock(&e->lock);
-            if (!dreamgpu_submission_reset_done(&e->work, &submission_memory, &ticket, &e->desktop,
-                                                &e->last_present)) {
+            if (!submission_reset_complete(e, &ticket)) {
                 /* A newer reset arrived during native drain/send/close. */
                 continue;
             }
@@ -1093,6 +1116,7 @@ void dg_gl_engine_free(DgGLEngine *e) {
     }
     qemu_mutex_lock(&e->lock);
     e->stopping = true;
+    qatomic_set(&e->cancel_requested, 1);
     if (e->socket >= 0) {
         shutdown(e->socket, SHUT_RDWR);
     }
@@ -1155,6 +1179,7 @@ bool dg_gl_engine_submit(DgGLEngine *e, uint8_t *data, size_t bytes, uint32_t se
 void dg_gl_engine_reset(DgGLEngine *e, uint32_t generation, uint64_t cpu_epoch,
                         uint64_t cpu_generation) {
     qemu_mutex_lock(&e->lock);
+    qatomic_set(&e->cancel_requested, 1);
     dreamgpu_submission_reset(&e->work, &submission_memory, generation, cpu_epoch, cpu_generation);
     qemu_cond_broadcast(&e->cond);
     qemu_mutex_unlock(&e->lock);

@@ -17,6 +17,7 @@
 #include "qapi/error.h"
 #include "ui/console.h"
 #include "ui/dreamgpu-shmem.h"
+#include "dreamgpu-refresh.h"
 #include "ui/surface.h"
 #include "ui/input.h"
 #include "qemu/bswap.h"
@@ -28,18 +29,6 @@
 #include <sys/un.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
-#endif
-
-#ifdef __APPLE__
-#include <CoreVideo/CoreVideo.h>
-#include <CoreGraphics/CoreGraphics.h>
-#endif
-
-#ifdef __linux__
-#include <xf86drm.h>
-#include <xf86drmMode.h>
-#include <fcntl.h>
-#include <dirent.h>
 #endif
 
 /* Input event types - must match Rust side */
@@ -55,6 +44,8 @@
  * independently importable, page-aligned storage for no-copy GPU sampling. */
 #define DREAMGPU_INPUT_RESET 5
 #define DREAMGPU_INPUT_REFRESH 6
+#define DREAMGPU_HOST_REFRESH 7
+#define DREAMGPU_INPUT_MOUSE_CAPTURE 8
 #define DREAMGPU_CURSOR_MAX_SIZE 64
 #define DREAMGPU_CURSOR_MAX_PIXELS (DREAMGPU_CURSOR_MAX_SIZE * DREAMGPU_CURSOR_MAX_SIZE)
 #define DREAMGPU_SHMEM_MAGIC 0x454B554A
@@ -130,7 +121,7 @@ typedef struct DreamGpuShmemState {
     bool cursor_position_dirty;
     uint64_t cursor_epoch, cursor_generation, cursor_position_sequence;
     DreamGpuNativeCursor native_cursor;
-    int normal_refresh_ms;
+    DreamGpuRefresh refresh_clock;
     uint64_t input_refresh_until_us;
 } DreamGpuShmemState;
 
@@ -162,6 +153,28 @@ static uint64_t dreamgpu_now_us(void) {
     return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 }
 
+static void dreamgpu_shmem_release_buttons(DreamGpuShmemState *s, bool all) {
+    for (int i = 0; i < INPUT_BUTTON__MAX; i++) {
+        if (s->held_buttons[i] || all) {
+            qemu_input_queue_btn(s->dcl.con, i, false);
+            s->held_buttons[i] = false;
+        }
+    }
+    qemu_input_event_sync();
+}
+
+static void dreamgpu_shmem_pointer_mode(DreamGpuShmemState *s, bool absolute) {
+    if (qemu_input_is_absolute(s->dcl.con) == absolute) {
+        return;
+    }
+    /* A press belongs to the old device. Release it before selecting another
+     * pointer, including when capture changes before the first motion event. */
+    dreamgpu_shmem_release_buttons(s, false);
+    if (qemu_input_select_pointer(s->dcl.con, absolute)) {
+        s->mouse_initialized = false;
+    }
+}
+
 static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all) {
     for (int i = 0; i < 256; i++) {
         if (s->held_keys[i] || (all && qemu_input_key_number_to_linux(i))) {
@@ -169,10 +182,13 @@ static void dreamgpu_shmem_release_input(DreamGpuShmemState *s, bool all) {
             s->held_keys[i] = false;
         }
     }
-    for (int i = 0; i < INPUT_BUTTON__MAX; i++) {
-        if (s->held_buttons[i] || all) {
-            qemu_input_queue_btn(NULL, i, false);
-            s->held_buttons[i] = false;
+    dreamgpu_shmem_release_buttons(s, all);
+    if (all) {
+        /* Snapshot state may contain presses on either installed pointer. */
+        bool absolute = qemu_input_is_absolute(s->dcl.con);
+        if (qemu_input_select_pointer(s->dcl.con, !absolute)) {
+            dreamgpu_shmem_release_buttons(s, true);
+            qemu_input_select_pointer(s->dcl.con, absolute);
         }
     }
     qemu_input_event_sync();
@@ -189,6 +205,7 @@ static void dreamgpu_shmem_disconnect(DreamGpuShmemState *s) {
     s->input_used = 0;
     s->deferred_ack.kind = 0;
     dreamgpu_shmem_release_input(s, false);
+    dreamgpu_shmem_pointer_mode(s, true);
 }
 
 static void dreamgpu_shmem_notify(DreamGpuShmemState *s, uint8_t kind, uint64_t id,
@@ -458,7 +475,22 @@ static void dreamgpu_shmem_publish(DreamGpuShmemState *s) {
 }
 
 static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEvent *ev) {
-    bool guest_wants_abs = qemu_input_is_absolute(s->dcl.con);
+    if (ev->type == DREAMGPU_HOST_REFRESH) {
+        if (ev->x >= 10000 && ev->x <= 500000) {
+            uint64_t now_us = dreamgpu_now_us();
+            dreamgpu_refresh_set(&s->refresh_clock, ev->x, now_us);
+            if (!s->input_refresh_until_us) {
+                qemu_console_listener_set_refresh(
+                    &s->dcl, dreamgpu_refresh_delay(&s->refresh_clock, now_us));
+            }
+        }
+        return;
+    }
+    if (ev->type == DREAMGPU_INPUT_MOUSE_CAPTURE) {
+        dreamgpu_shmem_pointer_mode(s, !ev->pressed);
+        dreamgpu_shmem_notify(s, 'A', ev->id, dreamgpu_now_us());
+        return;
+    }
     if (ev->type == DREAMGPU_INPUT_RESET || ev->type == DREAMGPU_INPUT_REFRESH) {
         if (ev->type == DREAMGPU_INPUT_RESET) {
             /* Include untracked guest keys restored by a VM snapshot. */
@@ -472,6 +504,13 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
     if (!s->shmem) {
         return;
     }
+    /* Motion also selects the route for consumers predating explicit capture.
+     * Relative motion must never enter the tablet accumulator: a guest game's
+     * SetCursorPos recenter does not update host tablet coordinates. */
+    if (ev->type == DREAMGPU_INPUT_MOUSE_REL || ev->type == DREAMGPU_INPUT_MOUSE_ABS) {
+        dreamgpu_shmem_pointer_mode(s, ev->type == DREAMGPU_INPUT_MOUSE_ABS);
+    }
+    bool guest_wants_abs = qemu_input_is_absolute(s->dcl.con);
     if (ev->type == DREAMGPU_INPUT_KEY) {
         if (ev->x < 0 || ev->x >= 256) {
             return;
@@ -486,28 +525,9 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
     }
     switch (ev->type) {
         case DREAMGPU_INPUT_MOUSE_REL:
-            /* Mark mouse as initialized on first movement - this prevents
-             * gfx_switch from resetting position to center */
-            s->mouse_initialized = true;
-
-            if (guest_wants_abs) {
-                /* Convert relative to absolute */
-                s->mouse_x += ev->x;
-                s->mouse_y += ev->y;
-                if (s->mouse_x < 0)
-                    s->mouse_x = 0;
-                if (s->mouse_y < 0)
-                    s->mouse_y = 0;
-                if (s->mouse_x >= (int32_t)s->shmem->width)
-                    s->mouse_x = s->shmem->width - 1;
-                if (s->mouse_y >= (int32_t)s->shmem->height)
-                    s->mouse_y = s->shmem->height - 1;
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_X, s->mouse_x, 0, s->shmem->width);
-                qemu_input_queue_abs(s->dcl.con, INPUT_AXIS_Y, s->mouse_y, 0, s->shmem->height);
-            } else {
-                qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, ev->x);
-                qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, ev->y);
-            }
+            s->mouse_initialized = false;
+            qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_X, ev->x);
+            qemu_input_queue_rel(s->dcl.con, INPUT_AXIS_Y, ev->y);
             break;
 
         case DREAMGPU_INPUT_MOUSE_ABS:
@@ -544,8 +564,7 @@ static void dreamgpu_shmem_process_event(DreamGpuShmemState *s, DreamGpuInputEve
             break;
 
         case DREAMGPU_INPUT_MOUSE_BTN:
-            /* Use NULL source like input-linux.c for PS/2 compatibility */
-            qemu_input_queue_btn(NULL, ev->button, ev->pressed);
+            qemu_input_queue_btn(s->dcl.con, ev->button, ev->pressed);
             break;
 
         case DREAMGPU_INPUT_KEY:
@@ -706,9 +725,13 @@ static void dreamgpu_shmem_gfx_switch(DisplayChangeListener *dcl, DisplaySurface
 static void dreamgpu_shmem_refresh(DisplayChangeListener *dcl) {
     DreamGpuShmemState *s = container_of(dcl, DreamGpuShmemState, dcl);
 
-    if (s->input_refresh_until_us && dreamgpu_now_us() >= s->input_refresh_until_us) {
+    uint64_t now_us = dreamgpu_now_us();
+    if (s->input_refresh_until_us && now_us >= s->input_refresh_until_us) {
         s->input_refresh_until_us = 0;
-        qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
+    }
+    if (!s->input_refresh_until_us) {
+        qemu_console_listener_set_refresh(&s->dcl,
+                                          dreamgpu_refresh_delay(&s->refresh_clock, now_us));
     }
 
     /* Try to (re)connect if not connected */
@@ -852,89 +875,13 @@ static int dreamgpu_shmem_connect(DreamGpuShmemState *s) {
     return 0;
 }
 
-/*
- * Set up display refresh rate to match monitor (like Cocoa does)
- * This is critical for performance - default is 30ms which limits us to 33fps
- *
- * macOS: Use CVDisplayLink to detect actual monitor refresh rate
- * Linux: Use libdrm to query the active display mode refresh rate
- */
+/* The consumer supplies its actual window monitor rate over the input socket.
+ * Until it connects, use120Hz. No global main-display query or integer-period
+ * truncation, and no effect on native GPU submissions or guest mode timing. */
 static void dreamgpu_shmem_setup_refresh(DreamGpuShmemState *s) {
-    int interval_ms = 0;
-
-#ifdef __APPLE__
-    /* Get display refresh rate using CVDisplayLink like Cocoa does */
-    CGDirectDisplayID display = CGMainDisplayID();
-    CVDisplayLinkRef displayLink;
-    if (CVDisplayLinkCreateWithCGDisplay(display, &displayLink) == kCVReturnSuccess) {
-        CVTime period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(displayLink);
-        CVDisplayLinkRelease(displayLink);
-        if (!(period.flags & kCVTimeIsIndefinite) && period.timeScale > 0) {
-            interval_ms = (int)(1000 * period.timeValue / period.timeScale);
-        }
-    }
-#endif
-
-#ifdef __linux__
-    /* Get display refresh rate using libdrm */
-    DIR *dir = opendir("/dev/dri");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            if (strncmp(entry->d_name, "card", 4) != 0) {
-                continue;
-            }
-            char path[256];
-            snprintf(path, sizeof(path), "/dev/dri/%s", entry->d_name);
-
-            int fd = open(path, O_RDONLY);
-            if (fd < 0) {
-                continue;
-            }
-
-            drmModeRes *res = drmModeGetResources(fd);
-            if (res) {
-                /* Find active CRTC with highest refresh rate */
-                for (int i = 0; i < res->count_crtcs; i++) {
-                    drmModeCrtc *crtc = drmModeGetCrtc(fd, res->crtcs[i]);
-                    if (crtc && crtc->mode_valid) {
-                        /* Calculate refresh rate from mode timing */
-                        uint32_t htotal = crtc->mode.htotal;
-                        uint32_t vtotal = crtc->mode.vtotal;
-                        uint32_t clock = crtc->mode.clock; /* in kHz */
-                        if (htotal > 0 && vtotal > 0 && clock > 0) {
-                            int refresh_hz = (clock * 1000) / (htotal * vtotal);
-                            int this_interval = 1000 / refresh_hz;
-                            if (this_interval > 0 &&
-                                (interval_ms == 0 || this_interval < interval_ms)) {
-                                interval_ms = this_interval;
-                            }
-                        }
-                        drmModeFreeCrtc(crtc);
-                    }
-                }
-                drmModeFreeResources(res);
-            }
-            close(fd);
-
-            if (interval_ms > 0) {
-                break; /* Found a valid refresh rate */
-            }
-        }
-        closedir(dir);
-    }
-#endif
-
-    if (interval_ms > 0 && interval_ms < 100) {
-        error_report("dreamgpu-shmem: using monitor refresh rate: %dms (~%dHz)", interval_ms,
-                     1000 / interval_ms);
-        s->normal_refresh_ms = interval_ms;
-    } else {
-        /* Fallback: 8ms (~120Hz) - fast enough for any common display */
-        error_report("dreamgpu-shmem: using fallback refresh rate: 8ms (~120Hz)");
-        s->normal_refresh_ms = 8;
-    }
-    qemu_console_listener_set_refresh(&s->dcl, s->normal_refresh_ms);
+    uint64_t now_us = dreamgpu_now_us();
+    dreamgpu_refresh_set(&s->refresh_clock, 120000, now_us);
+    qemu_console_listener_set_refresh(&s->dcl, dreamgpu_refresh_delay(&s->refresh_clock, now_us));
 }
 
 static void dreamgpu_shmem_init(DisplayState *ds, DisplayOptions *opts) {

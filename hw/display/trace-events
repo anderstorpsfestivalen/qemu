@@ -239,3 +239,9 @@ dreamgpu_gl_complete(uint32_t sequence, uint32_t error, uint64_t elapsed_us) "se
 
 # Failed GL records only; numeric headers are bounded and contain no guest payload.
 dreamgpu_gl_reject(uint32_t sequence, bool execution, uint32_t op, uint32_t function, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t error, const char *tail) "seq=%u execution=%d op=%u fn=%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x error=%u %s"
+
+# Opt-in geometry diagnostics; numeric state only, no texture or guest memory dumps.
+dreamgpu_gl_geometry_call(uint64_t context, uint32_t function, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) "context=%"PRIu64" fn=%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x"
+dreamgpu_gl_geometry_export(uint64_t context, uint32_t width, uint32_t height, uint32_t image_width, uint32_t image_height, uint32_t framebuffer, bool exchange) "context=%"PRIu64" drawable=%ux%u image=%ux%u framebuffer=%u exchange=%d"
+dreamgpu_gl_geometry_state(uint64_t context, uint32_t pname, int32_t x, int32_t y, int32_t width, int32_t height) "context=%"PRIu64" pname=0x%x rect=%d,%d,%d,%d"
+dreamgpu_gl_geometry_texture(uint64_t context, uint32_t texture, uint32_t level, uint32_t width, uint32_t height) "context=%"PRIu64" texture=%u level=%u size=%ux%u"

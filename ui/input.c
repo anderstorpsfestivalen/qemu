@@ -475,6 +475,20 @@ bool qemu_input_is_absolute(const QemuConsole *con)
     return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_ABS);
 }
 
+bool qemu_input_select_pointer(QemuConsole *con, bool absolute)
+{
+    QemuInputHandlerState *s = qemu_input_find_handler(
+        absolute ? INPUT_EVENT_MASK_ABS : INPUT_EVENT_MASK_REL, con);
+
+    if (!s || !(s->handler->mask & INPUT_EVENT_MASK_BTN)) {
+        return false;
+    }
+    if (qemu_input_find_handler(INPUT_EVENT_MASK_BTN, con) != s) {
+        qemu_input_handler_activate(s);
+    }
+    return qemu_input_find_handler(INPUT_EVENT_MASK_BTN, con) == s;
+}
+
 uint32_t qemu_input_get_leds_mask(const QemuConsole *con)
 {
     QemuInputHandlerState *s;

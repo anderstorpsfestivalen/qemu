@@ -28,6 +28,8 @@
 #include "fpu/softfloat-macros.h"
 #include "helper-tcg.h"
 #include "access.h"
+#include "fpu-pc24.h"
+#include "fpu-single.h"
 
 /* float macros */
 #define FT0    (env->ft0)
@@ -221,7 +223,7 @@ static void merge_exception_flags(CPUX86State *env, int old_flags)
 static inline floatx80 helper_fdiv(CPUX86State *env, floatx80 a, floatx80 b)
 {
     int old_flags = save_exception_flags(env);
-    floatx80 ret = floatx80_div(a, b, &env->fp_status);
+    floatx80 ret = fpu_pc24_binary(a, b, &env->fp_status, FPU_PC24_DIV);
     merge_exception_flags(env, old_flags);
     return ret;
 }
@@ -247,7 +249,7 @@ void helper_flds_FT0(CPUX86State *env, uint32_t val)
     } u;
 
     u.i = val;
-    FT0 = float32_to_floatx80(u.f, &env->fp_status);
+    FT0 = fpu_load_single(u.f, &env->fp_status);
     merge_exception_flags(env, old_flags);
 }
 
@@ -280,7 +282,7 @@ void helper_flds_ST0(CPUX86State *env, uint32_t val)
 
     new_fpstt = (env->fpstt - 1) & 7;
     u.i = val;
-    env->fpregs[new_fpstt].d = float32_to_floatx80(u.f, &env->fp_status);
+    env->fpregs[new_fpstt].d = fpu_load_single(u.f, &env->fp_status);
     env->fpstt = new_fpstt;
     env->fptags[new_fpstt] = 0; /* validate stack entry */
     merge_exception_flags(env, old_flags);
@@ -344,7 +346,7 @@ uint32_t helper_fsts_ST0(CPUX86State *env)
         uint32_t i;
     } u;
 
-    u.f = floatx80_to_float32(ST0, &env->fp_status);
+    u.f = fpu_store_single(ST0, &env->fp_status);
     merge_exception_flags(env, old_flags);
     return u.i;
 }
@@ -530,7 +532,7 @@ void helper_fcom_ST0_FT0(CPUX86State *env)
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
-    ret = floatx80_compare(ST0, FT0, &env->fp_status);
+    ret = fpu_exact_compare(ST0, FT0, &env->fp_status, false);
     env->fpus = (env->fpus & ~0x4500) | fcom_ccval[ret + 1];
     merge_exception_flags(env, old_flags);
 }
@@ -540,7 +542,7 @@ void helper_fucom_ST0_FT0(CPUX86State *env)
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
-    ret = floatx80_compare_quiet(ST0, FT0, &env->fp_status);
+    ret = fpu_exact_compare(ST0, FT0, &env->fp_status, true);
     env->fpus = (env->fpus & ~0x4500) | fcom_ccval[ret + 1];
     merge_exception_flags(env, old_flags);
 }
@@ -552,7 +554,7 @@ void helper_fcomi_ST0_FT0(CPUX86State *env)
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
-    ret = floatx80_compare(ST0, FT0, &env->fp_status);
+    ret = fpu_exact_compare(ST0, FT0, &env->fp_status, false);
     /* OF, SF, and AF are unconditionally cleared to 0 */
     CC_SRC = fcomi_ccval[ret + 1];
     CC_OP = CC_OP_EFLAGS;
@@ -564,7 +566,7 @@ void helper_fucomi_ST0_FT0(CPUX86State *env)
     int old_flags = save_exception_flags(env);
     FloatRelation ret;
 
-    ret = floatx80_compare_quiet(ST0, FT0, &env->fp_status);
+    ret = fpu_exact_compare(ST0, FT0, &env->fp_status, true);
     /* OF, SF, and AF are unconditionally cleared to 0 */
     CC_SRC = fcomi_ccval[ret + 1];
     CC_OP = CC_OP_EFLAGS;
@@ -574,28 +576,28 @@ void helper_fucomi_ST0_FT0(CPUX86State *env)
 void helper_fadd_ST0_FT0(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
-    ST0 = floatx80_add(ST0, FT0, &env->fp_status);
+    ST0 = fpu_pc24_binary(ST0, FT0, &env->fp_status, FPU_PC24_ADD);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fmul_ST0_FT0(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
-    ST0 = floatx80_mul(ST0, FT0, &env->fp_status);
+    ST0 = fpu_pc24_binary(ST0, FT0, &env->fp_status, FPU_PC24_MUL);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fsub_ST0_FT0(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
-    ST0 = floatx80_sub(ST0, FT0, &env->fp_status);
+    ST0 = fpu_pc24_binary(ST0, FT0, &env->fp_status, FPU_PC24_SUB);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fsubr_ST0_FT0(CPUX86State *env)
 {
     int old_flags = save_exception_flags(env);
-    ST0 = floatx80_sub(FT0, ST0, &env->fp_status);
+    ST0 = fpu_pc24_binary(FT0, ST0, &env->fp_status, FPU_PC24_SUB);
     merge_exception_flags(env, old_flags);
 }
 
@@ -614,28 +616,28 @@ void helper_fdivr_ST0_FT0(CPUX86State *env)
 void helper_fadd_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
-    ST(st_index) = floatx80_add(ST(st_index), ST0, &env->fp_status);
+    ST(st_index) = fpu_pc24_binary(ST(st_index), ST0, &env->fp_status, FPU_PC24_ADD);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fmul_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
-    ST(st_index) = floatx80_mul(ST(st_index), ST0, &env->fp_status);
+    ST(st_index) = fpu_pc24_binary(ST(st_index), ST0, &env->fp_status, FPU_PC24_MUL);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fsub_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
-    ST(st_index) = floatx80_sub(ST(st_index), ST0, &env->fp_status);
+    ST(st_index) = fpu_pc24_binary(ST(st_index), ST0, &env->fp_status, FPU_PC24_SUB);
     merge_exception_flags(env, old_flags);
 }
 
 void helper_fsubr_STN_ST0(CPUX86State *env, int st_index)
 {
     int old_flags = save_exception_flags(env);
-    ST(st_index) = floatx80_sub(ST0, ST(st_index), &env->fp_status);
+    ST(st_index) = fpu_pc24_binary(ST0, ST(st_index), &env->fp_status, FPU_PC24_SUB);
     merge_exception_flags(env, old_flags);
 }
 

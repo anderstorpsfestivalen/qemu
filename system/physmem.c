@@ -1133,6 +1133,13 @@ static void physical_memory_clear_dirty_range(ram_addr_t addr, ram_addr_t length
     physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_CODE, NULL);
 }
 
+bool physical_memory_snapshot_is_clean(const DirtyBitmapSnapshot *snap)
+{
+    unsigned long pages = (snap->end - snap->start) >> TARGET_PAGE_BITS;
+
+    return !pages || bitmap_empty(snap->dirty, pages);
+}
+
 DirtyBitmapSnapshot *physical_memory_snapshot_and_clear_dirty
     (MemoryRegion *mr, hwaddr offset, hwaddr length, unsigned client)
 {
@@ -1180,7 +1187,13 @@ DirtyBitmapSnapshot *physical_memory_snapshot_and_clear_dirty
         }
     }
 
-    physical_memory_dirty_bits_cleared(start, length);
+    /* Only pages whose dirty bits were cleared need their TLB write tracking
+     * rearmed. Inspect the private snapshot, not the live bitmap: a concurrent
+     * writer after the atomic exchange must retain its new dirty bit. Keep the
+     * MemoryRegion/hardware dirty-log callback below unconditional. */
+    if (!physical_memory_snapshot_is_clean(snap)) {
+        physical_memory_dirty_bits_cleared(start, length);
+    }
 
     memory_region_clear_dirty_bitmap(mr, offset, length);
 

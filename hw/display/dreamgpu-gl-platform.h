@@ -19,6 +19,8 @@ void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d);
 bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp);
 uint32_t dg_gl_function_words(uint32_t function);
 uint32_t dg_gl_call_validate(uint32_t function, const uint8_t *args);
+uint32_t dg_gl_pixel_image_guard(DgGLContext *context);
+void dg_gl_pixel_image_abort(DgGLContext *context);
 uint32_t dg_gl_call(DgGLContext *c, uint32_t function, const uint8_t *args);
 uint32_t dg_gl_data_validate(uint32_t function, const uint8_t *args, const uint8_t *data,
                              uint32_t bytes);

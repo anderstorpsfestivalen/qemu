@@ -9,6 +9,7 @@
 #include "standard-headers/dreamgpu/gl.h"
 #include "standard-headers/dreamgpu/transport.h"
 #include "dreamgpu-gl-platform.h"
+#include "trace.h"
 
 #ifdef CONFIG_DARWIN
 #define GL_SILENCE_DEPRECATION
@@ -58,6 +59,7 @@ struct DgGLPlatform {
     DreamGpuGlApi gl_api;
     uint64_t next_context_serial;
     uint64_t texture_bytes;
+    uint64_t pixel_image_bytes;
     uint32_t texture_count;
     /* One bounded CPU cache for genuine texture reads, never presentation. */
     DreamGpuReadCache read_cache;
@@ -406,6 +408,10 @@ void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d) {
 }
 
 bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp) {
+    if (c->drawable != d && dg_gl_pixel_image_guard(c)) {
+        error_setg(errp, "Cannot change drawable during an image upload");
+        return false;
+    }
 #ifdef CONFIG_DARWIN
     CGLError err = CGLSetCurrentContext(c->render);
     if (err != kCGLNoError) {
@@ -453,6 +459,7 @@ static DreamGpuTextureMemory texture_memory(DgGLPlatform *p) {
     return (DreamGpuTextureMemory){
         .api = &p->gl_api,
         .bytes = &p->texture_bytes,
+        .image_bytes = &p->pixel_image_bytes,
         .count = &p->texture_count,
         .opaque = p,
         .allocate = host_texture_allocate,
@@ -466,14 +473,20 @@ static DgTexture *bound_texture(DgGLContext *c, GLenum target) {
 }
 
 static uint32_t copy_texture(DgGLContext *c, uint32_t fn, const uint8_t *args) {
-    return dreamgpu_texture_copy(&c->platform->gl_api, c->state.bound_texture,
+    return dreamgpu_texture_copy(&c->platform->gl_api, bound_texture(c, ldl_le_p(args)),
                                  &c->platform->texture_bytes, &c->state.guest_errors, c->serial,
                                  c->drawable != NULL, fn, args);
 }
 
-uint32_t dg_gl_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args, const uint8_t *data,
-                         uint32_t bytes) {
+static uint32_t raw_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args, const uint8_t *data,
+                              uint32_t bytes) {
     DreamGpuTextureMemory memory = texture_memory(c->platform);
+    if (trace_event_get_state_backends(TRACE_DREAMGPU_GL_GEOMETRY_TEXTURE) &&
+        fn == FEnum_glTexImage2D) {
+        trace_dreamgpu_gl_geometry_texture(c->serial, c->state.bound_texture->guest_name,
+                                           ldl_le_p(args + 4), ldl_le_p(args + 12),
+                                           ldl_le_p(args + 16));
+    }
     return dreamgpu_gl_data(&memory, &c->state, c->in_begin, c->serial, fn, args, data, bytes);
 }
 
@@ -492,6 +505,10 @@ static uint32_t host_texture_read(void *opaque, uint32_t target, uint32_t level,
 
 uint32_t dg_gl_query(DgGLContext *c, uint32_t fn, const uint8_t *args, uint8_t *result,
                      uint32_t capacity, uint32_t *bytes, uint32_t *type) {
+    uint32_t pending = dg_gl_pixel_image_guard(c);
+    if (pending)
+        return pending;
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
     /* Stack snapshot is disjoint from callback-owned context/cache storage. */
     const DreamGpuQueryState state = {
         .in_begin = c->in_begin,
@@ -504,12 +521,31 @@ uint32_t dg_gl_query(DgGLContext *c, uint32_t fn, const uint8_t *args, uint8_t *
         .binding_2d = c->state.bound_texture->guest_name,
         .attrib_depth = c->state.attrib_depth,
         .textures = c->state.textures,
+        .capture = &c->state.capture,
+        .memory = &memory,
+        .context = &c->state,
     };
     return dreamgpu_gl_query(&c->platform->gl_api, &state, &c->state.guest_errors, fn, args, result,
                              capacity, host_texture_read, c, bytes, type);
 }
 
 /* Remaining resource-side operations; scalar GL execution is Rust-owned. */
+uint32_t dg_gl_pixel_image_guard(DgGLContext *c) {
+    if (!c->state.image.active) {
+        return 0;
+    }
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    return dreamgpu_pixel_image_interleave(&memory, &c->state.image);
+}
+
+void dg_gl_pixel_image_abort(DgGLContext *c) {
+    if (!c->state.image.active) {
+        return;
+    }
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    dreamgpu_pixel_image_release(&memory, &c->state.image);
+}
+
 static uint32_t host_copy_texture(void *opaque, uint32_t fn, const uint8_t *args) {
     return copy_texture(opaque, fn, args);
 }
@@ -521,13 +557,49 @@ static uint32_t scalar_resource(void *opaque, uint32_t fn, const uint8_t *args) 
                                      dg_gl_function_words(fn) * 4, host_copy_texture, c);
 }
 
-uint32_t dg_gl_call(DgGLContext *c, uint32_t fn, const uint8_t *args) {
+static uint32_t raw_call(DgGLContext *c, uint32_t fn, const uint8_t *args) {
+    if (fn != FEnum_glFlush && fn != FEnum_glFinish) {
+        uint32_t pending = dg_gl_pixel_image_guard(c);
+        if (pending)
+            return pending;
+    }
     uint32_t words = dg_gl_function_words(fn);
     if (words > 32) {
         return DG_GL_ERROR_UNSUPPORTED;
     }
+    if (trace_event_get_state_backends(TRACE_DREAMGPU_GL_GEOMETRY_CALL) &&
+        (fn == FEnum_glViewport || fn == FEnum_glScissor || fn == FEnum_glVertex3f ||
+         fn == FEnum_glVertex4f || fn == FEnum_glTexCoord2f || fn == FEnum_glTexCoord4f ||
+         fn == FEnum_glBegin || fn == FEnum_glEnd || fn == FEnum_glBindTexture ||
+         fn == FEnum_glDrawBuffer || fn == FEnum_glReadBuffer)) {
+        trace_dreamgpu_gl_geometry_call(
+            c->serial, fn, words > 0 ? ldl_le_p(args) : 0, words > 1 ? ldl_le_p(args + 4) : 0,
+            words > 2 ? ldl_le_p(args + 8) : 0, words > 3 ? ldl_le_p(args + 12) : 0);
+    }
     return dreamgpu_gl_scalar(&c->platform->gl_api, &c->in_begin, scalar_resource, c, fn, args,
                               words * 4);
+}
+
+static uint32_t list_execute(void *opaque, uint32_t kind, uint32_t fn, const uint8_t *args,
+                             const uint8_t *data, uint32_t bytes) {
+    DgGLContext *c = opaque;
+    return kind ? raw_data_call(c, fn, args, data, bytes) : raw_call(c, fn, args);
+}
+uint32_t dg_gl_call(DgGLContext *c, uint32_t fn, const uint8_t *args) {
+    if (!c->state.list_mode && fn != FEnum_glCallList && fn != DG_GL_RECORD_ERROR)
+        return raw_call(c, fn, args);
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    return dreamgpu_list_dispatch(&memory, &c->state, &c->in_begin, list_execute, c, 0, fn, args,
+                                  dg_gl_function_words(fn), NULL, 0);
+}
+uint32_t dg_gl_data_call(DgGLContext *c, uint32_t fn, const uint8_t *args, const uint8_t *data,
+                         uint32_t bytes) {
+    if (!c->state.list_mode && fn != FEnum_glCallLists)
+        return raw_data_call(c, fn, args, data, bytes);
+    DreamGpuTextureMemory memory = texture_memory(c->platform);
+    return dreamgpu_list_dispatch(&memory, &c->state, &c->in_begin, list_execute, c, 1, fn, args,
+                                  dg_gl_function_words(fn) & ~DG_GL_FUNCTION_KIND_MASK, data,
+                                  bytes);
 }
 
 typedef struct DgImageCall {
@@ -717,6 +789,17 @@ bool dg_gl_export(DgGLContext *c, DgGLDrawable *d, DgGLImage *image, bool exchan
 #ifdef CONFIG_DARWIN
     rectangle = 1;
 #endif
+    if (trace_event_get_state_backends(TRACE_DREAMGPU_GL_GEOMETRY_EXPORT)) {
+        GLint viewport[4], scissor[4];
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        glGetIntegerv(GL_SCISSOR_BOX, scissor);
+        trace_dreamgpu_gl_geometry_export(c->serial, d->gpu.width, d->gpu.height, image->width,
+                                          image->height, c->framebuffer, exchange);
+        trace_dreamgpu_gl_geometry_state(c->serial, GL_VIEWPORT, viewport[0], viewport[1],
+                                         viewport[2], viewport[3]);
+        trace_dreamgpu_gl_geometry_state(c->serial, GL_SCISSOR_BOX, scissor[0], scissor[1],
+                                         scissor[2], scissor[3]);
+    }
     uint32_t error = dreamgpu_export(&c->platform->gl_api, &d->gpu, &c->state, c->framebuffer,
                                      exchange, rectangle, export_bind, export_fence, &call);
     if (error && errp && !*errp) {
