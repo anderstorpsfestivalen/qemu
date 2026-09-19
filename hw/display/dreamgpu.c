@@ -861,7 +861,8 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
 #ifdef CONFIG_DREAMGPU_GL
                    | (s->gpu_socket && *s->gpu_socket
                           ? DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
-                                DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK
+                                DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK |
+                                DG_CAP_GL_DEPTH_STENCIL_READBACK
                           : 0)
 #endif
                 ;
