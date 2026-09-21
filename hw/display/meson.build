@@ -39,6 +39,8 @@ if config_all_devices.has_key('CONFIG_DREAMGPU')
             dreamgpu_host / 'src/texture.rs',
             dreamgpu_host / 'src/texture/names.rs',
             dreamgpu_host / 'src/texture/control.rs',
+            dreamgpu_host / 'src/texture/border.rs',
+            dreamgpu_host / 'src/texture/border.glsl',
             dreamgpu_root / 'Cargo.toml', dreamgpu_root / 'Cargo.lock'],
     output: 'libdreamgpu_host.a',
     command: [dreamgpu_rustc, '--crate-name', 'dreamgpu_host', '--edition=2021',

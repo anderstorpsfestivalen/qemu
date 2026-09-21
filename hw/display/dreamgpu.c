@@ -862,7 +862,8 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                    | (s->gpu_socket && *s->gpu_socket
                           ? DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
                                 DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK |
-                                DG_CAP_GL_DEPTH_STENCIL_READBACK
+                                DG_CAP_GL_DEPTH_STENCIL_READBACK | DG_CAP_GL_TEXTURE_IMAGES
+                                | DG_CAP_GL_TEXTURE_BORDERS
                           : 0)
 #endif
                 ;
