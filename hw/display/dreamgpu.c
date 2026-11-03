@@ -863,7 +863,8 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                           ? DG_CAP_GL_TRANSPORT | DG_CAP_GL_FRONT_BUFFERS |
                                 DG_CAP_GL_PRESENT_BOUNDS | DG_CAP_GL_BULK_READBACK |
                                 DG_CAP_GL_DEPTH_STENCIL_READBACK | DG_CAP_GL_TEXTURE_IMAGES
-                                | DG_CAP_GL_TEXTURE_BORDERS
+                                | DG_CAP_GL_TEXTURE_BORDERS | DG_CAP_GL_MULTITEXTURE |
+                                DG_CAP_GL_FIXED_STATE
                           : 0)
 #endif
                 ;

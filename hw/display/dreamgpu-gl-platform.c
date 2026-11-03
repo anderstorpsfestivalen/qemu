@@ -227,6 +227,13 @@ DgGLPlatform *dg_gl_platform_new(const char *render_node, Error **errp) {
     }
 #endif
     p->gl_api = (DreamGpuGlApi){DREAMGPU_GL_API_INIT};
+    /* The context state is embedded here but owned by Rust; refuse a stale mirror. */
+    if (dreamgpu_context_state_size() != sizeof(DreamGpuContextState)) {
+        error_setg(errp, "DreamGPU context state ABI mismatch: Rust %zu, C %zu",
+                   dreamgpu_context_state_size(), sizeof(DreamGpuContextState));
+        dg_gl_platform_free(p);
+        return NULL;
+    }
     return p;
 }
 
