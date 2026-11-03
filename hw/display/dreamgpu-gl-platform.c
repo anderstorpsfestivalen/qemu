@@ -476,7 +476,8 @@ static DreamGpuTextureMemory texture_memory(DgGLPlatform *p) {
 }
 
 static DgTexture *bound_texture(DgGLContext *c, GLenum target) {
-    return target == GL_TEXTURE_1D ? c->state.bound_texture_1d : c->state.bound_texture;
+    /* A cube map face selects the active unit's cube map binding. */
+    return dreamgpu_context_texture(&c->state, target);
 }
 
 static uint32_t copy_texture(DgGLContext *c, uint32_t fn, const uint8_t *args) {
