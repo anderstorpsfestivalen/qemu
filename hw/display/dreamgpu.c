@@ -865,7 +865,7 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                                 DG_CAP_GL_DEPTH_STENCIL_READBACK | DG_CAP_GL_TEXTURE_IMAGES
                                 | DG_CAP_GL_TEXTURE_BORDERS | DG_CAP_GL_MULTITEXTURE |
                                 DG_CAP_GL_FIXED_STATE | DG_CAP_GL_TEXTURE_CONTROL |
-                                DG_CAP_GL_COMPRESSED_TEXTURES
+                                DG_CAP_GL_COMPRESSED_TEXTURES | DG_CAP_GL_FOG_COORD
                           : 0)
 #endif
                 ;
