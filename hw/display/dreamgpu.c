@@ -867,7 +867,7 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                                 DG_CAP_GL_FIXED_STATE | DG_CAP_GL_TEXTURE_CONTROL |
                                 DG_CAP_GL_COMPRESSED_TEXTURES | DG_CAP_GL_FOG_COORD |
                                 DG_CAP_GL_TEXTURE_CUBE_MAP | DG_CAP_GL_FRAGMENT_PROGRAM |
-                                DG_CAP_GL_VERTEX_PROGRAM
+                                DG_CAP_GL_VERTEX_PROGRAM | DG_CAP_GL_TEXTURE_3D
                           : 0)
 #endif
                 ;
