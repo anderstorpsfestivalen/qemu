@@ -441,6 +441,7 @@ static bool make_current(DgGLEngine *e, DgContext *c, DgDrawable *d, Error **err
     }
     if (e->current_context && e->current_drawable &&
         !dg_gl_context_in_begin(e->current_context->native)) {
+        dg_gl_settle(e->current_context->native);
         dg_gl_flush_drawable(e->current_drawable->native);
     }
     if (!dg_gl_make_current(c->native, d->native, errp)) {
@@ -859,6 +860,7 @@ static void *host_drawable_new(void *opaque, uint32_t width, uint32_t height) {
     drain_output(e);
     if (e->current_context && e->current_drawable &&
         !dg_gl_context_in_begin(e->current_context->native)) {
+        dg_gl_settle(e->current_context->native);
         dg_gl_flush_drawable(e->current_drawable->native);
     }
     void *native = dg_gl_drawable_new(e->platform, width, height, d->errp);
@@ -873,6 +875,7 @@ static void host_context_free(void *opaque, uint32_t index) {
     DgContext *c = &e->resources.contexts[index];
     drain_output(e);
     if (e->current_context == c && e->current_drawable && !dg_gl_context_in_begin(c->native)) {
+        dg_gl_settle(c->native);
         dg_gl_flush_drawable(e->current_drawable->native);
     }
     dg_gl_pixel_image_abort(c->native);

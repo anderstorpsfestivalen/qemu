@@ -869,7 +869,8 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                                 DG_CAP_GL_TEXTURE_CUBE_MAP | DG_CAP_GL_FRAGMENT_PROGRAM |
                                 DG_CAP_GL_VERTEX_PROGRAM | DG_CAP_GL_TEXTURE_3D |
                                 /* Buffer bytes stay guest (little-endian) order. */
-                                (HOST_BIG_ENDIAN ? 0 : DG_CAP_GL_VERTEX_BUFFER_OBJECT)
+                                (HOST_BIG_ENDIAN ? 0 : DG_CAP_GL_VERTEX_BUFFER_OBJECT) |
+                                DG_CAP_GL_FRAMEBUFFER_OBJECT
                           : 0)
 #endif
                 ;

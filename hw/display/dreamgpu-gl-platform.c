@@ -410,6 +410,11 @@ void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d) {
     g_free(d);
 }
 
+void dg_gl_settle(DgGLContext *c) {
+    /* Fence framebuffer object rendering for readers in other contexts. */
+    dreamgpu_framebuffer_settle(&c->platform->gl_api, &c->state, c->serial);
+}
+
 void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d) {
     dreamgpu_drawable_exchange(&c->platform->gl_api, &d->gpu, c->framebuffer, &c->state);
 }
@@ -439,7 +444,7 @@ bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp) {
         return true;
     }
     if (dreamgpu_drawable_bind(&c->platform->gl_api, &d->gpu, &c->framebuffer, &c->initialized,
-                               &c->state)) {
+                               &c->state, c->serial)) {
         error_setg(errp, "Internal drawable framebuffer is incomplete");
         return false;
     }

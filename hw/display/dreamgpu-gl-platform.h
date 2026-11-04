@@ -15,6 +15,7 @@ void dg_gl_context_free(DgGLContext *c);
 DgGLDrawable *dg_gl_drawable_new(DgGLPlatform *p, uint32_t width, uint32_t height, Error **errp);
 void dg_gl_drawable_free(DgGLPlatform *p, DgGLDrawable *d);
 void dg_gl_flush_drawable(DgGLDrawable *d);
+void dg_gl_settle(DgGLContext *c);
 void dg_gl_exchange(DgGLContext *c, DgGLDrawable *d);
 bool dg_gl_make_current(DgGLContext *c, DgGLDrawable *d, Error **errp);
 uint32_t dg_gl_function_words(uint32_t function);
