@@ -38,7 +38,7 @@ if config_all_devices.has_key('CONFIG_DREAMGPU')
             dreamgpu_host / 'src/pixel_image.rs', dreamgpu_host / 'src/pixels.rs', dreamgpu_host / 'src/query.rs', dreamgpu_host / 'src/vector.rs',
             dreamgpu_host / 'src/state.rs', dreamgpu_host / 'src/resource.rs', dreamgpu_host / 'src/export.rs', dreamgpu_host / 'src/data.rs', dreamgpu_host / 'src/publication.rs', dreamgpu_host / 'src/image.rs', dreamgpu_host / 'src/batch.rs', dreamgpu_host / 'src/composition.rs', dreamgpu_host / 'src/worker.rs', dreamgpu_host / 'src/submission.rs',
             dreamgpu_host / 'src/texture.rs', dreamgpu_host / 'src/program.rs',
-            dreamgpu_host / 'src/buffer.rs', dreamgpu_host / 'src/framebuffer.rs',
+            dreamgpu_host / 'src/buffer.rs', dreamgpu_host / 'src/framebuffer.rs', dreamgpu_host / 'src/occlusion.rs',
             dreamgpu_host / 'src/texture/names.rs',
             dreamgpu_host / 'src/texture/control.rs',
             dreamgpu_host / 'src/texture/volume.rs',
