@@ -46,7 +46,7 @@ G_STATIC_ASSERT(sizeof(((DgGLCompletion *)0)->result) == DG_GL_MAX_RESULT_BYTES)
 G_STATIC_ASSERT(G_N_ELEMENTS(((DreamGpuOutputQueue *)0)->items) ==
                 DG_GL_MAX_DRAWABLES * DG_GL_EXPORT_SLOTS + DG_MAX_PENDING_DESKTOP);
 #if UINTPTR_MAX == UINT64_MAX
-G_STATIC_ASSERT(sizeof(DgBatch) == 576);
+G_STATIC_ASSERT(sizeof(DgBatch) == 592);
 G_STATIC_ASSERT(sizeof(DgGLCompletion) == 576);
 G_STATIC_ASSERT(offsetof(DgGLCompletion, bulk_result) == 568);
 #endif
@@ -1026,7 +1026,7 @@ static void *render_worker(void *opaque) {
         DgBatch *batch;
         uint32_t result = 0;
 
-        while (!e->work.pending && !e->work.reset && !e->stopping) {
+        while (!e->work.pending_len && !e->work.reset && !e->stopping) {
             qemu_cond_wait(&e->cond, &e->lock);
         }
         if (e->stopping) {
@@ -1158,8 +1158,11 @@ void dg_gl_engine_free(DgGLEngine *e) {
 
 bool dg_gl_engine_submit(DgGLEngine *e, uint8_t *data, size_t bytes, uint32_t sequence,
                          uint32_t generation, uint32_t primary_width, uint32_t primary_height,
-                         uint32_t records) {
+                         uint32_t records, const DreamGpuEnqueue *identity) {
     DreamGpuSubmissionRequest request = {
+        .client = identity->client,
+        .stream = identity->stream,
+        .error = identity->error,
         .data = data,
         .bytes = bytes,
         .sequence = sequence,

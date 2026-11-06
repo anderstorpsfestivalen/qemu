@@ -7,6 +7,8 @@
 #include "qemu/timer.h"
 #include "qemu/module.h"
 #include "qemu/bswap.h"
+#include "qemu/event_notifier.h"
+#include "qemu/atomic.h"
 #include "hw/pci/pci_device.h"
 #include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -76,8 +78,20 @@ struct DreamGpu {
     uint64_t gl_active_result_address;
     uint32_t gl_sensitive_op, gl_fault, gl_fault_operation, gl_fault_sequence;
     uint64_t gl_trace_start_us;
+    /* Queued transport (gl.h DG_GL_REG_QUEUE_*). Rust owns its state machine. */
+    DreamGpuQueue gl_queue;
+    uint32_t gl_queue_addr_lo, gl_queue_addr_hi;
+    uint64_t gl_doorbells;
+    EventNotifier gl_doorbell;
+    bool gl_doorbell_ready;
 #endif
 };
+
+#if defined(CONFIG_DREAMGPU_GL) && UINTPTR_MAX == UINT64_MAX
+G_STATIC_ASSERT(sizeof(DreamGpuQueue) == 976);
+G_STATIC_ASSERT(offsetof(DreamGpuQueue, kicks) == 944);
+G_STATIC_ASSERT(sizeof(DreamGpuEnqueue) == 16);
+#endif
 
 static void dg_update_irq(DreamGpu *s) {
     pci_set_irq(&s->parent_obj, !!(s->irq_enable & s->irq_status));
@@ -449,6 +463,10 @@ static void dg_gl_transfer_work(DreamGpu *s) {
     dg_gl_engine_transfer_done(s->gl, error, cpu_epoch, cpu_generation);
 }
 
+static DreamGpuQueueCallbacks dg_queue_callbacks(DreamGpu *s);
+static void dg_gl_queue_irq(DreamGpu *s);
+static void dg_gl_queue_kick(DreamGpu *s);
+
 static void dg_gl_completed_bh(void *opaque) {
     DreamGpu *s = opaque;
     DgGLCompletion done;
@@ -461,7 +479,15 @@ static void dg_gl_completed_bh(void *opaque) {
             g_free(done.bulk_result);
             continue;
         }
-        if (!done.reset) {
+        if (!done.reset && s->gl_queue.len) {
+            DreamGpuQueueCallbacks callbacks = dg_queue_callbacks(s);
+            DreamGpuQueueOutcome outcome =
+                dreamgpu_queue_complete(&s->gl_queue, &callbacks, &done);
+            s->gl_present = done.present;
+            if (outcome.flags & DREAMGPU_QUEUE_IRQ) {
+                dg_gl_queue_irq(s);
+            }
+        } else if (!done.reset) {
             s->gl_present = done.present;
             if (!done.error && done.result_bytes) {
                 if (done.result_bytes > s->gl_active_result_capacity ||
@@ -477,10 +503,14 @@ static void dg_gl_completed_bh(void *opaque) {
             }
             dg_gl_complete(s, done.sequence, done.error);
         }
-        if (!done.resources_live && !(s->gl_status & DG_STATUS_BUSY)) {
+        if (!done.resources_live && !(s->gl_status & DG_STATUS_BUSY) && !s->gl_queue.len) {
             migrate_del_blocker(&s->gl_blocker);
         }
         g_free(done.bulk_result);
+    }
+    /* Completions free capacity for entries published beyond it. */
+    if (s->gl_queue.active) {
+        dg_gl_queue_kick(s);
     }
 }
 
@@ -517,7 +547,8 @@ static void dg_snapshot_diagnostic_record(void *opaque, const uint8_t *record) {
         dg_diagnostic_record(s->diagnostics, record);
     }
 }
-static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data, uint32_t bytes, uint32_t records) {
+static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data, uint32_t bytes, uint32_t records,
+                                    const DreamGpuEnqueue *identity) {
     DreamGpu *s = opaque;
     uint32_t width, height;
     Error *err = NULL;
@@ -535,19 +566,92 @@ static uint32_t dg_snapshot_enqueue(void *opaque, uint8_t *data, uint32_t bytes,
         s->gl = dg_gl_engine_new(s->gpu_socket, dg_gl_notify, s);
     }
     dg_gl_dimensions(s, &width, &height);
-    return dg_gl_engine_submit(s->gl, data, bytes, s->gl_sequence, s->generation, width, height,
-                               records)
+    return dg_gl_engine_submit(s->gl, data, bytes, identity->sequence, s->generation, width, height,
+                               records, identity)
                ? 0
                : DG_GL_ERROR_LIMIT;
 }
-static void dg_gl_submit(DreamGpu *s) {
-    DreamGpuDeviceGlCallbacks callbacks = {
+static DreamGpuDeviceGlCallbacks dg_gl_callbacks(DreamGpu *s) {
+    return (DreamGpuDeviceGlCallbacks){
         .memory = dg_snapshot_memory(s),
         .validate = dg_snapshot_gl_validate,
         .diagnostics_begin = dg_snapshot_diagnostics_begin,
         .diagnostic_record = dg_snapshot_diagnostic_record,
         .enqueue = dg_snapshot_enqueue,
     };
+}
+static uint32_t dg_queue_write(void *opaque, uint64_t address, const uint8_t *data,
+                               uint32_t bytes) {
+    DreamGpu *s = opaque;
+    return pci_dma_write(&s->parent_obj, address, data, bytes) == MEMTX_OK;
+}
+static void dg_queue_barrier(void *opaque) {
+    smp_mb();
+}
+/* An entry rejected behind accepted work completes through the engine, so its
+ * completion and its fault domain keep entry order. */
+static uint32_t dg_queue_marker(void *opaque, const DreamGpuEnqueue *identity) {
+    DreamGpu *s = opaque;
+    uint32_t width, height;
+    if (!s->gl) {
+        return 1;
+    }
+    dg_gl_dimensions(s, &width, &height);
+    return dg_gl_engine_submit(s->gl, NULL, 0, identity->sequence, s->generation, width, height, 0,
+                               identity)
+               ? 0
+               : 1;
+}
+/* As with the registers, a failed coherence-sensitive batch stops the guest
+ * before its completion is visible. */
+static void dg_queue_fault(void *opaque, uint32_t sequence) {
+    dg_fault_stop(opaque, DG_GL_FAULT_HOST_COHERENCE, sequence);
+}
+static DreamGpuQueueCallbacks dg_queue_callbacks(DreamGpu *s) {
+    return (DreamGpuQueueCallbacks){
+        .gl = dg_gl_callbacks(s),
+        .write = dg_queue_write,
+        .barrier = dg_queue_barrier,
+        .marker = dg_queue_marker,
+        .fault = dg_queue_fault,
+    };
+}
+static void dg_gl_queue_irq(DreamGpu *s) {
+    s->irq_status |= DG_IRQ_GL_COMPLETION;
+    dg_update_irq(s);
+}
+/* Doorbell: copy and validate published entries now; execution is async. */
+static void dg_gl_queue_kick(DreamGpu *s) {
+    DreamGpuQueueCallbacks callbacks = dg_queue_callbacks(s);
+    if (s->gl_fault || !s->gl_queue.active) {
+        return;
+    }
+    if (dreamgpu_queue_consume(&s->gl_queue, &callbacks, s->generation,
+                               s->vga.vbe_regs[VBE_DISPI_INDEX_BPP],
+                               s->status & DG_STATUS_BUSY) &
+        DREAMGPU_QUEUE_IRQ) {
+        dg_gl_queue_irq(s);
+    }
+}
+static void dg_gl_doorbell(EventNotifier *notifier) {
+    DreamGpu *s = container_of(notifier, DreamGpu, gl_doorbell);
+    if (event_notifier_test_and_clear(notifier)) {
+        s->gl_doorbells++;
+        dg_gl_queue_kick(s);
+    }
+}
+static void dg_gl_queue_control(DreamGpu *s, uint32_t value) {
+    DreamGpuQueueCallbacks callbacks = dg_queue_callbacks(s);
+    if (!value) {
+        dreamgpu_queue_disable(&s->gl_queue, &callbacks);
+        return;
+    }
+    dreamgpu_queue_enable(&s->gl_queue, &callbacks,
+                          ((uint64_t)s->gl_queue_addr_hi << 32) | s->gl_queue_addr_lo, value,
+                          s->generation, (s->gl_status & DG_STATUS_BUSY) || s->gl_fault);
+}
+static void dg_gl_submit(DreamGpu *s) {
+    DreamGpuDeviceGlCallbacks callbacks = dg_gl_callbacks(s);
     DreamGpuDeviceGlRequest request = {
         .address = ((uint64_t)s->gl_addr_hi << 32) | s->gl_addr_lo,
         .result_address = ((uint64_t)s->gl_result_addr_hi << 32) | s->gl_result_addr_lo,
@@ -557,10 +661,16 @@ static void dg_gl_submit(DreamGpu *s) {
         .bpp = s->vga.vbe_regs[VBE_DISPI_INDEX_BPP],
         .busy_2d = s->status & DG_STATUS_BUSY,
         .result_capacity = s->gl_result_capacity,
+        .sequence = s->gl_sequence,
     };
     DreamGpuDeviceGlResult result;
     uint32_t error;
     if ((s->gl_status & DG_STATUS_BUSY) || s->gl_fault) {
+        return;
+    }
+    if (s->gl_queue.active || s->gl_queue.len) {
+        /* One ordered stream: never interleave a register batch with entries. */
+        dg_gl_complete(s, s->gl_sequence, DG_GL_ERROR_BATCH);
         return;
     }
     s->gl_trace_start_us = trace_event_get_state_backends(TRACE_DREAMGPU_GL_SUBMIT) ||
@@ -646,6 +756,14 @@ static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr) {
             return s->gl_query_function;
         case DG_GL_REG_FUNCTION_WORDS:
             return dg_gl_function_words(s->gl_query_function);
+        case DG_GL_REG_QUEUE_VERSION:
+            return DG_GL_QUEUE_VERSION;
+        case DG_GL_REG_QUEUE_ADDR_LO:
+            return s->gl_queue_addr_lo;
+        case DG_GL_REG_QUEUE_ADDR_HI:
+            return s->gl_queue_addr_hi;
+        case DG_GL_REG_QUEUE_CONTROL:
+            return s->gl_queue.active;
         default:
             return 0;
     }
@@ -687,6 +805,20 @@ static void dg_gl_write(DreamGpu *s, hwaddr addr, uint32_t value) {
             if (value == 1) {
                 dg_gl_submit(s);
             }
+            break;
+        case DG_GL_REG_QUEUE_ADDR_LO:
+            s->gl_queue_addr_lo = value;
+            break;
+        case DG_GL_REG_QUEUE_ADDR_HI:
+            s->gl_queue_addr_hi = value;
+            break;
+        case DG_GL_REG_QUEUE_CONTROL:
+            dg_gl_queue_control(s, value);
+            break;
+        case DG_GL_REG_QUEUE_DOORBELL:
+            /* Reached only without an ioeventfd (or for another access size). */
+            s->gl_doorbells++;
+            dg_gl_queue_kick(s);
             break;
     }
 }
@@ -821,6 +953,12 @@ static void dg_engine_reset(DreamGpu *s) {
     s->gl_result_bytes = s->gl_result_type = s->gl_active_result_capacity = 0;
     s->gl_active_result_address = 0;
     memset(&s->gl_present, 0, sizeof(s->gl_present));
+    {
+        DreamGpuQueueCallbacks callbacks = dg_queue_callbacks(s);
+        /* Writes STATE zero to the old page; its entries never complete. */
+        dreamgpu_queue_reset(&s->gl_queue, &callbacks);
+        s->gl_queue_addr_lo = s->gl_queue_addr_hi = 0;
+    }
     if (s->gl) {
         uint64_t epoch = 0, generation = 0;
         dreamgpu_shmem_cpu_anchor(s->vga.con, &epoch, &generation);
@@ -871,7 +1009,7 @@ static uint64_t dg_read(void *opaque, hwaddr addr, unsigned size) {
                                 /* Buffer bytes stay guest (little-endian) order. */
                                 (HOST_BIG_ENDIAN ? 0 : DG_CAP_GL_VERTEX_BUFFER_OBJECT) |
                                 DG_CAP_GL_FRAMEBUFFER_OBJECT | DG_CAP_GL_VERTEX_ARRAY_BGRA |
-                                DG_CAP_GL_OCCLUSION_QUERY
+                                DG_CAP_GL_OCCLUSION_QUERY | DG_CAP_GL_TEXTURE_RECTANGLE
                           : 0)
 #endif
                 ;
@@ -1016,6 +1154,12 @@ static int dg_post_load(void *opaque, int version_id) {
     if (s->status & DG_STATUS_BUSY) {
         qemu_bh_schedule(s->work_bh);
     }
+#ifdef CONFIG_DREAMGPU_GL
+    /* Entries published before the save whose doorbell was not yet handled. */
+    if (s->gl_queue.active) {
+        qemu_bh_schedule(s->gl_bh);
+    }
+#endif
     dg_update_irq(s);
     dreamgpu_shmem_native_cursor(s->vga.con, &s->cursor, true);
     return 0;
@@ -1041,6 +1185,9 @@ static int dg_pre_load(void *opaque) {
     s->gl_result_bytes = s->gl_result_type = s->gl_active_result_capacity = 0;
     s->gl_active_result_address = 0;
     s->gl_fault = s->gl_fault_operation = s->gl_fault_sequence = 0;
+    /* Without the subsection (older source or idle queue) the queue is off. */
+    memset(&s->gl_queue, 0, sizeof(s->gl_queue));
+    s->gl_queue_addr_lo = s->gl_queue_addr_hi = 0;
     migrate_del_blocker(&s->gl_blocker);
 #endif
     return 0;
@@ -1061,6 +1208,38 @@ static const VMStateDescription vmstate_dg_cursor = {
             VMSTATE_UINT8_ARRAY(pixels, DreamGpuNativeCursor, DG_CURSOR_MAX_BYTES),
             VMSTATE_END_OF_LIST()},
 };
+
+#ifdef CONFIG_DREAMGPU_GL
+/* Unfinished entries keep the GL migration blocker, so only an idle queue's
+ * page and counters migrate. The guest page itself migrates with RAM. */
+static bool dg_gl_queue_needed(void *opaque) {
+    DreamGpu *s = opaque;
+    return s->gl_queue.active || s->gl_queue_addr_lo || s->gl_queue_addr_hi;
+}
+
+static int dg_gl_queue_pre_save(void *opaque) {
+    DreamGpu *s = opaque;
+    return s->gl_queue.len ? -EBUSY : 0;
+}
+
+static const VMStateDescription vmstate_dg_gl_queue = {
+    .name = "dreamgpu/gl-queue",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = dg_gl_queue_needed,
+    .pre_save = dg_gl_queue_pre_save,
+    .fields =
+        (const VMStateField[]){
+            VMSTATE_UINT32(gl_queue_addr_lo, DreamGpu),
+            VMSTATE_UINT32(gl_queue_addr_hi, DreamGpu),
+            VMSTATE_UINT64(gl_queue.address, DreamGpu),
+            VMSTATE_UINT32(gl_queue.active, DreamGpu),
+            VMSTATE_UINT32(gl_queue.generation, DreamGpu),
+            VMSTATE_UINT32(gl_queue.consumed, DreamGpu),
+            VMSTATE_UINT32(gl_queue.completed, DreamGpu),
+            VMSTATE_END_OF_LIST()},
+};
+#endif
 
 static const VMStateDescription vmstate_dg = {
     .name = TYPE_DREAMGPU,
@@ -1125,6 +1304,13 @@ static const VMStateDescription vmstate_dg = {
             VMSTATE_UINT32_V(gl_result_type, DreamGpu, 2),
 #endif
             VMSTATE_END_OF_LIST()},
+#ifdef CONFIG_DREAMGPU_GL
+    .subsections =
+        (const VMStateDescription *const[]){
+            &vmstate_dg_gl_queue,
+            NULL,
+        },
+#endif
 };
 
 static void dg_reset(DeviceState *dev) {
@@ -1164,6 +1350,16 @@ static void dg_realize(PCIDevice *dev, Error **errp) {
     qemu_edid_region_io(&s->vga_regs[3], OBJECT(dev), s->edid, sizeof(s->edid));
     memory_region_add_subregion(&s->mmio, 0, &s->vga_regs[3]);
     memory_region_init_io(&s->regs, OBJECT(dev), &dg_ops, s, "dreamgpu.commands", 0x1000);
+#ifdef CONFIG_DREAMGPU_GL
+    /* The queue doorbell carries no data. Under KVM the vCPU's write signals
+     * this eventfd in the kernel and resumes; the main loop copies entries. */
+    if (event_notifier_init(&s->gl_doorbell, 0) == 0) {
+        event_notifier_set_handler(&s->gl_doorbell, dg_gl_doorbell);
+        memory_region_add_eventfd(&s->regs, DG_GL_REG_QUEUE_DOORBELL - DG_REG_MAGIC, 4, false, 0,
+                                  &s->gl_doorbell);
+        s->gl_doorbell_ready = true;
+    }
+#endif
     memory_region_add_subregion(&s->mmio, DG_REG_MAGIC, &s->regs);
     pci_register_bar(dev, DG_MMIO_BAR, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mmio);
     pci_set_byte(dev->config + PCI_INTERRUPT_PIN, 1);
@@ -1258,9 +1454,19 @@ static char *dg_diagnostics_stats(Object *obj, Error **errp) {
                 i ? "," : "", q->function, q->arg0, q->arg1, q->count);
         }
     }
-    g_string_append_printf(out,
-                           "],\"query_overflow\":%" PRIu64 ",\"function_overflow\":%" PRIu64 "}}",
+    g_string_append_printf(out, "],\"query_overflow\":%" PRIu64 ",\"function_overflow\":%" PRIu64,
                            d ? d->query_overflow : 0, d ? d->function_overflow : 0);
+#ifdef CONFIG_DREAMGPU_GL
+    /* Cumulative since realize, independent of the diagnostic window. */
+    g_string_append_printf(out,
+                           ",\"queue\":{\"active\":%s,\"doorbells\":%" PRIu64
+                           ",\"consume_passes\":%" PRIu64 ",\"entries\":%" PRIu64
+                           ",\"completions\":%" PRIu64 ",\"interrupts\":%" PRIu64 "}",
+                           s->gl_queue.active ? "true" : "false", s->gl_doorbells,
+                           s->gl_queue.kicks, s->gl_queue.taken, s->gl_queue.finished,
+                           s->gl_queue.interrupts);
+#endif
+    g_string_append(out, "}}");
     return g_string_free(out, false);
 }
 
@@ -1305,6 +1511,12 @@ static void dg_finalize(Object *obj) {
     dg_gl_engine_free(s->gl);
     if (s->gl_bh) {
         qemu_bh_delete(s->gl_bh);
+    }
+    if (s->gl_doorbell_ready) {
+        memory_region_del_eventfd(&s->regs, DG_GL_REG_QUEUE_DOORBELL - DG_REG_MAGIC, 4, false, 0,
+                                  &s->gl_doorbell);
+        event_notifier_set_handler(&s->gl_doorbell, NULL);
+        event_notifier_cleanup(&s->gl_doorbell);
     }
     migrate_del_blocker(&s->gl_blocker);
 #endif

@@ -22,9 +22,11 @@ uint32_t dg_gl_validate(const uint8_t *data, size_t bytes, uint32_t generation,
                         uint32_t *records);
 DgGLEngine *dg_gl_engine_new(const char *socket_path, DgGLNotify notify, void *opaque);
 void dg_gl_engine_free(DgGLEngine *engine);
+/* Null data with identity->error queues an in-order completion that never
+ * executes; identity->client/stream name the batch's fault domain. */
 bool dg_gl_engine_submit(DgGLEngine *engine, uint8_t *data, size_t bytes, uint32_t sequence,
                          uint32_t generation, uint32_t primary_width, uint32_t primary_height,
-                         uint32_t records);
+                         uint32_t records, const DreamGpuEnqueue *identity);
 void dg_gl_engine_reset(DgGLEngine *engine, uint32_t generation, uint64_t cpu_epoch,
                         uint64_t cpu_generation);
 bool dg_gl_engine_completion(DgGLEngine *engine, DgGLCompletion *completion);
