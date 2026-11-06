@@ -764,6 +764,9 @@ static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr) {
             return s->gl_queue_addr_hi;
         case DG_GL_REG_QUEUE_CONTROL:
             return s->gl_queue.active;
+        case DG_GL_REG_CAPS2:
+            /* Features beyond DG_REG_CAPS; zero without a GL engine, as there. */
+            return s->gpu_socket && *s->gpu_socket ? DG_CAP2_GL_DEPTH_TEXTURE : 0;
         default:
             return 0;
     }
