@@ -1114,6 +1114,35 @@ static void test_fault_stop(Fixture *f, gconstpointer unused) {
     assert_fault_stopped(f, DG_GL_FAULT_HOST_COHERENCE, DG_DESKTOP_READBACK);
 }
 
+/* The frame trace is off until requested and needs a running GL engine; a
+ * device without one rejects a request without creating its file. Only QMP is
+ * used, so this test starts its own machine. */
+static void test_trace_idle(void) {
+#ifdef CONFIG_DREAMGPU_GL
+    QTestState *qts = qtest_init("-machine pc -m 64 -vga none -device dreamgpu,id=retro");
+    g_autofree char *dir = g_dir_make_tmp("dreamgpu-trace-XXXXXX", NULL);
+    g_autofree char *path = g_build_filename(dir, "trace.txt", NULL);
+    g_autofree char *request = g_strdup_printf("%s,2", path);
+    QDict *reply =
+        qtest_qmp(qts, "{'execute':'qom-get','arguments':{'path':'/machine/peripheral/retro',"
+                       "'property':'diagnostic-trace'}}");
+    g_assert_cmpstr(qdict_get_str(reply, "return"), ==,
+                    "{\"schema\": 1, \"state\": \"idle\", \"engine\": false}");
+    qobject_unref(reply);
+    reply = qtest_qmp(qts,
+                      "{'execute':'qom-set','arguments':{'path':'/machine/peripheral/retro',"
+                      "'property':'diagnostic-trace','value':%s}}",
+                      request);
+    g_assert_true(qdict_haskey(reply, "error"));
+    qobject_unref(reply);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(rmdir(dir), ==, 0);
+    qtest_quit(qts);
+#else
+    g_test_skip("Native GL transport is not built on this host");
+#endif
+}
+
 int main(int argc, char **argv) {
     g_test_init(&argc, &argv, NULL);
     g_test_add("/dreamgpu/identity", Fixture, NULL, setup, test_identity, teardown);
@@ -1143,5 +1172,6 @@ int main(int argc, char **argv) {
     g_test_add("/dreamgpu/vector-validation", Fixture, NULL, setup, test_vector_validation,
                teardown);
     g_test_add("/dreamgpu/fault-stop", Fixture, NULL, setup, test_fault_stop, teardown);
+    qtest_add_func("/dreamgpu/trace-idle", test_trace_idle);
     return g_test_run();
 }

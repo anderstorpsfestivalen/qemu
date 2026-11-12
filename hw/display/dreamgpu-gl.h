@@ -34,5 +34,8 @@ uint32_t dg_gl_function_words(uint32_t function);
 bool dg_gl_engine_transfer(DgGLEngine *engine, DgGLTransfer *transfer);
 void dg_gl_engine_transfer_done(DgGLEngine *engine, uint32_t error, uint64_t cpu_epoch,
                                 uint64_t cpu_generation);
+/* Diagnostic frame trace control and JSON status (QOM diagnostic-trace). */
+bool dg_gl_engine_trace(DgGLEngine *engine, const char *request, Error **errp);
+char *dg_gl_engine_trace_status(DgGLEngine *engine);
 
 #endif

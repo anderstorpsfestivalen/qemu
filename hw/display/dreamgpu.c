@@ -1465,9 +1465,31 @@ static char *dg_diagnostics_stats(Object *obj, Error **errp) {
     return g_string_free(out, false);
 }
 
+#ifdef CONFIG_DREAMGPU_GL
+/* Host-only frame trace of executed GL records; see dg_gl_engine_trace. The
+ * engine starts with the guest's first GL submission. */
+static char *dg_trace_get(Object *obj, Error **errp) {
+    DreamGpu *s = DREAMGPU(obj);
+    return s->gl ? dg_gl_engine_trace_status(s->gl)
+                 : g_strdup("{\"schema\": 1, \"state\": \"idle\", \"engine\": false}");
+}
+
+static void dg_trace_set(Object *obj, const char *value, Error **errp) {
+    DreamGpu *s = DREAMGPU(obj);
+    if (!s->gl) {
+        error_setg(errp, "DreamGPU GL engine not started; trace after the guest submits GL");
+        return;
+    }
+    dg_gl_engine_trace(s->gl, value, errp);
+}
+#endif
+
 static void dg_instance_init(Object *obj) {
     object_property_add_bool(obj, "diagnostic-counters", dg_diagnostics_get, dg_diagnostics_set);
     object_property_add_str(obj, "diagnostic-stats", dg_diagnostics_stats, NULL);
+#ifdef CONFIG_DREAMGPU_GL
+    object_property_add_str(obj, "diagnostic-trace", dg_trace_get, dg_trace_set);
+#endif
 }
 
 static const Property dg_properties[] = {

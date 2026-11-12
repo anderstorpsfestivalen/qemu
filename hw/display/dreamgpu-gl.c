@@ -12,6 +12,8 @@
 #include "qemu/atomic.h"
 #include "qemu/cutils.h"
 #include "qemu/memfd.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
 #include <sys/mman.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
@@ -95,10 +97,185 @@ struct DgGLEngine {
     DgDrawable *current_drawable;
     DgGLNotify notify;
     void *opaque;
+    /* Diagnostic frame trace (QOM diagnostic-trace). A request or stop is
+     * handed over under `lock` between batches. The render worker alone uses
+     * `trace` while executing and publishes `trace_status` under `lock`, so an
+     * idle device pays one pointer check per record and per batch. */
+    struct DgTraceCapture *trace_request, *trace;
+    bool trace_stop;
+    DreamGpuTrace trace_status;
+    char *trace_path;
 };
+
+typedef struct DgTraceCapture {
+    DreamGpuTrace trace;
+    FILE *file;
+} DgTraceCapture;
 
 static uint32_t word(const uint8_t *p, unsigned offset) {
     return ldl_le_p(p + offset);
+}
+
+static uint32_t trace_write(void *opaque, const uint8_t *data, size_t bytes) {
+    return fwrite(data, 1, bytes, opaque) == bytes ? 0 : 1;
+}
+
+/* Ends an unfinished capture with `reason`, then closes and frees it. Called
+ * without the engine lock once the capture is detached. */
+static void trace_close(DgTraceCapture *c, uint32_t reason) {
+    if (!c) {
+        return;
+    }
+    dreamgpu_trace_end(&c->trace, reason);
+    if (fclose(c->file) != 0) {
+        warn_report("dreamgpu: closing the frame trace failed: %s", strerror(errno));
+    }
+    g_free(c);
+}
+
+/* Called with e->lock held before a batch executes. Returns a stopped capture
+ * for the caller to close after unlocking. */
+static DgTraceCapture *trace_adopt(DgGLEngine *e) {
+    DgTraceCapture *stopped = NULL;
+    if (e->trace_stop) {
+        e->trace_stop = false;
+        stopped = e->trace;
+        e->trace = NULL;
+        if (stopped) {
+            dreamgpu_trace_end(&stopped->trace, DREAMGPU_TRACE_END_CANCELLED);
+            e->trace_status = stopped->trace;
+        }
+    }
+    if (!e->trace && e->trace_request) {
+        e->trace = e->trace_request;
+        e->trace_request = NULL;
+    }
+    return stopped;
+}
+
+/* Called with e->lock held after a batch. Returns a finished capture. */
+static DgTraceCapture *trace_publish(DgGLEngine *e) {
+    DgTraceCapture *finished = e->trace;
+    e->trace_status = finished->trace;
+    if (finished->trace.state != DREAMGPU_TRACE_DONE) {
+        return NULL;
+    }
+    e->trace = NULL;
+    return finished;
+}
+
+/* "path,frames[,vertices][,limit=MiB]" arms a new capture of the records
+ * executed for the next `frames` presentations, starting at a presentation;
+ * "stop" ends the current one. The file must not exist. */
+bool dg_gl_engine_trace(DgGLEngine *e, const char *request, Error **errp) {
+    g_auto(GStrv) parts = NULL;
+    uint32_t frames = 0, flags = 0;
+    uint64_t limit = 0;
+    bool busy;
+    int fd;
+
+    if (!strcmp(request, "stop")) {
+        DgTraceCapture *pending;
+        qemu_mutex_lock(&e->lock);
+        pending = e->trace_request;
+        e->trace_request = NULL;
+        if (pending) {
+            dreamgpu_trace_end(&pending->trace, DREAMGPU_TRACE_END_CANCELLED);
+            e->trace_status = pending->trace;
+        } else if (e->trace) {
+            e->trace_stop = true;
+        }
+        qemu_mutex_unlock(&e->lock);
+        trace_close(pending, DREAMGPU_TRACE_END_CANCELLED);
+        return true;
+    }
+    parts = g_strsplit(request, ",", -1);
+    if (g_strv_length(parts) < 2 || !g_path_is_absolute(parts[0]) ||
+        qemu_strtoui(parts[1], NULL, 10, &frames) < 0 || !frames ||
+        frames > DREAMGPU_TRACE_MAX_FRAMES) {
+        error_setg(errp,
+                   "diagnostic-trace expects 'stop' or "
+                   "'/absolute/path,frames[,vertices][,limit=MiB]' with 1-%u frames",
+                   DREAMGPU_TRACE_MAX_FRAMES);
+        return false;
+    }
+    for (unsigned i = 2; parts[i]; i++) {
+        if (!strcmp(parts[i], "vertices")) {
+            flags |= DREAMGPU_TRACE_VERTICES;
+        } else if (g_str_has_prefix(parts[i], "limit=") &&
+                   qemu_strtou64(parts[i] + 6, NULL, 10, &limit) == 0 && limit &&
+                   limit <= DREAMGPU_TRACE_MAX_LIMIT >> 20) {
+            limit <<= 20;
+        } else {
+            error_setg(errp, "diagnostic-trace option '%s' is not 'vertices' or 'limit=1-%llu'",
+                       parts[i], DREAMGPU_TRACE_MAX_LIMIT >> 20);
+            return false;
+        }
+    }
+    qemu_mutex_lock(&e->lock);
+    busy = e->trace_request || e->trace;
+    qemu_mutex_unlock(&e->lock);
+    if (busy) {
+        error_setg(errp, "a DreamGPU frame trace is still running; set 'stop' first");
+        return false;
+    }
+    fd = qemu_create(parts[0], O_WRONLY | O_EXCL, 0644, errp);
+    if (fd < 0) {
+        return false;
+    }
+    DgTraceCapture *c = g_new0(DgTraceCapture, 1);
+    c->file = fdopen(fd, "w");
+    if (!c->file) {
+        error_setg_errno(errp, errno, "cannot open frame trace '%s'", parts[0]);
+        close(fd);
+        unlink(parts[0]);
+        g_free(c);
+        return false;
+    }
+    setvbuf(c->file, NULL, _IOFBF, 1 << 20);
+    c->trace.opaque = c->file;
+    c->trace.write = trace_write;
+    if (dreamgpu_trace_begin(&c->trace, frames, flags, limit)) {
+        error_setg(errp, "cannot start frame trace '%s'", parts[0]);
+        fclose(c->file);
+        unlink(parts[0]);
+        g_free(c);
+        return false;
+    }
+    qemu_mutex_lock(&e->lock);
+    e->trace_request = c;
+    e->trace_status = c->trace;
+    g_free(e->trace_path);
+    e->trace_path = g_strdup(parts[0]);
+    qemu_mutex_unlock(&e->lock);
+    return true;
+}
+
+char *dg_gl_engine_trace_status(DgGLEngine *e) {
+    static const char *const states[] = {"idle", "armed", "active", "done"};
+    static const char *const reasons[] = {"none", "frames", "limit", "write", "cancelled"};
+    QDict *status = qdict_new();
+    DreamGpuTrace t;
+    GString *json;
+
+    qemu_mutex_lock(&e->lock);
+    t = e->trace_status;
+    qdict_put_str(status, "path", e->trace_path ? e->trace_path : "");
+    qdict_put_bool(status, "stopping", e->trace_stop);
+    qemu_mutex_unlock(&e->lock);
+    qdict_put_int(status, "schema", 1);
+    qdict_put_str(status, "state", t.state < G_N_ELEMENTS(states) ? states[t.state] : "unknown");
+    qdict_put_str(status, "reason",
+                  t.reason < G_N_ELEMENTS(reasons) ? reasons[t.reason] : "unknown");
+    qdict_put_int(status, "frames", t.frames);
+    qdict_put_int(status, "completed", t.completed);
+    qdict_put_int(status, "records", t.records);
+    qdict_put_int(status, "bytes", t.bytes);
+    qdict_put_int(status, "limit", t.limit);
+    qdict_put_bool(status, "vertices", t.flags & DREAMGPU_TRACE_VERTICES);
+    json = qobject_to_json(QOBJECT(status));
+    qobject_unref(status);
+    return g_string_free(json, false);
 }
 
 /* Failure-only diagnostics carry bounded numeric command headers, never payloads. */
@@ -978,6 +1155,12 @@ static uint32_t submission_cancelled(void *opaque) {
 
 static void submission_report(void *opaque, const uint8_t *record, uint32_t error) {
     DgDispatch *d = opaque;
+    DgTraceCapture *trace = d->engine->trace;
+    if (G_UNLIKELY(trace)) {
+        /* After execution, so the line shows what the host actually ran. */
+        dreamgpu_trace_record(&trace->trace, record, word(record, DG_GL_OFF_SIZE),
+                              d->batch->sequence, d->batch->stream, error);
+    }
     if (error) {
         trace_rejection(record, word(record, DG_GL_OFF_SIZE), d->batch->sequence, true, error);
     }
@@ -1068,7 +1251,12 @@ static void *render_worker(void *opaque) {
             continue;
         }
         result = e->failed ? DG_GL_ERROR_TRANSPORT : 0;
+        DgTraceCapture *trace_ended = NULL;
+        if (G_UNLIKELY(e->trace_request || e->trace_stop)) {
+            trace_ended = trace_adopt(e);
+        }
         qemu_mutex_unlock(&e->lock);
+        trace_close(trace_ended, DREAMGPU_TRACE_END_CANCELLED);
         uint64_t trace_start_us = batch->trace_queued_us ? g_get_monotonic_time() : 0;
         DgDispatch dispatch = {e, batch, &err};
         DreamGpuPlatform platform = host_platform(&dispatch);
@@ -1086,7 +1274,12 @@ static void *render_worker(void *opaque) {
         qemu_mutex_lock(&e->lock);
         dreamgpu_submission_complete(&e->work, &submission_memory, batch, result, &e->resources,
                                      &e->desktop, &e->last_present);
+        DgTraceCapture *trace_finished = NULL;
+        if (G_UNLIKELY(e->trace)) {
+            trace_finished = trace_publish(e);
+        }
         qemu_mutex_unlock(&e->lock);
+        trace_close(trace_finished, DREAMGPU_TRACE_END_CANCELLED);
         e->notify(e->opaque);
         qemu_mutex_lock(&e->lock);
     }
@@ -1131,6 +1324,9 @@ void dg_gl_engine_free(DgGLEngine *e) {
         qemu_thread_join(&e->release_thread);
     }
     close_client(e, 0);
+    trace_close(e->trace_request, DREAMGPU_TRACE_END_CANCELLED);
+    trace_close(e->trace, DREAMGPU_TRACE_END_CANCELLED);
+    g_free(e->trace_path);
     dg_gl_platform_free(e->platform);
     dreamgpu_submission_free(&e->work, &submission_memory);
 #ifdef CONFIG_DARWIN
