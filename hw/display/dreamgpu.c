@@ -370,19 +370,6 @@ static void dg_fault_stop(DreamGpu *s, uint32_t reason, uint32_t sequence) {
     vm_stop(RUN_STATE_INTERNAL_ERROR);
 }
 
-static bool dg_result_ram(DreamGpu *s, uint64_t address, uint32_t bytes) {
-    hwaddr translated, length = bytes;
-    MemoryRegion *mr;
-
-    if (!bytes || bytes > DG_GL_MAX_READBACK_BYTES || address > UINT64_MAX - bytes) {
-        return false;
-    }
-    RCU_READ_LOCK_GUARD();
-    mr = address_space_translate(pci_get_address_space(&s->parent_obj), address, &translated,
-                                 &length, true, MEMTXATTRS_UNSPECIFIED);
-    return length >= bytes && memory_region_is_ram(mr) && !memory_region_is_rom(mr);
-}
-
 static void dg_gl_complete(DreamGpu *s, uint32_t sequence, uint32_t error) {
     if (s->gl_trace_start_us) {
         trace_dreamgpu_gl_complete(sequence, error, g_get_monotonic_time() - s->gl_trace_start_us);
@@ -464,6 +451,7 @@ static void dg_gl_transfer_work(DreamGpu *s) {
 }
 
 static DreamGpuQueueCallbacks dg_queue_callbacks(DreamGpu *s);
+static uint32_t dg_queue_write(void *opaque, uint64_t address, const uint8_t *data, uint32_t bytes);
 static void dg_gl_queue_irq(DreamGpu *s);
 static void dg_gl_queue_kick(DreamGpu *s);
 
@@ -490,11 +478,13 @@ static void dg_gl_completed_bh(void *opaque) {
         } else if (!done.reset) {
             s->gl_present = done.present;
             if (!done.error && done.result_bytes) {
-                if (done.result_bytes > s->gl_active_result_capacity ||
-                    !dg_result_ram(s, s->gl_active_result_address, done.result_bytes) ||
-                    pci_dma_write(&s->parent_obj, s->gl_active_result_address,
-                                  done.bulk_result ? done.bulk_result : done.result,
-                                  done.result_bytes) != MEMTX_OK) {
+                /* A contiguous range or a page list (DG_GL_RESULT_PAGES),
+                 * rechecked as writable RAM before each write. */
+                DreamGpuDeviceMemory memory = dg_snapshot_memory(s);
+                if (!dreamgpu_device_result_write(
+                        &memory, dg_queue_write, s->gl_active_result_address,
+                        s->gl_active_result_capacity,
+                        done.bulk_result ? done.bulk_result : done.result, done.result_bytes)) {
                     done.error = DG_GL_ERROR_DMA;
                 } else {
                     s->gl_result_bytes = done.result_bytes;
@@ -766,8 +756,9 @@ static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr) {
             return s->gl_queue.active;
         case DG_GL_REG_CAPS2:
             /* Features beyond DG_REG_CAPS; zero without a GL engine, as there. */
-            return s->gpu_socket && *s->gpu_socket ? DG_CAP2_GL_DEPTH_TEXTURE | DG_CAP2_GL_RGB565
-                                                   : 0;
+            return s->gpu_socket && *s->gpu_socket
+                       ? DG_CAP2_GL_DEPTH_TEXTURE | DG_CAP2_GL_RGB565 | DG_CAP2_GL_BULK_READ
+                       : 0;
         default:
             return 0;
     }
