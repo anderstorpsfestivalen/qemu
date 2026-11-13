@@ -757,7 +757,8 @@ static uint64_t dg_gl_read(DreamGpu *s, hwaddr addr) {
         case DG_GL_REG_CAPS2:
             /* Features beyond DG_REG_CAPS; zero without a GL engine, as there. */
             return s->gpu_socket && *s->gpu_socket
-                       ? DG_CAP2_GL_DEPTH_TEXTURE | DG_CAP2_GL_RGB565 | DG_CAP2_GL_BULK_READ
+                       ? DG_CAP2_GL_DEPTH_TEXTURE | DG_CAP2_GL_RGB565 | DG_CAP2_GL_BULK_READ |
+                             DG_CAP2_GL_CORE_1_2
                        : 0;
         default:
             return 0;
